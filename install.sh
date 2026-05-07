@@ -99,11 +99,25 @@ fi
 
 echo "Build throttle: ${BUILD_JOBS}/${CPU_THREADS} parallel jobs (~${VERBATIM_BUILD_CPU_PERCENT}% CPU target)"
 
+export CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS"
+export MAKEFLAGS="-j${BUILD_JOBS}"
+export NINJAFLAGS="-j${BUILD_JOBS}"
+
 run_build() {
-  if command -v ionice >/dev/null 2>&1; then
-    ionice -c 3 nice -n 10 "$@"
+  local cpu_last="$((BUILD_JOBS - 1))"
+
+  if command -v taskset >/dev/null 2>&1; then
+    if command -v ionice >/dev/null 2>&1; then
+      taskset -c "0-${cpu_last}" ionice -c 3 nice -n 10 "$@"
+    else
+      taskset -c "0-${cpu_last}" nice -n 10 "$@"
+    fi
   else
-    nice -n 10 "$@"
+    if command -v ionice >/dev/null 2>&1; then
+      ionice -c 3 nice -n 10 "$@"
+    else
+      nice -n 10 "$@"
+    fi
   fi
 }
 
