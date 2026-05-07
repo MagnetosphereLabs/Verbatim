@@ -154,9 +154,11 @@ sudo apt-get update
 sudo apt-get install -y \
   acl \
   build-essential \
+  libc6-dev \
   curl \
   ffmpeg \
   git \
+  glslc \
   vulkan-tools \
   libvulkan1 \
   libvulkan-dev \
@@ -203,13 +205,36 @@ fi
 
 if ! ldconfig -p 2>/dev/null | grep -q 'libgtk4-layer-shell.so'; then
   echo "Building gtk4-layer-shell from source..."
-  sudo apt-get install -y meson ninja-build gobject-introspection libgirepository1.0-dev libwayland-dev wayland-protocols
+  sudo apt-get install -y \
+    meson \
+    ninja-build \
+    gobject-introspection \
+    libgirepository1.0-dev \
+    libwayland-dev \
+    wayland-protocols \
+    libc6-dev
+
+  # Some restored/custom systems can have build-essential installed while the
+  # libc development headers are missing or damaged. sys/cdefs.h comes from
+  # libc6-dev, so reinstall it before compiling optional layer-shell support.
+  sudo apt-get install -y --reinstall libc6-dev || true
+
   TMP="$(mktemp -d)"
   git clone --depth=1 https://github.com/wmww/gtk4-layer-shell.git "$TMP/gtk4-layer-shell"
-  meson setup "$TMP/gtk4-layer-shell/build" "$TMP/gtk4-layer-shell" --prefix=/usr --buildtype=release
-  ninja -C "$TMP/gtk4-layer-shell/build"
-  sudo ninja -C "$TMP/gtk4-layer-shell/build" install
-  sudo ldconfig
+
+  if meson setup "$TMP/gtk4-layer-shell/build" "$TMP/gtk4-layer-shell" --prefix=/usr --buildtype=release \
+    && ninja -C "$TMP/gtk4-layer-shell/build" \
+    && sudo ninja -C "$TMP/gtk4-layer-shell/build" install; then
+    sudo ldconfig
+    echo "gtk4-layer-shell installed."
+  else
+    echo
+    echo "Warning: gtk4-layer-shell could not be built on this system."
+    echo "Verbatim will continue with the normal GTK Wayland window fallback."
+    echo "The overlay may be positioned less perfectly, but dictation can still work."
+    echo
+  fi
+
   rm -rf "$TMP"
 fi
 
@@ -231,7 +256,7 @@ else
   KDICTATE_DEVICE="cpu"
   KDICTATE_COMPUTE_TYPE="int8"
 
-  sudo apt-get install -y cmake ninja-build
+  sudo apt-get install -y cmake ninja-build glslc
 
   WHISPER_CPP_DIR="$APP/whisper.cpp"
   if [ ! -d "$WHISPER_CPP_DIR/.git" ]; then
@@ -241,17 +266,31 @@ else
     git -C "$WHISPER_CPP_DIR" pull --ff-only || true
   fi
 
+  BUILD_DIR="$WHISPER_CPP_DIR/build"
+  
   if [ "$GPU_BACKEND" = "vulkan" ]; then
     echo "Building whisper.cpp with Vulkan."
-    cmake -S "$WHISPER_CPP_DIR" -B "$WHISPER_CPP_DIR/build" -G Ninja \
-      -DGGML_VULKAN=ON \
-      -DCMAKE_BUILD_TYPE=Release
+    if cmake -S "$WHISPER_CPP_DIR" -B "$BUILD_DIR" -G Ninja \
+        -DGGML_VULKAN=ON \
+        -DCMAKE_BUILD_TYPE=Release; then
+      cmake --build "$BUILD_DIR" -j"$(nproc)"
+    else
+      echo
+      echo "Warning: Vulkan whisper.cpp configuration failed."
+      echo "Falling back to CPU whisper.cpp build so installation can still complete."
+      echo
+      GPU_BACKEND="cpu"
+      rm -rf "$BUILD_DIR"
+      cmake -S "$WHISPER_CPP_DIR" -B "$BUILD_DIR" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release
+      cmake --build "$BUILD_DIR" -j"$(nproc)"
+    fi
   else
     echo "Building whisper.cpp CPU fallback."
-    cmake -S "$WHISPER_CPP_DIR" -B "$WHISPER_CPP_DIR/build" -G Ninja \
+    cmake -S "$WHISPER_CPP_DIR" -B "$BUILD_DIR" -G Ninja \
       -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$BUILD_DIR" -j"$(nproc)"
   fi
-  cmake --build "$WHISPER_CPP_DIR/build" -j"$(nproc)"
 
   mkdir -p "$APP/models"
   if [ ! -f "$APP/models/ggml-$KDICTATE_MODEL.bin" ]; then
