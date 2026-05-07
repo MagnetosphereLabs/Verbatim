@@ -86,6 +86,27 @@ fi
 
 sudo -v
 
+# Keep source builds from saturating the machine.
+# VERBATIM_BUILD_CPU_PERCENT=50 means use about 50% of logical CPU cores.
+# Example: 16 threads -> 8 build jobs.
+VERBATIM_BUILD_CPU_PERCENT="${VERBATIM_BUILD_CPU_PERCENT:-80}"
+CPU_THREADS="$(nproc 2>/dev/null || echo 1)"
+BUILD_JOBS="$(( CPU_THREADS * VERBATIM_BUILD_CPU_PERCENT / 100 ))"
+
+if [ "$BUILD_JOBS" -lt 1 ]; then
+  BUILD_JOBS=1
+fi
+
+echo "Build throttle: ${BUILD_JOBS}/${CPU_THREADS} parallel jobs (~${VERBATIM_BUILD_CPU_PERCENT}% CPU target)"
+
+run_build() {
+  if command -v ionice >/dev/null 2>&1; then
+    ionice -c 3 nice -n 10 "$@"
+  else
+    nice -n 10 "$@"
+  fi
+}
+
 echo
 echo "Detecting GPU backend..."
 GPU_BACKEND="cpu"
@@ -226,7 +247,7 @@ if ! ldconfig -p 2>/dev/null | grep -q 'libgtk4-layer-shell.so'; then
   git clone --depth=1 https://github.com/wmww/gtk4-layer-shell.git "$TMP/gtk4-layer-shell"
 
   if meson setup "$TMP/gtk4-layer-shell/build" "$TMP/gtk4-layer-shell" --prefix=/usr --buildtype=release \
-    && ninja -C "$TMP/gtk4-layer-shell/build" \
+    && run_build ninja -C "$TMP/gtk4-layer-shell/build" -j"$BUILD_JOBS" \
     && sudo ninja -C "$TMP/gtk4-layer-shell/build" install; then
     sudo ldconfig
     echo "gtk4-layer-shell installed."
@@ -277,7 +298,7 @@ else
     if cmake -S "$WHISPER_CPP_DIR" -B "$BUILD_DIR" -G Ninja \
         -DGGML_VULKAN=ON \
         -DCMAKE_BUILD_TYPE=Release \
-      && cmake --build "$BUILD_DIR" -j"$(nproc)"; then
+      && run_build cmake --build "$BUILD_DIR" -j"$BUILD_JOBS"; then
       echo "whisper.cpp Vulkan build complete."
     else
       echo
@@ -292,7 +313,7 @@ else
       cmake -S "$WHISPER_CPP_DIR" -B "$BUILD_DIR" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release
   
-      cmake --build "$BUILD_DIR" -j"$(nproc)"
+      run_build cmake --build "$BUILD_DIR" -j"$BUILD_JOBS"
     fi
   else
     echo "Building whisper.cpp CPU fallback."
@@ -300,7 +321,7 @@ else
     cmake -S "$WHISPER_CPP_DIR" -B "$BUILD_DIR" -G Ninja \
       -DCMAKE_BUILD_TYPE=Release
   
-    cmake --build "$BUILD_DIR" -j"$(nproc)"
+    run_build cmake --build "$BUILD_DIR" -j"$BUILD_JOBS"
   fi
 
   mkdir -p "$APP/models"
