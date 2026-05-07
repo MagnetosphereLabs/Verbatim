@@ -1,7 +1,61 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERBATIM_REPO_OWNER="${VERBATIM_REPO_OWNER:-MagnetosphereLabs}"
+VERBATIM_REPO_NAME="${VERBATIM_REPO_NAME:-Verbatim}"
+VERBATIM_BRANCH="${VERBATIM_BRANCH:-main}"
+
+if [ "$(id -u)" -eq 0 ]; then
+  echo "Do not run this installer with sudo."
+  echo
+  echo "Use:"
+  echo "  curl -fsSL https://raw.githubusercontent.com/${VERBATIM_REPO_OWNER}/${VERBATIM_REPO_NAME}/${VERBATIM_BRANCH}/install.sh | bash"
+  echo
+  echo "Reason: Verbatim installs a user service, user shortcut, and files under the desktop user's home directory."
+  echo "The installer will ask for sudo internally when system packages or input-device permissions are needed."
+  exit 1
+fi
+
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
+
+if [ -f "$SCRIPT_SOURCE" ]; then
+  ROOT="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+else
+  ROOT="$(pwd)"
+fi
+
+if [ ! -d "$ROOT/app" ] || [ ! -d "$ROOT/bin" ] || [ ! -d "$ROOT/scripts" ] || [ ! -f "$ROOT/requirements.txt" ]; then
+  if [ "${VERBATIM_BOOTSTRAPPED:-0}" != "1" ]; then
+    echo "Verbatim bootstrap installer"
+    echo "Fetching ${VERBATIM_REPO_OWNER}/${VERBATIM_REPO_NAME}@${VERBATIM_BRANCH}..."
+
+    TMPDIR_INSTALL="$(mktemp -d "${TMPDIR:-/tmp}/verbatim-install.XXXXXXXX")"
+
+    cleanup() {
+      rm -rf "$TMPDIR_INSTALL"
+    }
+    trap cleanup EXIT
+
+    ARCHIVE_URL="https://github.com/${VERBATIM_REPO_OWNER}/${VERBATIM_REPO_NAME}/archive/refs/heads/${VERBATIM_BRANCH}.tar.gz"
+
+    curl -fsSL "$ARCHIVE_URL" -o "$TMPDIR_INSTALL/verbatim.tar.gz"
+    tar -xzf "$TMPDIR_INSTALL/verbatim.tar.gz" -C "$TMPDIR_INSTALL"
+
+    FETCHED_ROOT="$(find "$TMPDIR_INSTALL" -mindepth 1 -maxdepth 1 -type d -name "${VERBATIM_REPO_NAME}-*" | head -n1)"
+
+    if [ -z "$FETCHED_ROOT" ] || [ ! -f "$FETCHED_ROOT/install.sh" ]; then
+      echo "Could not locate fetched Verbatim installer." >&2
+      exit 1
+    fi
+
+    export VERBATIM_BOOTSTRAPPED=1
+    exec bash "$FETCHED_ROOT/install.sh" "$@"
+  fi
+
+  echo "Installer is missing required project files: app/, bin/, scripts/, requirements.txt" >&2
+  exit 1
+fi
+
 APP="$HOME/.local/share/kdictate-cosmic"
 BIN="$HOME/.local/bin"
 LOG="$APP/install.log"
