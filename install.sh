@@ -418,15 +418,75 @@ chmod 0644 "$DESKTOP_FILE"
 echo "Registering Super+V in COSMIC..."
 "$APP/venv/bin/python" "$APP/scripts/register_cosmic_shortcut.py" "$HOME/.local/bin/kdictate toggle"
 
+wait_for_daemon() {
+  local label="$1"
+  local deadline=$((SECONDS + 25))
+
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if "$BIN/kdictate" status >/dev/null 2>&1; then
+      echo "Daemon is running ($label)."
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  return 1
+}
+
 echo "Restarting daemon..."
+
+# Ask a running daemon to exit.
 "$BIN/kdictate" quit >/dev/null 2>&1 || true
-sleep 0.3
+sleep 0.5
+
+# Stop systemd service if present.
 if command -v systemctl >/dev/null 2>&1; then
-  systemctl --user restart kdictate.service || true
+  systemctl --user stop kdictate.service >/dev/null 2>&1 || true
 fi
-if ! "$BIN/kdictate" status >/dev/null 2>&1; then
+
+# Kill legacy/stray daemons from older installer versions.
+pkill -f "$APP/app/kdictate.py daemon" >/dev/null 2>&1 || true
+pkill -f '/kdictate-cosmic/app/kdictate.py daemon' >/dev/null 2>&1 || true
+
+# Remove stale runtime files after old daemons are gone.
+rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/kdictate.sock"
+rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/kdictate.daemon.lock"
+
+sleep 0.5
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl --user daemon-reload || true
+  systemctl --user import-environment \
+    WAYLAND_DISPLAY \
+    XDG_CURRENT_DESKTOP \
+    XDG_SESSION_TYPE \
+    DISPLAY \
+    DBUS_SESSION_BUS_ADDRESS \
+    XDG_RUNTIME_DIR \
+    PATH || true
+
+  systemctl --user enable kdictate.service >/dev/null 2>&1 || true
+  systemctl --user start kdictate.service || true
+fi
+
+if ! wait_for_daemon "systemd user service"; then
+  echo "Systemd user service did not come up; trying direct user daemon fallback..."
+
   nohup "$BIN/kdictate" daemon >> "$APP/kdictate.log" 2>&1 &
   sleep 1
+
+  if ! wait_for_daemon "direct fallback"; then
+    echo
+    echo "ERROR: Verbatim installed, but the daemon did not start."
+    echo
+    echo "Run these commands and include the output in a bug report:"
+    echo "  kdictate status"
+    echo "  systemctl --user status kdictate.service --no-pager -l"
+    echo "  journalctl --user -u kdictate.service -n 120 --no-pager"
+    echo "  tail -160 $APP/kdictate.log"
+    echo
+    exit 1
+  fi
 fi
 
 echo "Running doctor..."
@@ -434,12 +494,35 @@ echo "Running doctor..."
 
 echo
 echo "Warming Whisper $KDICTATE_MODEL with backend $KDICTATE_BACKEND."
-"$BIN/kdictate" warmup || true
+if ! "$BIN/kdictate" warmup; then
+  echo
+  echo "Warning: warmup failed, but the daemon is running."
+  echo "The first dictation may take longer while the backend initializes."
+fi
+
+echo
+echo "Verifying manual launch..."
+if "$BIN/kdictate" start >/dev/null 2>&1; then
+  echo "Manual launch test: ok"
+  "$BIN/kdictate" cancel >/dev/null 2>&1 || true
+else
+  echo
+  echo "Warning: daemon is running, but manual launch did not return ok."
+  echo "Check logs: $APP/kdictate.log"
+fi
 
 echo
 echo "Install complete."
 echo "Use: press Super+V in a text field, speak, then pause."
+echo "Manual test command: kdictate start"
+echo "Status command: kdictate status"
 echo "Logs: $APP/kdictate.log"
+echo
+echo "If Super+V does not work immediately, run:"
+echo "  kdictate start"
+echo
+echo "If kdictate start works but Super+V does not, COSMIC accepted the shortcut file but has not activated it yet."
+echo "Log out and back in once, or open COSMIC Settings > Input devices > Keyboard > Keyboard shortcuts and confirm Super+V."
 echo
 echo "Important: if doctor reports /dev/uinput or /dev/input permission problems, log out and back in once."
 echo "That refreshes the new input group membership."
