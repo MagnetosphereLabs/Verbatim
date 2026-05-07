@@ -170,6 +170,13 @@ esac
 echo "Selected: $KDICTATE_PROFILE ($KDICTATE_MODEL)"
 echo
 
+if ! grep -R "^[^#].* universe" /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources >/dev/null 2>&1; then
+  echo "Enabling Ubuntu universe repository for Vulkan/SPIR-V packages..."
+  sudo apt-get update
+  sudo apt-get install -y software-properties-common
+  sudo add-apt-repository -y universe || true
+fi
+
 echo "Installing OS packages..."
 sudo apt-get update
 sudo apt-get install -y \
@@ -182,7 +189,6 @@ sudo apt-get install -y \
   glslc \
   spirv-headers \
   spirv-tools \
-  spirv-tools-dev \
   vulkan-tools \
   libvulkan1 \
   libvulkan-dev \
@@ -280,7 +286,7 @@ else
   KDICTATE_DEVICE="cpu"
   KDICTATE_COMPUTE_TYPE="int8"
 
-  sudo apt-get install -y cmake ninja-build glslc spirv-headers spirv-tools spirv-tools-dev
+  sudo apt-get install -y cmake ninja-build glslc spirv-headers spirv-tools
 
   WHISPER_CPP_DIR="$APP/whisper.cpp"
   if [ ! -d "$WHISPER_CPP_DIR/.git" ]; then
