@@ -989,6 +989,12 @@ def daemon_main() -> int:
             self.visible = True
             self.monitor.arm(ignore_for=0.8)
             self.window.present()
+            
+            # Load GPU model only when the user invokes dictation.
+            # This keeps the daemon ready without occupying NVIDIA VRAM 24/7.
+            if BACKEND != "whisper.cpp":
+                ModelManager.warm_async()
+            
             self.engine.start()
 
         def close_smoothly(self):
@@ -1166,7 +1172,6 @@ def daemon_main() -> int:
 
     def on_activate(_app):
         overlay_ref["overlay"] = Overlay(_app)
-        ModelManager.warm_async()
         log("Daemon activated")
 
     app.connect("activate", on_activate)
@@ -1217,6 +1222,79 @@ def daemon_main() -> int:
     SocketServer(handle_socket).start()
     return app.run([sys.argv[0]])
 
+
+def gpu_status_text() -> str:
+    lines: list[str] = []
+    lines.append(f"Backend: {BACKEND}")
+    lines.append(f"Model: {MODEL_NAME}")
+
+    try:
+        lines.append(f"Daemon status: {'running' if daemon_is_running() else 'not running'}")
+    except Exception:
+        lines.append("Daemon status: unknown")
+
+    if command_exists("nvidia-smi"):
+        lines.append("")
+        lines.append("NVIDIA VRAM / compute processes:")
+        try:
+            proc = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=pid,process_name,used_gpu_memory",
+                    "--format=csv,noheader,nounits",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=4,
+                check=False,
+            )
+            out = proc.stdout.strip()
+            if out:
+                lines.extend("  " + line + " MiB" for line in out.splitlines())
+            else:
+                lines.append("  no active NVIDIA compute process listed")
+        except Exception as exc:
+            lines.append(f"  nvidia-smi failed: {exc}")
+
+    if command_exists("rocm-smi"):
+        lines.append("")
+        lines.append("AMD ROCm VRAM:")
+        try:
+            proc = subprocess.run(
+                ["rocm-smi", "--showmeminfo", "vram"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=6,
+                check=False,
+            )
+            out = proc.stdout.strip()
+            if out:
+                lines.extend("  " + line for line in out.splitlines())
+            else:
+                lines.append("  rocm-smi returned no VRAM output")
+        except Exception as exc:
+            lines.append(f"  rocm-smi failed: {exc}")
+
+    if command_exists("radeontop"):
+        lines.append("")
+        lines.append("AMD live monitor available: radeontop")
+
+    if command_exists("nvtop"):
+        lines.append("")
+        lines.append("Interactive GPU monitor available: nvtop")
+
+    if not command_exists("nvidia-smi") and not command_exists("rocm-smi"):
+        lines.append("")
+        lines.append("No vendor VRAM CLI found.")
+        lines.append("For debugging, install one of:")
+        lines.append("  NVIDIA: nvidia-smi is included with NVIDIA drivers")
+        lines.append("  AMD ROCm: rocm-smi")
+        lines.append("  Generic live monitor: nvtop")
+        lines.append("  AMD live monitor: radeontop")
+
+    return "\n".join(lines)
 
 def doctor_text() -> str:
     lines: list[str] = []
@@ -1299,12 +1377,16 @@ def cli_main(argv: list[str]) -> int:
         print(doctor_text())
         return 0
 
+    if cmd == "gpu-status":
+        print(gpu_status_text())
+        return 0
+
     if cmd == "quit":
         with contextlib.suppress(Exception):
             print(send_socket("quit"))
         return 0
 
-    print("Usage: kdictate [toggle|start|cancel|daemon|status|doctor|warmup|warmup-foreground|quit]", file=sys.stderr)
+    print("Usage: kdictate [toggle|start|cancel|daemon|status|doctor|gpu-status|warmup|warmup-foreground|quit]", file=sys.stderr)
     return 2
 
 
