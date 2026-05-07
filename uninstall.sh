@@ -77,10 +77,12 @@ pkill -f '/verbatim.py daemon' >/dev/null 2>&1 || true
 pkill -f 'kdictate-cosmic/app/kdictate.py daemon' >/dev/null 2>&1 || true
 pkill -f 'verbatim/app/kdictate.py daemon' >/dev/null 2>&1 || true
 
-echo "Removing COSMIC shortcuts..."
+echo "Removing desktop shortcuts..."
 
 for app in "${APP_DIRS[@]}"; do
-  if [ -x "$app/venv/bin/python" ] && [ -f "$app/scripts/register_cosmic_shortcut.py" ]; then
+  if [ -x "$app/venv/bin/python" ] && [ -f "$app/scripts/register_desktop_shortcut.py" ]; then
+    "$app/venv/bin/python" "$app/scripts/register_desktop_shortcut.py" --remove >/dev/null 2>&1 || true
+  elif [ -x "$app/venv/bin/python" ] && [ -f "$app/scripts/register_cosmic_shortcut.py" ]; then
     "$app/venv/bin/python" "$app/scripts/register_cosmic_shortcut.py" --remove >/dev/null 2>&1 || true
   fi
 done
