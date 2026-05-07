@@ -67,7 +67,7 @@ SERVICE_FILE="$SERVICE_DIR/kdictate.service"
 mkdir -p "$APP" "$BIN" "$SERVICE_DIR" "$AUTOSTART_DIR"
 exec > >(tee -a "$LOG") 2>&1
 
-echo "KDictate Cosmic installer"
+echo "Verbatim installer"
 echo "Target app dir: $APP"
 echo "Install log: $LOG"
 echo
@@ -260,7 +260,7 @@ CONFIG
 echo "Backend config written to $APP/config.env"
 cat "$APP/config.env"
 echo
-echo "Copying KDictate files..."
+echo "Copying Verbatim files..."
 rm -rf "$APP/app" "$APP/scripts" "$APP/systemd" "$APP/docs"
 mkdir -p "$APP"
 cp -a "$ROOT/app" "$APP/app"
@@ -272,7 +272,7 @@ cp "$ROOT/README.md" "$APP/README.md" 2>/dev/null || true
 install -m 0755 "$ROOT/bin/kdictate" "$BIN/kdictate"
 
 echo "Creating Python environment..."
-python3 -m venv --system-site-packages "$APP/venv"
+/usr/bin/python3 -m venv --system-site-packages "$APP/venv"
 "$APP/venv/bin/python" -m pip install --upgrade pip wheel setuptools
 "$APP/venv/bin/pip" install -r "$APP/requirements.txt"
 
@@ -303,8 +303,8 @@ fi
 cat > "$DESKTOP_FILE" <<DESKTOP
 [Desktop Entry]
 Type=Application
-Name=KDictate Cosmic
-Comment=Local Whisper dictation overlay for COSMIC Wayland
+Name=Verbatim
+Comment=Local AI dictation for Linux Wayland
 Exec=$HOME/.local/bin/kdictate daemon
 X-GNOME-Autostart-enabled=true
 NoDisplay=true
