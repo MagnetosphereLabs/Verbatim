@@ -89,7 +89,7 @@ sudo -v
 # Keep source builds from saturating the machine.
 # VERBATIM_BUILD_CPU_PERCENT=50 means use about 50% of logical CPU cores.
 # Example: 16 threads -> 8 build jobs.
-VERBATIM_BUILD_CPU_PERCENT="${VERBATIM_BUILD_CPU_PERCENT:-80}"
+VERBATIM_BUILD_CPU_PERCENT="${VERBATIM_BUILD_CPU_PERCENT:-50}"
 CPU_THREADS="$(nproc 2>/dev/null || echo 1)"
 BUILD_JOBS="$(( CPU_THREADS * VERBATIM_BUILD_CPU_PERCENT / 100 ))"
 
