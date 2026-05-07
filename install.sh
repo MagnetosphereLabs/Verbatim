@@ -400,20 +400,11 @@ if command -v systemctl >/dev/null 2>&1; then
   install -m 0644 "$ROOT/systemd/kdictate.service" "$SERVICE_FILE"
   systemctl --user daemon-reload || true
   systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DISPLAY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR PATH || true
-  systemctl --user enable --now kdictate.service || true
+  systemctl --user enable kdictate.service || true
+  systemctl --user start kdictate.service || true
 fi
 
-cat > "$DESKTOP_FILE" <<DESKTOP
-[Desktop Entry]
-Type=Application
-Name=Verbatim
-Comment=Local AI dictation for Linux Wayland
-Exec=$HOME/.local/bin/kdictate daemon
-X-GNOME-Autostart-enabled=true
-NoDisplay=true
-Terminal=false
-DESKTOP
-chmod 0644 "$DESKTOP_FILE"
+rm -f "$DESKTOP_FILE"
 
 echo "Registering Super+V in COSMIC..."
 "$APP/venv/bin/python" "$APP/scripts/register_cosmic_shortcut.py" "$HOME/.local/bin/kdictate toggle"
