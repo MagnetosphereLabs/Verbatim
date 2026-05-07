@@ -373,7 +373,7 @@ mkdir -p "$APP"
 
 cp -a "$ROOT/app" "$APP/app"
 cp -a "$ROOT/scripts" "$APP/scripts"
-chmod +x "$APP/scripts/"*.sh "$APP/scripts/verbatim-wayvr" 2>/dev/null || true
+chmod +x "$APP/scripts/"*.sh "$APP/scripts/"*.py "$APP/scripts/verbatim-wayvr" 2>/dev/null || true
 cp -a "$ROOT/systemd" "$APP/systemd"
 cp "$ROOT/requirements.txt" "$APP/requirements.txt"
 install -m 0755 "$ROOT/bin/kdictate" "$BIN/kdictate"
@@ -425,8 +425,12 @@ fi
 
 rm -f "$DESKTOP_FILE"
 
-echo "Registering Super+V in COSMIC..."
-"$APP/venv/bin/python" "$APP/scripts/register_cosmic_shortcut.py" "$HOME/.local/bin/kdictate toggle"
+echo "Registering Super+V desktop shortcut..."
+if [ -f "$APP/scripts/register_desktop_shortcut.py" ]; then
+  "$APP/venv/bin/python" "$APP/scripts/register_desktop_shortcut.py" "$HOME/.local/bin/kdictate toggle" || true
+else
+  "$APP/venv/bin/python" "$APP/scripts/register_cosmic_shortcut.py" "$HOME/.local/bin/kdictate toggle" || true
+fi
 
 echo "Installing WayVR integration if possible..."
 if [ -f "$APP/scripts/install_wayvr_integration.sh" ]; then
