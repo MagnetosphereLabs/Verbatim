@@ -377,6 +377,10 @@ cp -a "$ROOT/systemd" "$APP/systemd"
 cp "$ROOT/requirements.txt" "$APP/requirements.txt"
 install -m 0755 "$ROOT/bin/kdictate" "$BIN/kdictate"
 
+if [ -f "$ROOT/scripts/verbatim-wayvr" ]; then
+  install -m 0755 "$ROOT/scripts/verbatim-wayvr" "$BIN/verbatim-wayvr"
+fi
+
 # Optional repo files.
 if [ -d "$ROOT/docs" ]; then
   cp -a "$ROOT/docs" "$APP/docs"
@@ -422,6 +426,17 @@ rm -f "$DESKTOP_FILE"
 
 echo "Registering Super+V in COSMIC..."
 "$APP/venv/bin/python" "$APP/scripts/register_cosmic_shortcut.py" "$HOME/.local/bin/kdictate toggle"
+
+echo "Installing WayVR integration if possible..."
+if [ -x "$APP/scripts/install_wayvr_integration.sh" ]; then
+  if command -v wayvr >/dev/null 2>&1 || command -v wayvrctl >/dev/null 2>&1 || [ -d "$HOME/.config/wayvr" ]; then
+    bash "$APP/scripts/install_wayvr_integration.sh" || true
+  else
+    echo "WayVR not detected. Skipping WayVR watch/keyboard integration."
+    echo "After installing or launching WayVR once, run:"
+    echo "  bash $APP/scripts/install_wayvr_integration.sh"
+  fi
+fi
 
 wait_for_daemon() {
   local label="$1"
