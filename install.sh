@@ -356,13 +356,23 @@ echo
 echo "Copying Verbatim files..."
 rm -rf "$APP/app" "$APP/scripts" "$APP/systemd" "$APP/docs"
 mkdir -p "$APP"
+
 cp -a "$ROOT/app" "$APP/app"
 cp -a "$ROOT/scripts" "$APP/scripts"
 cp -a "$ROOT/systemd" "$APP/systemd"
-cp -a "$ROOT/docs" "$APP/docs"
 cp "$ROOT/requirements.txt" "$APP/requirements.txt"
-cp "$ROOT/README.md" "$APP/README.md" 2>/dev/null || true
 install -m 0755 "$ROOT/bin/kdictate" "$BIN/kdictate"
+
+# Optional repo files.
+if [ -d "$ROOT/docs" ]; then
+  cp -a "$ROOT/docs" "$APP/docs"
+else
+  mkdir -p "$APP/docs"
+fi
+
+if [ -f "$ROOT/README.md" ]; then
+  cp "$ROOT/README.md" "$APP/README.md"
+fi
 
 echo "Creating Python environment..."
 /usr/bin/python3 -m venv --system-site-packages "$APP/venv"
