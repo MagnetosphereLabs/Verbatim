@@ -159,6 +159,9 @@ sudo apt-get install -y \
   ffmpeg \
   git \
   glslc \
+  spirv-headers \
+  spirv-tools \
+  spirv-tools-dev \
   vulkan-tools \
   libvulkan1 \
   libvulkan-dev \
@@ -256,7 +259,7 @@ else
   KDICTATE_DEVICE="cpu"
   KDICTATE_COMPUTE_TYPE="int8"
 
-  sudo apt-get install -y cmake ninja-build glslc
+  sudo apt-get install -y cmake ninja-build glslc spirv-headers spirv-tools spirv-tools-dev
 
   WHISPER_CPP_DIR="$APP/whisper.cpp"
   if [ ! -d "$WHISPER_CPP_DIR/.git" ]; then
@@ -270,25 +273,33 @@ else
   
   if [ "$GPU_BACKEND" = "vulkan" ]; then
     echo "Building whisper.cpp with Vulkan."
+  
     if cmake -S "$WHISPER_CPP_DIR" -B "$BUILD_DIR" -G Ninja \
         -DGGML_VULKAN=ON \
-        -DCMAKE_BUILD_TYPE=Release; then
-      cmake --build "$BUILD_DIR" -j"$(nproc)"
+        -DCMAKE_BUILD_TYPE=Release \
+      && cmake --build "$BUILD_DIR" -j"$(nproc)"; then
+      echo "whisper.cpp Vulkan build complete."
     else
       echo
-      echo "Warning: Vulkan whisper.cpp configuration failed."
+      echo "Warning: whisper.cpp Vulkan build failed on this system."
       echo "Falling back to CPU whisper.cpp build so installation can still complete."
+      echo "GPU acceleration can be retried later after Vulkan/SPIR-V packages are corrected."
       echo
+  
       GPU_BACKEND="cpu"
       rm -rf "$BUILD_DIR"
+  
       cmake -S "$WHISPER_CPP_DIR" -B "$BUILD_DIR" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release
+  
       cmake --build "$BUILD_DIR" -j"$(nproc)"
     fi
   else
     echo "Building whisper.cpp CPU fallback."
+  
     cmake -S "$WHISPER_CPP_DIR" -B "$BUILD_DIR" -G Ninja \
       -DCMAKE_BUILD_TYPE=Release
+  
     cmake --build "$BUILD_DIR" -j"$(nproc)"
   fi
 
