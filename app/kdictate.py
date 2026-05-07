@@ -1322,6 +1322,10 @@ def doctor_text() -> str:
     try:
         run(["wl-copy"], input_text="", timeout=1.0)
         lines.append("Wayland clipboard: ok")
+    except subprocess.TimeoutExpired:
+        # wl-copy may stay alive as the clipboard owner on Wayland.
+        # That is normal and usable, not a failure.
+        lines.append("Wayland clipboard: ok (wl-copy stayed alive as clipboard owner)")
     except Exception as exc:
         lines.append(f"Wayland clipboard: failed ({exc})")
     try:
