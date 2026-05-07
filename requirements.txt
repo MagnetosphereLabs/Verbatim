@@ -1,0 +1,8 @@
+faster-whisper>=1.1.1,<2
+sounddevice>=0.5.1
+soundfile>=0.12.1
+numpy>=1.26
+pycairo>=1.26.0
+evdev>=1.7.1
+nvidia-cublas-cu12>=12.4
+nvidia-cudnn-cu12>=9,<10
