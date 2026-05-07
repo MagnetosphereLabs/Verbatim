@@ -108,23 +108,39 @@ fi
 echo "Detected GPU path: $GPU_BACKEND (${GPU_NAME:-unknown})"
 echo
 echo "Choose Whisper model:"
-echo "  1) Speed     ~142 MiB disk, ~388 MB memory"
-echo "  2) Balanced  ~466 MiB disk, ~852 MB memory [default]"
-echo "  3) Quality   ~2.9 GiB disk, ~3.9 GB memory"
-printf "Selection [2]: "
-read -r MODEL_CHOICE || true
+echo "  1) Speed     base.en   ~142 MiB disk, ~388 MB memory"
+echo "  2) Balanced  small.en  ~466 MiB disk, ~852 MB memory [default]"
+echo "  3) Quality   large-v3  ~2.9 GiB disk, ~3.9 GB memory"
+
+MODEL_CHOICE="${VERBATIM_MODEL_CHOICE:-}"
+
+if [ -z "$MODEL_CHOICE" ]; then
+  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    printf "Selection [2]: " > /dev/tty
+    read -r MODEL_CHOICE < /dev/tty || true
+  else
+    echo "No interactive terminal detected; using Balanced [2]."
+    MODEL_CHOICE="2"
+  fi
+fi
+
 MODEL_CHOICE="${MODEL_CHOICE:-2}"
 
 case "$MODEL_CHOICE" in
-  1)
+  1|speed|Speed|SPEED)
     KDICTATE_MODEL="base.en"
     KDICTATE_PROFILE="speed"
     ;;
-  3)
+  3|quality|Quality|QUALITY)
     KDICTATE_MODEL="large-v3"
     KDICTATE_PROFILE="quality"
     ;;
+  2|balanced|Balanced|BALANCED|"")
+    KDICTATE_MODEL="small.en"
+    KDICTATE_PROFILE="balanced"
+    ;;
   *)
+    echo "Unknown model selection '$MODEL_CHOICE'; using Balanced [2]."
     KDICTATE_MODEL="small.en"
     KDICTATE_PROFILE="balanced"
     ;;
