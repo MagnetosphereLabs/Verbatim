@@ -373,6 +373,7 @@ mkdir -p "$APP"
 
 cp -a "$ROOT/app" "$APP/app"
 cp -a "$ROOT/scripts" "$APP/scripts"
+chmod +x "$APP/scripts/"*.sh "$APP/scripts/verbatim-wayvr" 2>/dev/null || true
 cp -a "$ROOT/systemd" "$APP/systemd"
 cp "$ROOT/requirements.txt" "$APP/requirements.txt"
 install -m 0755 "$ROOT/bin/kdictate" "$BIN/kdictate"
@@ -428,14 +429,18 @@ echo "Registering Super+V in COSMIC..."
 "$APP/venv/bin/python" "$APP/scripts/register_cosmic_shortcut.py" "$HOME/.local/bin/kdictate toggle"
 
 echo "Installing WayVR integration if possible..."
-if [ -x "$APP/scripts/install_wayvr_integration.sh" ]; then
-  if command -v wayvr >/dev/null 2>&1 || command -v wayvrctl >/dev/null 2>&1 || [ -d "$HOME/.config/wayvr" ]; then
+if [ -f "$APP/scripts/install_wayvr_integration.sh" ]; then
+  chmod +x "$APP/scripts/install_wayvr_integration.sh" || true
+
+  if command -v wayvr >/dev/null 2>&1 || command -v wayvrctl >/dev/null 2>&1 || pgrep -f 'WayVR.AppImage|/wayvr|wayvr' >/dev/null 2>&1 || [ -d "$HOME/.config/wayvr" ]; then
     bash "$APP/scripts/install_wayvr_integration.sh" || true
   else
     echo "WayVR not detected. Skipping WayVR watch/keyboard integration."
     echo "After installing or launching WayVR once, run:"
     echo "  bash $APP/scripts/install_wayvr_integration.sh"
   fi
+else
+  echo "WayVR integration script missing from installed app files."
 fi
 
 wait_for_daemon() {
