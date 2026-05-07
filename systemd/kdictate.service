@@ -1,0 +1,16 @@
+[Unit]
+Description=KDictate Cosmic Whisper Dictation Daemon
+After=graphical-session.target pipewire.service pipewire-pulse.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/kdictate daemon
+Restart=on-failure
+RestartSec=2
+Environment=KDICTATE_MODEL=large-v3
+Environment=KDICTATE_DEVICE=cuda
+Environment=KDICTATE_COMPUTE_TYPE=float16
+
+[Install]
+WantedBy=default.target
