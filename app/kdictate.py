@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
+import fcntl
 import math
 import os
 import select
@@ -58,6 +60,7 @@ _load_config_env()
 
 RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
 SOCKET_PATH = RUNTIME_DIR / "kdictate.sock"
+LOCK_PATH = RUNTIME_DIR / "kdictate.daemon.lock"
 MODEL_NAME = os.environ.get("KDICTATE_MODEL", "small.en")
 BACKEND = os.environ.get("KDICTATE_BACKEND", "faster-whisper").strip().lower()
 DEVICE = os.environ.get("KDICTATE_DEVICE", "cuda")
@@ -692,10 +695,22 @@ class SocketServer:
 
     def _run(self) -> None:
         _ensure_dirs()
+        
+        # Remove stale socket files. If another live daemon owns the socket,
+        # bind() below will fail and this daemon will exit cleanly.
         with contextlib.suppress(FileNotFoundError):
             SOCKET_PATH.unlink()
+        
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.bind(str(SOCKET_PATH))
+        
+        try:
+            srv.bind(str(SOCKET_PATH))
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                log(f"Socket already in use at {SOCKET_PATH}; another daemon is already running")
+                return
+            raise
+        
         os.chmod(SOCKET_PATH, 0o600)
         srv.listen(12)
         log(f"Socket listening at {SOCKET_PATH}")
@@ -774,6 +789,18 @@ def daemon_main() -> int:
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     _ensure_dirs()
 
+    # Prevent duplicate daemon instances from racing for the same UNIX socket.
+    lock_fh = open(LOCK_PATH, "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_fh.seek(0)
+        lock_fh.truncate()
+        lock_fh.write(str(os.getpid()))
+        lock_fh.flush()
+    except BlockingIOError:
+        log("Another KDictate/Verbatim daemon already holds the daemon lock; exiting")
+        return 0
+
     # GTK imports are intentionally delayed so CLI commands stay lightweight.
     try:
         import gi
@@ -801,8 +828,13 @@ def daemon_main() -> int:
 
     injector = InputInjector()
     injector.ensure()
-
+    
     app = Gtk.Application(application_id=APP_ID)
+    
+    # This is a background daemon. Without hold(), Gtk.Application may exit cleanly
+    # when no visible window is active, which makes the systemd service appear
+    # "successful" but dead.
+    app.hold()
 
     class Overlay:
         def __init__(self, gtk_app) -> None:
