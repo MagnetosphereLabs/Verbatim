@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CMD="${1:-toggle}"
+KDICTATE_BIN="${KDICTATE_BIN:-$HOME/.local/bin/kdictate}"
+
+if [ ! -x "$KDICTATE_BIN" ]; then
+  notify-send "Verbatim" "Verbatim is not installed or ~/.local/bin/kdictate is missing." >/dev/null 2>&1 || true
+  exit 1
+fi
+
+case "$CMD" in
+  toggle|start|cancel|status)
+    "$KDICTATE_BIN" "$CMD"
+    ;;
+  *)
+    echo "Usage: verbatim-wayvr [toggle|start|cancel|status]" >&2
+    exit 2
+    ;;
+esac
+
+# Optional confirmation feedback when wayvrctl exists.
+# This is non-critical: dictation must still work without wayvrctl.
+if command -v wayvrctl >/dev/null 2>&1; then
+  wayvrctl haptics -i 0.35 -d 0.08 -f 0.1 0 >/dev/null 2>&1 || true
+fi
