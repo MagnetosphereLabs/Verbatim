@@ -40,6 +40,7 @@ APP_DIRS=(
 BIN_FILES=(
   "$HOME/.local/bin/verbatim"
   "$HOME/.local/bin/kdictate"
+  "$HOME/.local/bin/verbatim-wayvr"
 )
 
 SERVICE_NAMES=(
@@ -83,6 +84,89 @@ for app in "${APP_DIRS[@]}"; do
     "$app/venv/bin/python" "$app/scripts/register_cosmic_shortcut.py" --remove >/dev/null 2>&1 || true
   fi
 done
+
+echo "Removing WayVR integration..."
+
+WAYVR_WATCH="$HOME/.config/wayvr/theme/gui/watch.xml"
+WAYVR_KEYBOARD="$HOME/.config/wayvr/theme/gui/keyboard.xml"
+WAYVR_MIC_ICON="$HOME/.config/wayvr/theme/verbatim-mic.svg"
+WAYVR_BACKUP="$HOME/.config/wayvr/verbatim-backups"
+
+mkdir -p "$WAYVR_BACKUP" 2>/dev/null || true
+
+python3 - "$WAYVR_WATCH" "$WAYVR_KEYBOARD" "$WAYVR_BACKUP" <<'PY' || true
+from pathlib import Path
+import re
+import shutil
+import sys
+import time
+
+watch = Path(sys.argv[1])
+keyboard = Path(sys.argv[2])
+backup = Path(sys.argv[3])
+stamp = time.strftime("%Y%m%d-%H%M%S")
+
+default_watch_grid = '''          <!-- Four buttons -->
+          <div flex_direction="column" gap="8">
+            <div gap="8">
+              <Button id="btn_keyboard" macro="button_style" _press="::OverlayToggle kbd" tooltip="EDIT_MODE.KEYBOARD" tooltip_side="left">
+                <sprite src_builtin="watch/keyboard.svg" width="40" height="40" />
+              </Button>
+              <Button id="btn_edit_mode" macro="button_style" _press="::EditToggle" tooltip="WATCH.EDIT_MODE" tooltip_side="left">
+                <sprite color="~color_text" width="40" height="40" src="watch/edit.svg" />
+              </Button>
+            </div>
+            <div gap="8">
+              <Button macro="button_style" _press="::PlayspaceRecenter" tooltip="WATCH.RECENTER" tooltip_side="left">
+                <sprite width="40" height="40" color="~color_text" src="watch/recenter.svg" />
+              </Button>
+              <Button macro="button_style" _press="::PlayspaceFixFloor" tooltip="WATCH.FIX_FLOOR" tooltip_side="left">
+                <sprite width="40" height="40" color="~color_text" src="watch/fix-floor.svg" />
+              </Button>
+            </div>
+          </div>'''
+
+if watch.exists():
+    text = watch.read_text(encoding="utf-8")
+    if "btn_verbatim_dictation" in text:
+        backup.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(watch, backup / f"watch.xml.before-verbatim-remove.{stamp}")
+
+        text = re.sub(
+            r'''          <!-- Four buttons -->\s*
+          <div flex_direction="column" gap="8">[\s\S]*?          </div>\s*
+        </rectangle>''',
+            default_watch_grid + "\n        </rectangle>",
+            text,
+            count=1,
+        )
+
+        watch.write_text(text, encoding="utf-8")
+
+if keyboard.exists():
+    text = keyboard.read_text(encoding="utf-8")
+    if "btn_verbatim_dictation" in text:
+        backup.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(keyboard, backup / f"keyboard.xml.before-verbatim-remove.{stamp}")
+
+        text = re.sub(
+            r'\s*<Button[^>]*id="btn_verbatim_dictation"[\s\S]*?</Button>\s*<VerticalSeparator\s*/>\s*',
+            "\n",
+            text,
+            count=1,
+        )
+
+        text = re.sub(
+            r'\s*<Button[^>]*id="btn_verbatim_dictation"[\s\S]*?</Button>\s*',
+            "\n",
+            text,
+            count=1,
+        )
+
+        keyboard.write_text(text, encoding="utf-8")
+PY
+
+rm -f "$WAYVR_MIC_ICON"
 
 echo "Removing user services and autostart entries..."
 
