@@ -1,5 +1,6 @@
 [Unit]
-Description=KDictate Cosmic Whisper Dictation Daemon
+Description=Verbatim Local AI Dictation Daemon
+Documentation=https://github.com/MagnetosphereLabs/Verbatim
 After=graphical-session.target pipewire.service pipewire-pulse.service
 PartOf=graphical-session.target
 
@@ -8,9 +9,7 @@ Type=simple
 ExecStart=%h/.local/bin/kdictate daemon
 Restart=on-failure
 RestartSec=2
-Environment=KDICTATE_MODEL=large-v3
-Environment=KDICTATE_DEVICE=cuda
-Environment=KDICTATE_COMPUTE_TYPE=float16
+KillMode=mixed
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
