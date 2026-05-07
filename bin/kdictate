@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+APP="${KDICTATE_APPDIR:-$HOME/.local/share/kdictate-cosmic}"
+if [ -f "$APP/config.env" ]; then
+  set -a
+  . "$APP/config.env"
+  set +a
+fi
+
+APP="${KDICTATE_APPDIR:-$HOME/.local/share/kdictate-cosmic}"
+VENV="$APP/venv"
+CUDA_LIB_PATH="$(find "$VENV/lib" -type d \( -path "*/nvidia/cublas/lib" -o -path "*/nvidia/cudnn/lib" -o -path "*/nvidia/cuda_nvrtc/lib" \) -print 2>/dev/null | paste -sd: - || true)"
+if [ -n "$CUDA_LIB_PATH" ]; then
+  export LD_LIBRARY_PATH="$CUDA_LIB_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+export GI_TYPELIB_PATH="/usr/local/lib/x86_64-linux-gnu/girepository-1.0:/usr/local/lib/girepository-1.0:/usr/lib/x86_64-linux-gnu/girepository-1.0:${GI_TYPELIB_PATH:-}"
+export LD_LIBRARY_PATH="/usr/local/lib/x86_64-linux-gnu:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+
+APP="${KDICTATE_APPDIR:-$HOME/.local/share/kdictate-cosmic}"
+PY="$APP/venv/bin/python"
+
+if [ ! -x "$PY" ]; then
+  echo "KDictate is not installed yet. Run ./install.sh from the extracted package." >&2
+  exit 127
+fi
+
+LIB_PATH="$($PY - <<'PY' 2>/dev/null || true
+import os
+paths = []
+for modname in ("nvidia.cublas.lib", "nvidia.cudnn.lib"):
+    try:
+        mod = __import__(modname, fromlist=["__file__"])
+        p = os.path.dirname(mod.__file__)
+        if p and p not in paths:
+            paths.append(p)
+    except Exception:
+        pass
+print(":".join(paths))
+PY
+)"
+
+if [ -n "$LIB_PATH" ]; then
+  export LD_LIBRARY_PATH="$LIB_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+LS_LIB="$(ldconfig -p 2>/dev/null | awk '/libgtk4-layer-shell.so/{print $NF; exit}')"
+if [ -n "$LS_LIB" ]; then
+  export LD_PRELOAD="$LS_LIB${LD_PRELOAD:+:$LD_PRELOAD}"
+fi
+
+export KDICTATE_APPDIR="$APP"
+exec "$PY" "$APP/app/kdictate.py" "${@:-toggle}"
