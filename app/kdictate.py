@@ -61,18 +61,152 @@ _load_config_env()
 RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
 SOCKET_PATH = RUNTIME_DIR / "kdictate.sock"
 LOCK_PATH = RUNTIME_DIR / "kdictate.daemon.lock"
-MODEL_NAME = os.environ.get("KDICTATE_MODEL", "small.en")
+QUALITY_PROFILES = {
+    "speed": "base.en",
+    "balanced": "small.en",
+    "quality": "large-v3",
+}
+
+QUALITY_LABELS = {
+    "speed": "Speed / base.en",
+    "balanced": "Balanced / small.en",
+    "quality": "Quality / large-v3",
+}
+
+
+def _truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def _normalize_profile(value: str | None, model: str | None = None) -> str:
+    raw = (value or "").strip().lower()
+    if raw in QUALITY_PROFILES:
+        return raw
+
+    wanted_model = (model or os.environ.get("KDICTATE_MODEL", "small.en")).strip()
+    for profile, profile_model in QUALITY_PROFILES.items():
+        if wanted_model == profile_model:
+            return profile
+
+    return "balanced"
+
+
+def save_runtime_config(updates: dict[str, str]) -> None:
+    """Persist user-adjustable settings without disturbing existing installer keys."""
+    try:
+        _ensure_dirs()
+
+        existing = CONFIG_FILE.read_text(encoding="utf-8").splitlines() if CONFIG_FILE.exists() else []
+        seen: set[str] = set()
+        output: list[str] = []
+
+        for raw in existing:
+            line = raw.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key = line.split("=", 1)[0].strip()
+                if key in updates:
+                    output.append(f"{key}={updates[key]}")
+                    seen.add(key)
+                    continue
+            output.append(raw)
+
+        for key, value in updates.items():
+            if key not in seen:
+                output.append(f"{key}={value}")
+
+        CONFIG_FILE.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+
+        for key, value in updates.items():
+            os.environ[key] = value
+    except Exception as exc:
+        log(f"Could not persist runtime config {updates!r}: {exc!r}")
+
+
+def realtime_transcription_enabled() -> bool:
+    # Default ON unless the user explicitly turns it off.
+    return _truthy(os.environ.get("KDICTATE_REALTIME_TRANSCRIPTION", "1"))
+
+
+def active_silence_to_finish_seconds() -> float:
+    if realtime_transcription_enabled():
+        return float(os.environ.get("KDICTATE_REALTIME_SILENCE_TO_FINISH_SECONDS", "2.85"))
+    return float(os.environ.get("KDICTATE_SILENCE_TO_FINISH_SECONDS", "1.55"))
+
+
+def list_input_microphones() -> list[dict[str, str]]:
+    devices = [{"id": "", "label": "System default"}]
+
+    try:
+        import sounddevice as sd
+
+        for idx, dev in enumerate(sd.query_devices()):
+            if int(dev.get("max_input_channels") or 0) <= 0:
+                continue
+            name = str(dev.get("name") or f"Input {idx}").strip()
+            devices.append({"id": str(idx), "label": f"{name} ({idx})"})
+    except Exception as exc:
+        log(f"Could not enumerate microphones: {exc!r}")
+
+    return devices
+
+
+def set_microphone_device(device_id: str) -> None:
+    global MIC_DEVICE
+    MIC_DEVICE = device_id.strip()
+    save_runtime_config({"KDICTATE_MIC_DEVICE": MIC_DEVICE})
+
+
+def set_realtime_transcription(enabled: bool) -> None:
+    global REALTIME_TRANSCRIPTION
+    REALTIME_TRANSCRIPTION = enabled
+    save_runtime_config({"KDICTATE_REALTIME_TRANSCRIPTION": "1" if enabled else "0"})
+
+
+def apply_quality_profile(profile: str) -> tuple[str, str]:
+    global KDICTATE_PROFILE, MODEL_NAME, WHISPER_CPP_MODEL
+
+    KDICTATE_PROFILE = _normalize_profile(profile)
+    MODEL_NAME = QUALITY_PROFILES[KDICTATE_PROFILE]
+
+    updates = {
+        "KDICTATE_PROFILE": KDICTATE_PROFILE,
+        "KDICTATE_MODEL": MODEL_NAME,
+    }
+
+    if BACKEND == "whisper.cpp":
+        WHISPER_CPP_MODEL = str(APP_DIR / f"models/ggml-{MODEL_NAME}.bin")
+        updates["KDICTATE_WHISPER_CPP_MODEL"] = WHISPER_CPP_MODEL
+
+    save_runtime_config(updates)
+
+    manager = globals().get("ModelManager")
+    if manager is not None:
+        with contextlib.suppress(Exception):
+            manager.clear()
+
+    return KDICTATE_PROFILE, MODEL_NAME
+
+
+KDICTATE_PROFILE = _normalize_profile(os.environ.get("KDICTATE_PROFILE"), os.environ.get("KDICTATE_MODEL"))
+MODEL_NAME = os.environ.get("KDICTATE_MODEL", QUALITY_PROFILES[KDICTATE_PROFILE])
 BACKEND = os.environ.get("KDICTATE_BACKEND", "faster-whisper").strip().lower()
 DEVICE = os.environ.get("KDICTATE_DEVICE", "cuda")
 COMPUTE_TYPE = os.environ.get("KDICTATE_COMPUTE_TYPE", "float16")
 LANGUAGE = os.environ.get("KDICTATE_LANGUAGE", "en")
 WHISPER_CPP_BIN = os.environ.get("KDICTATE_WHISPER_CPP_BIN", str(APP_DIR / "whisper.cpp/build/bin/whisper-cli"))
 WHISPER_CPP_MODEL = os.environ.get("KDICTATE_WHISPER_CPP_MODEL", str(APP_DIR / f"models/ggml-{MODEL_NAME}.bin"))
+MIC_DEVICE = os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
+REALTIME_TRANSCRIPTION = realtime_transcription_enabled()
 MAX_RECORD_SECONDS = float(os.environ.get("KDICTATE_MAX_RECORD_SECONDS", "90"))
 SILENCE_TO_FINISH_SECONDS = float(os.environ.get("KDICTATE_SILENCE_TO_FINISH_SECONDS", "1.55"))
+REALTIME_SILENCE_TO_FINISH_SECONDS = float(os.environ.get("KDICTATE_REALTIME_SILENCE_TO_FINISH_SECONDS", "2.85"))
 
 WINDOW_W = 330
 WINDOW_H = 118
+LISTENING_PREVIEW_EXTRA_H = 144
+LISTENING_PREVIEW_WINDOW_H = WINDOW_H + LISTENING_PREVIEW_EXTRA_H
+SETTINGS_EXTRA_H = 214
+SETTINGS_WINDOW_H = WINDOW_H + SETTINGS_EXTRA_H
 
 
 def _ensure_dirs() -> None:
@@ -410,8 +544,10 @@ class KeyboardMonitor:
                     log(f"Keyboard monitor read failed: {exc!r}")
 
 
+
 class ModelManager:
     _model = None
+    _model_name: str | None = None
     _lock = threading.Lock()
     _loading = False
     _load_error: str | None = None
@@ -419,6 +555,13 @@ class ModelManager:
     @classmethod
     def is_loading(cls) -> bool:
         return cls._loading
+
+    @classmethod
+    def clear(cls) -> None:
+        with cls._lock:
+            cls._model = None
+            cls._model_name = None
+            cls._load_error = None
 
     @classmethod
     def load(cls):
@@ -431,14 +574,20 @@ class ModelManager:
             return None
 
         with cls._lock:
-            if cls._model is not None:
+            if cls._model is not None and cls._model_name == MODEL_NAME:
                 return cls._model
+
+            cls._model = None
+            cls._model_name = None
             cls._loading = True
             cls._load_error = None
+
             log(f"Loading faster-whisper model={MODEL_NAME} device={DEVICE} compute_type={COMPUTE_TYPE}")
+
             try:
                 from faster_whisper import WhisperModel
                 cls._model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE)
+                cls._model_name = MODEL_NAME
                 log("Whisper model loaded")
                 return cls._model
             except Exception as exc:
@@ -455,8 +604,8 @@ class ModelManager:
                 cls.load()
             except Exception:
                 pass
-        threading.Thread(target=worker, daemon=True).start()
 
+        threading.Thread(target=worker, daemon=True).start()
 
 def transcribe_with_whisper_cpp(wav_path: str) -> str:
     """Transcribe via whisper.cpp, usually Vulkan on AMD/Intel/non-NVIDIA GPUs."""
@@ -466,7 +615,32 @@ def transcribe_with_whisper_cpp(wav_path: str) -> str:
     if not bin_path.exists():
         raise RuntimeError(f"whisper.cpp binary not found: {bin_path}")
     if not model_path.exists():
-        raise RuntimeError(f"whisper.cpp model not found: {model_path}")
+        # Quality can now be changed after install. If the requested ggml model
+        # was not installed originally, download it using the existing
+        # whisper.cpp helper before failing.
+        download_script = bin_path.parents[2] / "models" / "download-ggml-model.sh" if len(bin_path.parents) >= 3 else None
+
+        if download_script is not None and download_script.exists():
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            log(f"Downloading missing whisper.cpp model {MODEL_NAME} to {model_path.parent}")
+
+            proc = subprocess.run(
+                [str(download_script), MODEL_NAME, str(model_path.parent)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=1800,
+                check=False,
+            )
+
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"Could not download whisper.cpp model {MODEL_NAME}: "
+                    f"{proc.stderr.strip() or proc.stdout.strip()}"
+                )
+
+        if not model_path.exists():
+            raise RuntimeError(f"whisper.cpp model not found: {model_path}")
 
     # whisper-cli writes plain text to stdout with -otxt disabled by default in
     # newer builds; -nt removes timestamps, -np removes progress noise.
@@ -527,6 +701,9 @@ class DictationEngine:
         self.lock = threading.Lock()
         self.recording = False
         self.cancelled = False
+        self.realtime_busy = False
+        self.realtime_last_start = 0.0
+        self.realtime_last_audio_seconds = 0.0
 
     def start(self) -> None:
         if self.recording:
@@ -534,6 +711,9 @@ class DictationEngine:
         self.state = AudioState(frames=[])
         self.cancelled = False
         self.recording = True
+        self.realtime_busy = False
+        self.realtime_last_start = 0.0
+        self.realtime_last_audio_seconds = 0.0
         now = time.time()
         self.state.started_at = now
         self.state.last_speech_at = now
@@ -542,11 +722,21 @@ class DictationEngine:
             import numpy as np
             import sounddevice as sd
 
+            selected_mic = os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
+            device_arg = int(selected_mic) if selected_mic.isdigit() else (selected_mic or None)
+
             try:
-                dev = sd.query_devices(kind="input")
+                if device_arg is None:
+                    dev = sd.query_devices(kind="input")
+                else:
+                    dev = sd.query_devices(device=device_arg, kind="input")
+
                 samplerate = int(dev.get("default_samplerate") or 48000)
+                mic_label = str(dev.get("name", "default"))
             except Exception:
                 samplerate = 48000
+                mic_label = "default"
+
             self.state.samplerate = samplerate
 
             def callback(indata, frames, time_info, status):
@@ -563,10 +753,14 @@ class DictationEngine:
                 channels=1,
                 dtype="float32",
                 blocksize=0,
+                device=device_arg,
                 callback=callback,
             )
             self.stream.start()
-            log(f"Recording started samplerate={samplerate}")
+            log(
+                f"Recording started samplerate={samplerate} "
+                f"microphone={mic_label!r} realtime={realtime_transcription_enabled()}"
+            )
         except Exception as exc:
             self.recording = False
             self.ui.show_error(f"Microphone failed: {exc}")
@@ -606,9 +800,18 @@ class DictationEngine:
         if rms > threshold:
             self.state.speech_seen = True
             self.state.last_speech_at = now
-            self.ui.set_status("listening", "Listening", "Keep talking, or pause to finish.")
 
-        if self.state.speech_seen and (now - self.state.last_speech_at) >= SILENCE_TO_FINISH_SECONDS and age >= 1.1:
+            if realtime_transcription_enabled():
+                self.ui.set_status("listening", "Listening live", "Transcribing as you speak.")
+            else:
+                self.ui.set_status("listening", "Listening", "Keep talking, or pause to finish.")
+
+        if realtime_transcription_enabled():
+            self._maybe_realtime_transcribe(now)
+
+        silence_to_finish = active_silence_to_finish_seconds()
+
+        if self.state.speech_seen and (now - self.state.last_speech_at) >= silence_to_finish and age >= 1.1:
             self.finish()
         elif age >= MAX_RECORD_SECONDS:
             self.finish()
@@ -640,49 +843,97 @@ class DictationEngine:
         self.ui.set_status("transcribing", "Transcribing", f"Whisper {MODEL_NAME} via {BACKEND}")
         threading.Thread(target=self._transcribe_worker, args=(frames, samplerate), daemon=True).start()
 
-    def _transcribe_worker(self, frames, samplerate: int) -> None:
-        wav_path = None
+    def _transcribe_file(self, wav_path: str, *, realtime: bool = False) -> str:
+        if BACKEND == "whisper.cpp":
+            return transcribe_with_whisper_cpp(wav_path)
+
+        model = ModelManager.load()
+        segments, info = model.transcribe(
+            wav_path,
+            language=LANGUAGE,
+            task="transcribe",
+            beam_size=1 if realtime else 5,
+            vad_filter=False if realtime else True,
+            vad_parameters={"min_silence_duration_ms": 700 if realtime else 450},
+            condition_on_previous_text=False,
+            temperature=0.0,
+            no_speech_threshold=0.35,
+            compression_ratio_threshold=2.4,
+        )
+
+        return " ".join(seg.text.strip() for seg in segments).strip()
+
+    def _write_wav_and_transcribe(self, frames, samplerate: int, *, realtime: bool) -> str:
+        import numpy as np
+        import soundfile as sf
+
+        audio = np.concatenate(frames).astype(np.float32)
+        min_seconds = 0.85 if realtime else 0.30
+
+        if audio.size < samplerate * min_seconds:
+            return ""
+
+        fd, wav_path = tempfile.mkstemp(prefix="kdictate-live-" if realtime else "kdictate-", suffix=".wav")
+        os.close(fd)
+
         try:
-            import numpy as np
-            import soundfile as sf
-
-            audio = np.concatenate(frames).astype(np.float32)
-            if audio.size < samplerate * 0.30:
-                self.ui.invoke_cancel("too short")
-                return
-
-            fd, wav_path = tempfile.mkstemp(prefix="kdictate-", suffix=".wav")
-            os.close(fd)
             sf.write(wav_path, audio, samplerate)
-            if BACKEND == "whisper.cpp":
-                text = transcribe_with_whisper_cpp(wav_path)
-            else:
-                model = ModelManager.load()
-                segments, info = model.transcribe(
-                    wav_path,
-                    language=LANGUAGE,
-                    task="transcribe",
-                    beam_size=5,
-                    vad_filter=True,
-                    vad_parameters={"min_silence_duration_ms": 450},
-                    condition_on_previous_text=False,
-                    temperature=0.0,
-                    no_speech_threshold=0.35,
-                    compression_ratio_threshold=2.4,
-                )
-                text = " ".join(seg.text.strip() for seg in segments).strip()
+            return self._transcribe_file(wav_path, realtime=realtime)
+        finally:
+            with contextlib.suppress(Exception):
+                os.unlink(wav_path)
+
+    def _maybe_realtime_transcribe(self, now: float) -> None:
+        if self.realtime_busy or self.cancelled:
+            return
+
+        if now - self.realtime_last_start < 1.25:
+            return
+
+        with self.lock:
+            frames = list(self.state.frames)
+            samplerate = self.state.samplerate
+
+        if not frames or samplerate <= 0:
+            return
+
+        audio_seconds = sum(len(frame) for frame in frames) / float(samplerate)
+
+        if audio_seconds < 1.1 or audio_seconds - self.realtime_last_audio_seconds < 0.65:
+            return
+
+        self.realtime_busy = True
+        self.realtime_last_start = now
+        self.realtime_last_audio_seconds = audio_seconds
+
+        threading.Thread(target=self._realtime_worker, args=(frames, samplerate), daemon=True).start()
+
+    def _realtime_worker(self, frames, samplerate: int) -> None:
+        try:
+            text = self._write_wav_and_transcribe(frames, samplerate, realtime=True)
+            text = " ".join(text.split())
+
+            if text and self.recording and not self.cancelled and realtime_transcription_enabled():
+                self.ui.invoke_realtime_text(text)
+        except Exception as exc:
+            log(f"Realtime transcription preview failed: {exc!r}")
+        finally:
+            self.realtime_busy = False
+
+    def _transcribe_worker(self, frames, samplerate: int) -> None:
+        try:
+            text = self._write_wav_and_transcribe(frames, samplerate, realtime=False)
+
             if not text:
                 self.ui.invoke_cancel("no speech recognized")
                 return
+
+            text = " ".join(text.split())
             log(f"Transcribed {len(text)} chars: {text[:240]!r}")
             self.ui.invoke_transcribed(text)
         except Exception as exc:
             log(f"Transcription failed: {exc!r}\n{traceback.format_exc()}")
             self.ui.invoke_error(str(exc))
-        finally:
-            if wav_path:
-                with contextlib.suppress(Exception):
-                    os.unlink(wav_path)
 
 
 class SocketServer:
@@ -886,6 +1137,14 @@ def daemon_main() -> int:
             self.paster = ClipboardPaster(injector, self.monitor.pause_for)
             self.layer_enabled = False
 
+            self.settings_open = False
+            self.settings_anim = 0.0
+            self.preview_anim = 0.0
+            self.preview_draw_chars = 0.0
+            self.current_window_h = WINDOW_H
+            self.microphones = list_input_microphones()
+            self.realtime_preview = ""
+
             self.area = Gtk.DrawingArea()
             self.area.set_content_width(WINDOW_W)
             self.area.set_content_height(WINDOW_H)
@@ -911,16 +1170,100 @@ def daemon_main() -> int:
                     self.layer_enabled = False
                     log(f"Layer shell init failed: {exc!r}")
 
-            GLib.timeout_add(33, self.animate)
+            GLib.timeout_add(16, self.animate)
             GLib.timeout_add(55, self.tick)
 
         def on_close_request(self, *args):
             self.invoke_cancel("closed")
             return True
 
+        def _hit_circle(self, x: float, y: float, cx: float, cy: float, radius: float = 17.0) -> bool:
+            return ((x - cx) * (x - cx) + (y - cy) * (y - cy)) <= radius * radius
+
         def on_click(self, gesture, n_press, x, y):
-            if x >= WINDOW_W - 42 and y <= 42:
+            if self._hit_circle(x, y, WINDOW_W - 58, 27):
                 self.invoke_cancel("clicked close")
+                return
+
+            if self._hit_circle(x, y, WINDOW_W - 27, 27):
+                self.open_settings()
+                return
+
+            if self.settings_open:
+                self.on_settings_click(x, y)
+
+        def refresh_microphones(self) -> None:
+            self.microphones = list_input_microphones()
+
+        def selected_mic_label(self) -> str:
+            selected = os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
+
+            for dev in self.microphones:
+                if dev["id"] == selected:
+                    return dev["label"]
+
+            return "System default"
+
+        def on_settings_click(self, x, y) -> None:
+            if 130 <= y <= 176:
+                self.cycle_microphone()
+            elif 184 <= y <= 230:
+                self.cycle_quality()
+            elif 238 <= y <= 284:
+                set_realtime_transcription(not realtime_transcription_enabled())
+                self.set_status("settings", "Settings", "Realtime transcription updated.")
+
+            self.area.queue_draw()
+
+        def cycle_microphone(self) -> None:
+            self.refresh_microphones()
+
+            selected = os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
+            ids = [dev["id"] for dev in self.microphones]
+
+            if selected not in ids:
+                selected = ""
+
+            next_id = ids[(ids.index(selected) + 1) % len(ids)] if ids else ""
+            set_microphone_device(next_id)
+            self.set_status("settings", "Settings", f"Microphone: {self.selected_mic_label()}")
+
+        def cycle_quality(self) -> None:
+            order = ["speed", "balanced", "quality"]
+            current = _normalize_profile(os.environ.get("KDICTATE_PROFILE"), os.environ.get("KDICTATE_MODEL"))
+            next_profile = order[(order.index(current) + 1) % len(order)] if current in order else "balanced"
+
+            profile, model = apply_quality_profile(next_profile)
+            self.set_status("settings", "Settings", f"Quality: {QUALITY_LABELS[profile]}")
+
+            if BACKEND != "whisper.cpp":
+                ModelManager.warm_async()
+
+        def open_settings(self):
+            self.engine.cancel("settings opened")
+            self.monitor.disarm()
+            self.refresh_microphones()
+            self.settings_open = True
+            self.realtime_preview = ""
+            self.preview_draw_chars = 0.0
+            self.set_window_height(SETTINGS_WINDOW_H)
+            self.position()
+            self.set_status("settings", "Settings", "Choose microphone, quality, and realtime preview.")
+            self.fade_target = 1.0
+            self.visible = True
+            self.window.present()
+            self.area.queue_draw()
+
+        def set_window_height(self, height: int) -> None:
+            if self.current_window_h == height:
+                return
+
+            self.current_window_h = height
+            self.area.set_content_height(height)
+            self.window.set_default_size(WINDOW_W, height)
+
+            with contextlib.suppress(Exception):
+                self.window.set_size_request(WINDOW_W, height)
 
         def tick(self):
             self.engine.tick()
@@ -930,13 +1273,35 @@ def daemon_main() -> int:
             now = time.time()
             dt = max(0.001, min(0.09, now - self.last_frame))
             self.last_frame = now
+
             self.level_smooth += (self.level - self.level_smooth) * min(1.0, dt * 12.0)
             self.fade_alpha += (self.fade_target - self.fade_alpha) * min(1.0, dt * 16.0)
+
+            target_settings = 1.0 if self.settings_open else 0.0
+            self.settings_anim += (target_settings - self.settings_anim) * min(1.0, dt * 14.0)
+
+            target_preview = 1.0 if self.engine.recording and realtime_transcription_enabled() and not self.settings_open else 0.0
+            self.preview_anim += (target_preview - self.preview_anim) * min(1.0, dt * 14.0)
+
+            if self.realtime_preview:
+                target_chars = float(len(self.realtime_preview))
+                if self.preview_draw_chars < target_chars:
+                    self.preview_draw_chars = min(target_chars, self.preview_draw_chars + max(1.0, dt * 52.0))
+                else:
+                    self.preview_draw_chars = target_chars
+            else:
+                self.preview_draw_chars = 0.0
+
             if self.fade_target == 0.0 and self.fade_alpha < 0.03 and self.visible:
                 self.window.hide()
                 self.visible = False
+
+            if not self.settings_open and self.settings_anim < 0.03 and self.preview_anim < 0.03:
+                self.set_window_height(WINDOW_H)
+
             with contextlib.suppress(Exception):
                 self.window.set_opacity(max(0.0, min(1.0, self.fade_alpha)))
+
             self.area.queue_draw()
             return True
 
@@ -960,10 +1325,12 @@ def daemon_main() -> int:
             else:
                 sw, sh, ox, oy = 1920, 1080, 0, 0
 
+            window_h = self.current_window_h
+
             if caret:
                 cx, cy = caret
                 x = max(16, min(cx, sw - WINDOW_W - 16))
-                y = max(16, min(cy, sh - WINDOW_H - 16))
+                y = max(16, min(cy, sh - window_h - 16))
             else:
                 x = ox + max(16, int((sw - WINDOW_W) / 2))
                 y = oy + max(16, int(sh * 0.18))
@@ -981,24 +1348,37 @@ def daemon_main() -> int:
             if self.engine.recording:
                 self.invoke_cancel("toggle")
                 return
+
+            self.settings_open = False
+            self.realtime_preview = ""
+            self.preview_draw_chars = 0.0
+
+            if realtime_transcription_enabled():
+                self.set_window_height(LISTENING_PREVIEW_WINDOW_H)
+                subtitle = "Speak now. Live transcript is on."
+            else:
+                self.set_window_height(WINDOW_H)
+                subtitle = "Speak now. Pause to finish."
+
             self.position()
-            self.set_status("listening", "Listening", "Speak now. Pause to finish.")
+            self.set_status("listening", "Listening", subtitle)
             self.level = 0.0
             self.fade_alpha = 0.0
             self.fade_target = 1.0
             self.visible = True
             self.monitor.arm(ignore_for=0.8)
             self.window.present()
-            
+
             # Load GPU model only when the user invokes dictation.
             # This keeps the daemon ready without occupying NVIDIA VRAM 24/7.
             if BACKEND != "whisper.cpp":
                 ModelManager.warm_async()
-            
+
             self.engine.start()
 
         def close_smoothly(self):
             self.monitor.disarm()
+            self.settings_open = False
             self.fade_target = 0.0
 
         def set_level(self, rms: float) -> None:
@@ -1014,6 +1394,9 @@ def daemon_main() -> int:
         def invoke_transcribed(self, text: str):
             GLib.idle_add(self._on_transcribed, text)
 
+        def invoke_realtime_text(self, text: str):
+            GLib.idle_add(self._on_realtime_text, text)
+
         def invoke_error(self, msg: str):
             GLib.idle_add(self.show_error, msg)
 
@@ -1023,6 +1406,17 @@ def daemon_main() -> int:
         def _cancel_on_ui(self, reason: str):
             self.engine.cancel(reason)
             self.close_smoothly()
+            return False
+
+        def _on_realtime_text(self, text: str):
+            if self.engine.recording and realtime_transcription_enabled():
+                previous_len = len(self.realtime_preview)
+                self.realtime_preview = text
+
+                if len(text) < previous_len:
+                    self.preview_draw_chars = float(len(text))
+
+                self.set_status("listening", "Listening live", "Transcribing as you speak.")
             return False
 
         def _on_transcribed(self, text: str):
@@ -1036,6 +1430,7 @@ def daemon_main() -> int:
 
         def show_error(self, msg: str):
             self.monitor.disarm()
+            self.settings_open = False
             self.set_status("error", "Needs attention", msg[:96])
             self.fade_target = 1.0
             self.visible = True
@@ -1054,38 +1449,179 @@ def daemon_main() -> int:
             cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
             cr.close_path()
 
+        def _text_width(self, cr, text: str) -> float:
+            extents = cr.text_extents(text)
+            return float(extents.width if hasattr(extents, "width") else extents[2])
+
+        def wrap_text_lines(self, cr, text: str, max_width: float, max_lines: int) -> list[str]:
+            words = text.split()
+            if not words:
+                return []
+
+            lines: list[str] = []
+            current = ""
+
+            for word in words:
+                candidate = word if not current else f"{current} {word}"
+                if self._text_width(cr, candidate) <= max_width:
+                    current = candidate
+                    continue
+
+                if current:
+                    lines.append(current)
+                    current = word
+
+                if len(lines) >= max_lines:
+                    break
+
+            if current and len(lines) < max_lines:
+                lines.append(current)
+
+            if len(lines) == max_lines and len(" ".join(words)) > len(" ".join(lines)):
+                lines[-1] = lines[-1].rstrip(". ") + "..."
+
+            return lines
+
+        def draw_settings_row(self, cr, y: float, label: str, value: str, a: float) -> None:
+            self.draw_round_rect(cr, 24, y, WINDOW_W - 48, 38, 13)
+            cr.set_source_rgba(1, 1, 1, 0.070 * a)
+            cr.fill()
+
+            cr.set_source_rgba(1, 1, 1, 0.92 * a)
+            cr.set_font_size(12.4)
+            cr.move_to(39, y + 16)
+            cr.show_text(label)
+
+            cr.set_source_rgba(1, 1, 1, 0.58 * a)
+            cr.set_font_size(11.0)
+            shown = value[:34] + ("..." if len(value) > 34 else "")
+            cr.move_to(39, y + 31)
+            cr.show_text(shown)
+
+            cr.set_source_rgba(1, 1, 1, 0.42 * a)
+            cr.set_line_width(1.6)
+            cr.move_to(WINDOW_W - 45, y + 16)
+            cr.line_to(WINDOW_W - 38, y + 19)
+            cr.line_to(WINDOW_W - 45, y + 22)
+            cr.stroke()
+
+        def draw_live_preview(self, cr, width: int, a: float, base: tuple[float, float, float]) -> None:
+            y = 110
+            panel_h = LISTENING_PREVIEW_EXTRA_H - 14
+
+            cr.save()
+            cr.rectangle(14, 102, width - 28, panel_h + 12)
+            cr.clip()
+
+            glow = 0.035 + 0.025 * (0.5 + 0.5 * math.sin(time.time() * 3.6))
+            cr.set_source_rgba(base[0], base[1], base[2], glow * a)
+            self.draw_round_rect(cr, 20, y + 20, width - 40, panel_h - 24, 18)
+            cr.fill()
+
+            cr.set_source_rgba(1, 1, 1, 0.072 * a)
+            self.draw_round_rect(cr, 20, y + 20, width - 40, panel_h - 24, 18)
+            cr.fill()
+
+            cr.set_source_rgba(1, 1, 1, 0.12 * a)
+            self.draw_round_rect(cr, 20.5, y + 20.5, width - 41, panel_h - 25, 18)
+            cr.set_line_width(1)
+            cr.stroke()
+
+            cr.set_source_rgba(1, 1, 1, 0.78 * a)
+            cr.set_font_size(11.5)
+            cr.move_to(28, y + 11)
+            cr.show_text("Live transcript")
+
+            cr.set_font_size(15.0)
+            visible_chars = max(0, min(len(self.realtime_preview), int(self.preview_draw_chars)))
+            text = self.realtime_preview[:visible_chars].strip()
+
+            if not text:
+                text = "Listening..."
+
+            lines = self.wrap_text_lines(cr, text, width - 62, 4)
+
+            cr.set_source_rgba(1, 1, 1, 0.92 * a)
+            text_y = y + 47
+            for line in lines:
+                cr.move_to(32, text_y)
+                cr.show_text(line)
+                text_y += 22
+
+            if realtime_transcription_enabled() and self.engine.recording:
+                caret_on = math.sin(time.time() * 7.5) > -0.15
+                if caret_on:
+                    last_line = lines[-1] if lines else ""
+                    caret_x = 32 + min(width - 72, self._text_width(cr, last_line) + 4)
+                    caret_y = text_y - 20
+                    cr.set_source_rgba(base[0], base[1], base[2], 0.92 * a)
+                    cr.set_line_width(2)
+                    cr.move_to(caret_x, caret_y - 13)
+                    cr.line_to(caret_x, caret_y + 4)
+                    cr.stroke()
+
+            cr.restore()
+
         def draw(self, area, cr, width, height):
             # Outside the card stays transparent; the card itself is a clean solid dark material.
             a = max(0.0, min(1.0, self.fade_alpha))
+            settings_alpha = a * max(0.0, min(1.0, self.settings_anim))
+            preview_alpha = a * max(0.0, min(1.0, self.preview_anim))
+            panel_extra = max(
+                SETTINGS_EXTRA_H * max(0.0, min(1.0, self.settings_anim)),
+                LISTENING_PREVIEW_EXTRA_H * max(0.0, min(1.0, self.preview_anim)),
+            )
+            effective_h = WINDOW_H + panel_extra
+
             cr.save()
             cr.set_operator(cairo.OPERATOR_OVER)  # normal alpha compositing; do not punch transparent holes
 
             # Soft shadow only outside the card.
             cr.set_source_rgba(0, 0, 0, 0.28 * a)
-            self.draw_round_rect(cr, 10, 14, width - 20, height - 20, 24)
+            self.draw_round_rect(cr, 10, 14, width - 20, effective_h - 20, 24)
             cr.fill()
 
             # One unified solid dark card. No separate transparent-looking islands.
             cr.set_source_rgba(0.045, 0.047, 0.060, 0.995 * a)
-            self.draw_round_rect(cr, 8, 7, width - 16, height - 17, 24)
+            self.draw_round_rect(cr, 8, 7, width - 16, effective_h - 17, 24)
             cr.fill()
 
             # Subtle border/highlight.
             cr.set_source_rgba(1, 1, 1, 0.105 * a)
-            self.draw_round_rect(cr, 8.5, 7.5, width - 17, height - 18, 24)
+            self.draw_round_rect(cr, 8.5, 7.5, width - 17, effective_h - 18, 24)
             cr.set_line_width(1)
             cr.stroke()
 
-            # Close button: simple, visible, on the same card material.
+            # Close button, moved left just enough to make room for Settings.
+            close_x = width - 58
             cr.set_source_rgba(1, 1, 1, 0.105 * a)
-            cr.arc(width - 27, 27, 13, 0, 2 * math.pi)
+            cr.arc(close_x, 27, 13, 0, 2 * math.pi)
             cr.fill()
+
             cr.set_source_rgba(1, 1, 1, 0.78 * a)
             cr.set_line_width(2)
-            cr.move_to(width - 32, 22)
-            cr.line_to(width - 22, 32)
-            cr.move_to(width - 22, 22)
-            cr.line_to(width - 32, 32)
+            cr.move_to(close_x - 5, 22)
+            cr.line_to(close_x + 5, 32)
+            cr.move_to(close_x + 5, 22)
+            cr.line_to(close_x - 5, 32)
+            cr.stroke()
+
+            # Settings gear button.
+            gear_x = width - 27
+            cr.set_source_rgba(1, 1, 1, 0.105 * a)
+            cr.arc(gear_x, 27, 13, 0, 2 * math.pi)
+            cr.fill()
+
+            cr.set_source_rgba(1, 1, 1, 0.76 * a)
+            cr.set_line_width(1.8)
+
+            for idx in range(8):
+                ang = idx * math.pi / 4.0
+                cr.move_to(gear_x + math.cos(ang) * 5.8, 27 + math.sin(ang) * 5.8)
+                cr.line_to(gear_x + math.cos(ang) * 8.7, 27 + math.sin(ang) * 8.7)
+
+            cr.stroke()
+            cr.arc(gear_x, 27, 4.7, 0, 2 * math.pi)
             cr.stroke()
 
             # Reactive microphone glow.
@@ -1100,6 +1636,9 @@ def daemon_main() -> int:
             elif self.mode == "error":
                 base = (1.00, 0.25, 0.36)
                 lev = 0.55
+            elif self.mode == "settings":
+                base = (0.72, 0.80, 1.00)
+                lev = 0.35
             else:
                 base = (0.55, 0.86, 1.00) if lev > 0.13 else (1.00, 0.29, 0.43)
 
@@ -1150,7 +1689,7 @@ def daemon_main() -> int:
             # Tiny level meter, directly on the solid card.
             if self.mode == "listening":
                 x0, y0 = 96, 88
-                x1 = width - 48
+                x1 = width - 94
                 cr.set_line_width(4)
                 cr.set_line_cap(cairo.LINE_CAP_ROUND)
 
@@ -1165,6 +1704,40 @@ def daemon_main() -> int:
                 cr.stroke()
 
                 cr.set_line_cap(cairo.LINE_CAP_BUTT)
+
+            if preview_alpha > 0.02:
+                self.draw_live_preview(cr, width, preview_alpha, base)
+
+            if settings_alpha > 0.02:
+                cr.save()
+                cr.rectangle(14, 106, width - 28, SETTINGS_EXTRA_H - 10)
+                cr.clip()
+
+                cr.set_source_rgba(1, 1, 1, 0.86 * settings_alpha)
+                cr.set_font_size(13.4)
+                cr.move_to(24, 120)
+                cr.show_text("Settings")
+
+                self.draw_settings_row(cr, 130, "Microphone", self.selected_mic_label(), settings_alpha)
+
+                quality = _normalize_profile(os.environ.get("KDICTATE_PROFILE"), os.environ.get("KDICTATE_MODEL"))
+                self.draw_settings_row(
+                    cr,
+                    184,
+                    "Quality",
+                    QUALITY_LABELS.get(quality, QUALITY_LABELS["balanced"]),
+                    settings_alpha,
+                )
+
+                realtime_label = "On - live preview, longer pause" if realtime_transcription_enabled() else "Off - paste after pause"
+                self.draw_settings_row(cr, 238, "Realtime transcription", realtime_label, settings_alpha)
+
+                cr.set_source_rgba(1, 1, 1, 0.38 * settings_alpha)
+                cr.set_font_size(10.5)
+                cr.move_to(25, 307)
+                cr.show_text("Click a row to cycle it. Gear cancels dictation and opens this menu.")
+
+                cr.restore()
 
             cr.restore()
 
