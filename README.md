@@ -10,7 +10,7 @@ curl -fsSL https://raw.githubusercontent.com/MagnetosphereLabs/Verbatim/main/uni
 
 # Verbatim
 
-Local AI voice dictation for Linux.
+Local AI voice dictation for Linux. Tested on Pop!_OS, but should also work on common Linux distros like Ubuntu or Linux Mint.
 
 Click a text input, press **Super+V**, speak naturally, pause for a moment, and Verbatim types what you said into the focused app. It works with browsers and other desktop apps.
 
@@ -31,3 +31,9 @@ Click a text input, press **Super+V**, speak naturally, pause for a moment, and 
 - NVIDIA GPU acceleration through faster-whisper and CTranslate2
 - AMD and other Vulkan GPU support through whisper.cpp
 - CPU fallback only when GPU acceleration is not available
+- Automatically detects when WiVRN audio devices are active and connected to your headset.
+- Switches your microphone input to the WiVRN headset mic when VR mode is ready.
+- Switches your audio output to the WiVRN headset speakers for seamless VR audio.
+- Remembers your previous desktop input and output before switching to WiVRN.
+- Automatically restores your original audio devices when WiVRN closes or disconnects.
+- Runs in the background, so audio switching works even when the overlay is not open.
