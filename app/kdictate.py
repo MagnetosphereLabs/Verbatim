@@ -139,6 +139,8 @@ VR_AUDIO_STATE = {
     "active": False,
     "restore_source": None,
     "restore_sink": None,
+    "easyeffects_paused": False,
+    "easyeffects_kind": None,
 }
 
 
@@ -258,8 +260,128 @@ def _set_default_audio(kind: str, name: str) -> None:
         log(f"pactl {cmd} {name!r} failed: {proc.stderr.strip() or proc.stdout.strip()}")
 
 
+def easyeffects_vr_pause_enabled() -> bool:
+    return _truthy(os.environ.get("KDICTATE_WIVRN_PAUSE_EASYEFFECTS", "1"))
+
+
+def _flatpak_app_available(app_id: str) -> bool:
+    if not command_exists("flatpak"):
+        return False
+
+    try:
+        proc = subprocess.run(
+            ["flatpak", "info", app_id],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1.2,
+            check=False,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _easyeffects_command_prefix(preferred: str | None = None) -> tuple[list[str] | None, str | None]:
+    if preferred == "native" and command_exists("easyeffects"):
+        return ["easyeffects"], "native"
+
+    if preferred == "flatpak" and _flatpak_app_available("com.github.wwmm.easyeffects"):
+        return ["flatpak", "run", "com.github.wwmm.easyeffects"], "flatpak"
+
+    if command_exists("easyeffects"):
+        return ["easyeffects"], "native"
+
+    if _flatpak_app_available("com.github.wwmm.easyeffects"):
+        return ["flatpak", "run", "com.github.wwmm.easyeffects"], "flatpak"
+
+    return None, None
+
+
+def _easyeffects_is_running() -> bool:
+    if not command_exists("pgrep"):
+        return False
+
+    patterns = [
+        r"(^|/)easyeffects($| )",
+        r"com\.github\.wwmm\.easyeffects",
+    ]
+
+    for pattern in patterns:
+        try:
+            proc = subprocess.run(
+                ["pgrep", "-f", pattern],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=0.5,
+                check=False,
+            )
+            if proc.returncode == 0:
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
+def _pause_easyeffects_for_vr() -> None:
+    if not easyeffects_vr_pause_enabled():
+        return
+
+    if VR_AUDIO_STATE.get("easyeffects_paused"):
+        return
+
+    if not _easyeffects_is_running():
+        return
+
+    prefix, kind = _easyeffects_command_prefix()
+    if prefix is None:
+        return
+
+    VR_AUDIO_STATE["easyeffects_paused"] = True
+    VR_AUDIO_STATE["easyeffects_kind"] = kind
+
+    try:
+        proc = subprocess.run(
+            [*prefix, "-q"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2.5,
+            check=False,
+        )
+        log(f"Paused EasyEffects for WiVRn mode kind={kind!r} rc={proc.returncode}")
+    except Exception as exc:
+        log(f"Could not pause EasyEffects for WiVRn mode: {exc!r}")
+
+
+def _restore_easyeffects_after_vr() -> None:
+    if not VR_AUDIO_STATE.get("easyeffects_paused"):
+        return
+
+    preferred = str(VR_AUDIO_STATE.get("easyeffects_kind") or "")
+    prefix, kind = _easyeffects_command_prefix(preferred or None)
+
+    VR_AUDIO_STATE["easyeffects_paused"] = False
+    VR_AUDIO_STATE["easyeffects_kind"] = None
+
+    if prefix is None:
+        return
+
+    try:
+        subprocess.Popen(
+            [*prefix, "--gapplication-service"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        log(f"Restored EasyEffects after WiVRn mode kind={kind!r}")
+    except Exception as exc:
+        log(f"Could not restore EasyEffects after WiVRn mode: {exc!r}")
+
+
 def _restore_vr_audio_defaults() -> None:
     if not VR_AUDIO_STATE.get("active"):
+        _restore_easyeffects_after_vr()
         return
 
     restore_source = str(VR_AUDIO_STATE.get("restore_source") or "")
@@ -273,6 +395,8 @@ def _restore_vr_audio_defaults() -> None:
 
     if restore_sink and restore_sink in known_sinks:
         _set_default_audio("sink", restore_sink)
+
+    _restore_easyeffects_after_vr()
 
     log("WiVRn audio disappeared; restored previous desktop audio defaults")
     VR_AUDIO_STATE.update({"active": False, "restore_source": None, "restore_sink": None})
@@ -316,6 +440,8 @@ def apply_wivrn_audio_if_available(*, force: bool = False) -> dict[str, str] | N
 
     if current_sink != sink["name"]:
         _set_default_audio("sink", sink["name"])
+
+    _pause_easyeffects_for_vr()
 
     return {
         "source": source["name"],
@@ -560,6 +686,108 @@ def start_daemon_if_needed() -> bool:
     return False
 
 
+def _focused_text_interface():
+    """Return the focused AT-SPI text interface, if the focused app exposes one."""
+    try:
+        import pyatspi
+    except Exception:
+        return None
+
+    try:
+        desktop = pyatspi.Registry.getDesktop(0)
+        seen = 0
+
+        def find_focused(obj, depth=0):
+            nonlocal seen
+            seen += 1
+
+            if seen > 1400 or depth > 12:
+                return None
+
+            try:
+                state = obj.getState()
+                if state.contains(pyatspi.STATE_FOCUSED):
+                    return obj
+            except Exception:
+                pass
+
+            try:
+                count = obj.childCount
+            except Exception:
+                count = 0
+
+            for idx in range(count):
+                try:
+                    found = find_focused(obj[idx], depth + 1)
+                    if found:
+                        return found
+                except Exception:
+                    continue
+
+            return None
+
+        focused = find_focused(desktop)
+        if not focused:
+            return None
+
+        try:
+            return focused.queryText()
+        except Exception:
+            return None
+    except Exception as exc:
+        log(f"AT-SPI focused text lookup failed: {exc!r}")
+        return None
+
+
+def _focused_text_insertion_offset(text_iface) -> int:
+    try:
+        selection_count = int(text_iface.getNSelections())
+        if selection_count > 0:
+            start, end = text_iface.getSelection(0)
+            return max(0, int(min(start, end)))
+    except Exception:
+        pass
+
+    try:
+        return max(0, int(text_iface.caretOffset))
+    except Exception:
+        return 0
+
+
+def should_prefix_space_before_paste(text: str) -> bool:
+    """Only add a space when the focused text field has non-space text immediately before the caret."""
+    if not text or text[:1].isspace():
+        return False
+
+    # Do not force a space before punctuation-like dictated output.
+    if text[:1] in ".,!?;:%)]}":
+        return False
+
+    text_iface = _focused_text_interface()
+    if text_iface is None:
+        return False
+
+    offset = _focused_text_insertion_offset(text_iface)
+    if offset <= 0:
+        return False
+
+    try:
+        previous = text_iface.getText(max(0, offset - 1), offset)
+    except Exception:
+        return False
+
+    if not previous:
+        return False
+
+    return not previous[-1].isspace()
+
+
+def apply_contextual_leading_space(text: str) -> str:
+    if should_prefix_space_before_paste(text):
+        return " " + text
+    return text
+
+
 class InputInjector:
     """Persistent virtual keyboard used to send Ctrl+V on Wayland."""
 
@@ -650,6 +878,8 @@ class ClipboardPaster:
         self.pause_monitor = pause_monitor
 
     def paste_text(self, text: str) -> tuple[bool, str]:
+        text = apply_contextual_leading_space(text)
+
         if not command_exists("wl-copy"):
             return False, "wl-copy is not installed. The installer should have installed wl-clipboard."
 
@@ -1438,7 +1668,9 @@ def daemon_main() -> int:
             self.drag_origin_x = 0
             self.drag_origin_y = 0
             self.microphones = list_input_microphones()
+            self.settings_options_cache: dict[str, list[tuple[str, str]]] = {}
             self.audio_poll_busy = False
+            self.rebuild_settings_options_cache()
             self.realtime_preview = ""
 
             self.area = Gtk.DrawingArea()
@@ -1551,29 +1783,44 @@ def daemon_main() -> int:
             def worker() -> None:
                 try:
                     apply_wivrn_audio_if_available()
-                    GLib.idle_add(self._on_audio_devices_changed)
+                    devices = list_input_microphones()
+                    GLib.idle_add(self._on_audio_devices_changed, devices)
                 finally:
                     self.audio_poll_busy = False
 
             threading.Thread(target=worker, daemon=True).start()
             return True
 
-        def _on_audio_devices_changed(self):
+        def _on_audio_devices_changed(self, devices):
+            self.microphones = devices
+            self.rebuild_settings_options_cache()
+
             if self.settings_open:
-                self.refresh_microphones()
                 self.area.queue_draw()
+
             return False
+
+        def rebuild_settings_options_cache(self) -> None:
+            self.settings_options_cache["mic"] = [(dev["id"], dev["label"]) for dev in self.microphones]
+            self.settings_options_cache["quality"] = [
+                ("speed", QUALITY_LABELS["speed"]),
+                ("balanced", QUALITY_LABELS["balanced"]),
+                ("quality", QUALITY_LABELS["quality"]),
+            ]
+            self.settings_options_cache["realtime"] = [
+                ("1", "On - live transcript"),
+                ("0", "Off - final paste only"),
+            ]
 
         def refresh_microphones(self) -> None:
             self.microphones = list_input_microphones()
+            self.rebuild_settings_options_cache()
 
         def selected_mic_label(self) -> str:
             selected = os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
 
-            if selected in {"", WIVRN_AUTO_DEVICE_ID}:
-                active = apply_wivrn_audio_if_available(force=(selected == WIVRN_AUTO_DEVICE_ID))
-                if active is not None:
-                    return "WiVRn microphone (auto)"
+            if selected in {"", WIVRN_AUTO_DEVICE_ID} and VR_AUDIO_STATE.get("active"):
+                return "WiVRn microphone (auto)"
 
             for dev in self.microphones:
                 if dev["id"] == selected:
@@ -1582,9 +1829,9 @@ def daemon_main() -> int:
             return "System default"
 
         def settings_options(self, key: str) -> list[tuple[str, str]]:
+            options = list(self.settings_options_cache.get(key, []))
+
             if key == "mic":
-                self.refresh_microphones()
-                options = [(dev["id"], dev["label"]) for dev in self.microphones]
                 selected = os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
 
                 # Keep the dropdown elegant even on systems with many input devices,
@@ -1603,20 +1850,7 @@ def daemon_main() -> int:
 
                 return visible
 
-            if key == "quality":
-                return [
-                    ("speed", QUALITY_LABELS["speed"]),
-                    ("balanced", QUALITY_LABELS["balanced"]),
-                    ("quality", QUALITY_LABELS["quality"]),
-                ]
-
-            if key == "realtime":
-                return [
-                    ("1", "On - live transcript"),
-                    ("0", "Off - final paste only"),
-                ]
-
-            return []
+            return options
 
         def selected_setting_value(self, key: str) -> str:
             if key == "mic":
@@ -1672,8 +1906,10 @@ def daemon_main() -> int:
 
         def toggle_dropdown(self, key: str) -> None:
             self.open_dropdown = None if self.open_dropdown == key else key
-            if key == "mic":
+
+            if key == "mic" and self.open_dropdown == "mic":
                 self.refresh_microphones()
+
             self.update_settings_height()
             self.area.queue_draw()
 
@@ -1704,7 +1940,6 @@ def daemon_main() -> int:
         def open_settings(self):
             self.engine.cancel("settings opened")
             self.monitor.disarm()
-            self.refresh_microphones()
             self.settings_open = True
             self.open_dropdown = None
             self.realtime_preview = ""
@@ -2474,7 +2709,7 @@ def doctor_text() -> str:
     if BACKEND == "whisper.cpp":
         lines.append(f"whisper.cpp bin: {WHISPER_CPP_BIN}")
         lines.append(f"whisper.cpp model: {WHISPER_CPP_MODEL}")
-    for cmd in ["wl-copy", "wl-paste", "pactl", "nvidia-smi"]:
+    for cmd in ["wl-copy", "wl-paste", "pactl", "easyeffects", "flatpak", "nvidia-smi"]:
         lines.append(f"{cmd}: {'ok' if command_exists(cmd) else 'missing'}")
     try:
         import evdev  # noqa: F401
@@ -2519,6 +2754,15 @@ def doctor_text() -> str:
             lines.append("WiVRn audio: not connected")
     except Exception as exc:
         lines.append(f"WiVRn audio: check failed ({exc})")
+
+    try:
+        _prefix, kind = _easyeffects_command_prefix()
+        if kind:
+            lines.append(f"EasyEffects VR pause: available ({kind}), running={'yes' if _easyeffects_is_running() else 'no'}")
+        else:
+            lines.append("EasyEffects VR pause: not installed")
+    except Exception as exc:
+        lines.append(f"EasyEffects VR pause: check failed ({exc})")
 
     return "\n".join(lines)
 
