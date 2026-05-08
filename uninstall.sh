@@ -89,10 +89,11 @@ done
 
 echo "Removing WayVR integration..."
 
-WAYVR_WATCH="$HOME/.config/wayvr/theme/gui/watch.xml"
-WAYVR_KEYBOARD="$HOME/.config/wayvr/theme/gui/keyboard.xml"
-WAYVR_MIC_ICON="$HOME/.config/wayvr/theme/verbatim-mic.svg"
-WAYVR_BACKUP="$HOME/.config/wayvr/verbatim-backups"
+WAYVR_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/wayvr"
+WAYVR_WATCH="$WAYVR_CONFIG/theme/gui/watch.xml"
+WAYVR_KEYBOARD="$WAYVR_CONFIG/theme/gui/keyboard.xml"
+WAYVR_MIC_ICON="$WAYVR_CONFIG/theme/verbatim-mic.svg"
+WAYVR_BACKUP="$WAYVR_CONFIG/verbatim-backups"
 
 mkdir -p "$WAYVR_BACKUP" 2>/dev/null || true
 
@@ -128,12 +129,51 @@ default_watch_grid = '''          <!-- Four buttons -->
             </div>
           </div>'''
 
+
+def backup_file(path: Path, prefix: str) -> None:
+    if not path.exists():
+        return
+    backup.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, backup / f"{prefix}.before-verbatim-remove.{stamp}")
+
+
+def remove_verbatim_blocks(text: str) -> str:
+    # New robust installer block.
+    text = re.sub(
+        r'\s*<!-- Verbatim Dictation: installed by Verbatim -->[\s\S]*?<!-- /Verbatim Dictation -->\s*',
+        "\n",
+        text,
+        count=0,
+    )
+
+    # Older installer block: button followed by its separator.
+    text = re.sub(
+        r'\s*<Button\b[^>]*id="btn_verbatim_dictation"[\s\S]*?</Button>\s*<VerticalSeparator\s*/>\s*',
+        "\n",
+        text,
+        count=0,
+    )
+
+    # Safety cleanup: button without separator.
+    text = re.sub(
+        r'\s*<Button\b[^>]*id="btn_verbatim_dictation"[\s\S]*?</Button>\s*',
+        "\n",
+        text,
+        count=0,
+    )
+
+    # Collapse excessive blank lines created by removal, without reformatting the file.
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text
+
+
 if watch.exists():
     text = watch.read_text(encoding="utf-8")
-    if "btn_verbatim_dictation" in text:
-        backup.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(watch, backup / f"watch.xml.before-verbatim-remove.{stamp}")
 
+    if "btn_verbatim_dictation" in text or "Verbatim Dictation" in text:
+        backup_file(watch, "watch.xml")
+
+        # Watch integration replaced the 2x2 quick grid, so restore the default grid.
         text = re.sub(
             r'''          <!-- Four buttons -->\s*
           <div flex_direction="column" gap="8">[\s\S]*?          </div>\s*
@@ -143,32 +183,26 @@ if watch.exists():
             count=1,
         )
 
+        # Also remove any future marker-style Verbatim block, if present.
+        text = remove_verbatim_blocks(text)
         watch.write_text(text, encoding="utf-8")
+
 
 if keyboard.exists():
     text = keyboard.read_text(encoding="utf-8")
-    if "btn_verbatim_dictation" in text:
-        backup.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(keyboard, backup / f"keyboard.xml.before-verbatim-remove.{stamp}")
 
-        text = re.sub(
-            r'\s*<Button[^>]*id="btn_verbatim_dictation"[\s\S]*?</Button>\s*<VerticalSeparator\s*/>\s*',
-            "\n",
-            text,
-            count=1,
-        )
+    if "btn_verbatim_dictation" in text or "Verbatim Dictation" in text:
+        backup_file(keyboard, "keyboard.xml")
 
-        text = re.sub(
-            r'\s*<Button[^>]*id="btn_verbatim_dictation"[\s\S]*?</Button>\s*',
-            "\n",
-            text,
-            count=1,
-        )
+        # Keyboard integration should be removed in place. Do not replace the
+        # whole keyboard XML, because users/WayVR may have customized it.
+        text = remove_verbatim_blocks(text)
 
         keyboard.write_text(text, encoding="utf-8")
 PY
 
 rm -f "$WAYVR_MIC_ICON"
+rmdir "$WAYVR_CONFIG/theme" "$WAYVR_CONFIG/theme/gui" 2>/dev/null || true
 
 echo "Removing user services and autostart entries..."
 
