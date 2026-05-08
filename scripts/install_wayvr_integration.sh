@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-WAYVR_CONFIG="$HOME/.config/wayvr"
+WAYVR_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/wayvr"
 WAYVR_GUI="$WAYVR_CONFIG/theme/gui"
 BACKUP_DIR="$WAYVR_CONFIG/verbatim-backups"
 
@@ -119,35 +119,78 @@ watch_path.write_text(watch, encoding="utf-8")
 # ---------------------------------------------------------------------
 # KEYBOARD INTEGRATION
 #
-# Upstream keyboard.xml has a top tray with:
-#   btn_dashboard, panels_root, apps_root, tray_root
+# Upstream keyboard.xml has historically had a top tray with a burger/menu
+# button, but its formatting/attribute order can change between WayVR
+# versions. Do not depend on one exact multiline string.
 #
-# The safest non invasive spot is inside tray_root before the burger/menu
-# button. This adds a mic shortcut to the keyboard without touching
-# generated keycaps.
+# Preferred insertion:
+#   1) before the ::ContextMenuOpen menu_burger button
+#   2) before any button that uses keyboard/burger.svg
+#   3) as the first child inside tray_root
+#
+# This keeps the mic shortcut on the keyboard without touching generated
+# keycaps and without breaking if WayVR reformats keyboard.xml.
 # ---------------------------------------------------------------------
 
-keyboard_button = f'''          <Button id="btn_verbatim_dictation" macro="button_style" _press="{action}" tooltip_str="Verbatim Dictation">
+keyboard_button = f'''
+          <!-- Verbatim Dictation: installed by Verbatim -->
+          <Button id="btn_verbatim_dictation" macro="button_style" _press="{action}" tooltip_str="Verbatim Dictation">
             <sprite width="38" height="38" color="~color_text" src_ext="{mic_icon}" />
           </Button>
 
-          <VerticalSeparator />'''
+          <VerticalSeparator />
+          <!-- /Verbatim Dictation -->'''
 
+# Remove any previous Verbatim keyboard insertion, including older versions
+# that did not have marker comments.
 keyboard = re.sub(
-    r'\s*<Button[^>]*id="btn_verbatim_dictation"[\s\S]*?</Button>\s*<VerticalSeparator\s*/>\s*',
+    r'\s*<!-- Verbatim Dictation: installed by Verbatim -->[\s\S]*?<!-- /Verbatim Dictation -->\s*',
     "\n",
     keyboard,
     count=1,
 )
 
-burger_needle = '''          <Button macro="button_style" _press="::ContextMenuOpen menu_burger">
-            <sprite width="38" height="38" color="~color_text" src_builtin="keyboard/burger.svg" />
-          </Button>'''
+keyboard = re.sub(
+    r'\s*<Button\b[^>]*id="btn_verbatim_dictation"[\s\S]*?</Button>\s*(?:<VerticalSeparator\s*/>\s*)?',
+    "\n",
+    keyboard,
+    count=1,
+)
 
-if burger_needle in keyboard:
-    keyboard = keyboard.replace(burger_needle, keyboard_button + "\n" + burger_needle, 1)
-else:
-    raise SystemExit("Could not find WayVR keyboard burger/menu button insertion point.")
+inserted = False
+
+burger_patterns = [
+    r'(?P<burger>\n(?P<indent>\s*)<Button\b(?=[^>]*_press="::ContextMenuOpen menu_burger")[^>]*>[\s\S]*?</Button>)',
+    r'(?P<burger>\n(?P<indent>\s*)<Button\b[^>]*>[\s\S]*?src_builtin="keyboard/burger\.svg"[\s\S]*?</Button>)',
+]
+
+for pattern in burger_patterns:
+    match = re.search(pattern, keyboard)
+    if not match:
+        continue
+
+    keyboard = keyboard[:match.start("burger")] + keyboard_button + match.group("burger") + keyboard[match.end("burger"):]
+    inserted = True
+    break
+
+if not inserted:
+    tray_match = re.search(
+        r'(?P<tray_open><[^>]*\bid="tray_root"[^>]*>\s*)',
+        keyboard,
+    )
+
+    if tray_match:
+        keyboard = keyboard[:tray_match.end("tray_open")] + keyboard_button + "\n" + keyboard[tray_match.end("tray_open"):]
+        inserted = True
+
+if not inserted:
+    raise SystemExit(
+        "Could not find WayVR keyboard insertion point. "
+        "Looked for menu_burger, keyboard/burger.svg, and tray_root."
+    )
+
+if "btn_verbatim_dictation" not in keyboard:
+    raise SystemExit("Failed to install Verbatim button into WayVR keyboard.xml")
 
 keyboard_path.write_text(keyboard, encoding="utf-8")
 
@@ -162,5 +205,6 @@ echo "  $WATCH_XML"
 echo "  $KEYBOARD_XML"
 echo
 echo "Restart WayVR to reload the custom watch/keyboard UI."
+echo "If WayVR was already open, fully quit and relaunch it so keyboard.xml is reloaded."
 echo "The new mic button calls:"
 echo "  $VERBATIM_ACTION"
