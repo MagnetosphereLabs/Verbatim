@@ -1552,14 +1552,16 @@ class DictationEngine:
         if preview_text:
             preview_audio_seconds = max(0.0, float(self.realtime_preview_audio_seconds or 0.0))
             speech_tail_gap = max(0.0, last_speech_elapsed - preview_audio_seconds)
+            allowed_preview_lag = max(1.25, active_silence_to_finish_seconds() + 0.35)
 
-            if speech_tail_gap <= 0.75:
+            if speech_tail_gap <= allowed_preview_lag:
                 quick_text = normalize_transcript_text(preview_text, final=True)
                 if quick_text:
                     log(
                         "Using current realtime preview for final paste "
                         f"preview_audio={preview_audio_seconds:.2f}s "
-                        f"last_speech={last_speech_elapsed:.2f}s"
+                        f"last_speech={last_speech_elapsed:.2f}s "
+                        f"allowed_lag={allowed_preview_lag:.2f}s"
                     )
                     self.ui.invoke_transcribed(quick_text)
                     return
@@ -1880,6 +1882,7 @@ def daemon_main() -> int:
             self.preview_scroll = 0.0
             self.preview_scroll_target = 0.0
             self.preview_user_scroll_lines = 0
+            self.keep_preview_during_finish = False
             self.current_window_h = WINDOW_H
             self.window_x = 0
             self.window_y = 0
@@ -2222,7 +2225,11 @@ def daemon_main() -> int:
             if self.settings_open or any(value > 0.02 for value in self.dropdown_anim.values()):
                 self.update_settings_height()
 
-            target_preview = 1.0 if self.engine.recording and realtime_transcription_enabled() and not self.settings_open else 0.0
+            target_preview = 1.0 if (
+                (self.engine.recording or self.keep_preview_during_finish)
+                and realtime_transcription_enabled()
+                and not self.settings_open
+            ) else 0.0
             self.preview_anim += (target_preview - self.preview_anim) * min(1.0, dt * 13.0)
 
             if self.realtime_preview:
@@ -2245,8 +2252,21 @@ def daemon_main() -> int:
             if self.fade_target == 0.0 and self.fade_alpha < 0.025 and self.open_anim < 0.04 and self.visible:
                 self.window.hide()
                 self.visible = False
+                self.keep_preview_during_finish = False
+                self.realtime_preview = ""
+                self.preview_anim = 0.0
+                self.preview_draw_chars = 0.0
+                self.preview_scroll = 0.0
+                self.preview_scroll_target = 0.0
+                self.preview_user_scroll_lines = 0
+                self.set_window_height(WINDOW_H)
 
-            if not self.settings_open and self.settings_anim < 0.03 and self.preview_anim < 0.03:
+            if (
+                not self.settings_open
+                and not self.keep_preview_during_finish
+                and self.settings_anim < 0.03
+                and self.preview_anim < 0.015
+            ):
                 self.set_window_height(WINDOW_H)
 
             with contextlib.suppress(Exception):
@@ -2299,6 +2319,7 @@ def daemon_main() -> int:
             self.preview_scroll = 0.0
             self.preview_scroll_target = 0.0
             self.preview_user_scroll_lines = 0
+            self.keep_preview_during_finish = False
 
             if realtime_transcription_enabled():
                 self.set_window_height(LISTENING_PREVIEW_WINDOW_H)
@@ -2406,12 +2427,26 @@ def daemon_main() -> int:
             return False
 
         def _on_transcribed(self, text: str):
+            if realtime_transcription_enabled() and self.realtime_preview:
+                self.keep_preview_during_finish = True
+                self.set_window_height(LISTENING_PREVIEW_WINDOW_H)
+                self.preview_anim = max(self.preview_anim, 1.0)
+                self.preview_draw_chars = max(
+                    self.preview_draw_chars,
+                    float(len(self.realtime_preview)),
+                )
+
             self.set_status("typing", "Typing", text[:68] + ("..." if len(text) > 68 else ""))
-            ok, msg = self.paster.paste_text(text)
-            if not ok:
-                self.show_error(msg)
-            else:
-                self.close_smoothly()
+
+            def paste_worker() -> None:
+                ok, msg = self.paster.paste_text(text)
+
+                if not ok:
+                    GLib.idle_add(self.show_error, msg)
+                else:
+                    GLib.idle_add(self.close_smoothly)
+
+            threading.Thread(target=paste_worker, daemon=True).start()
             return False
 
         def show_error(self, msg: str):
