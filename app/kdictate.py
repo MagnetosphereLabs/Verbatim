@@ -1582,11 +1582,6 @@ class DictationEngine:
             vad_filter=False if realtime else True,
             vad_parameters={"min_silence_duration_ms": 850 if realtime else 450},
             condition_on_previous_text=False if realtime else True,
-            initial_prompt=(
-                "This is continuous voice dictation. "
-                "Use natural punctuation. Do not randomly capitalize words unless "
-                "they begin a sentence or are proper nouns."
-            ),
             temperature=0.0,
             no_speech_threshold=0.35,
             compression_ratio_threshold=2.4,
