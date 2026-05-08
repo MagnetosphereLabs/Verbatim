@@ -27,6 +27,7 @@ import tempfile
 import threading
 import time
 import traceback
+import re
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -644,6 +645,42 @@ def command_exists(name: str) -> bool:
     return subprocess.run(["sh", "-lc", f"command -v {name} >/dev/null 2>&1"], check=False).returncode == 0
 
 
+_SENTENCE_BOUNDARY_STARTERS = (
+    "This", "That", "It", "There", "These", "Those",
+    "Then", "So", "But", "However", "Now", "Next",
+    "Also", "Finally", "Basically", "Actually", "Overall",
+)
+
+
+def normalize_transcript_text(text: str, *, final: bool = False) -> str:
+    """Lightly clean Whisper dictation without rewriting the user's words."""
+    text = " ".join((text or "").split()).strip()
+    if not text:
+        return ""
+
+    # Normal spacing around punctuation.
+    text = re.sub(r"\s+([,.;:!?%)\]\}])", r"\1", text)
+    text = re.sub(r"([(\[\{])\s+", r"\1", text)
+    text = re.sub(r"([.!?])([A-Za-z])", r"\1 \2", text)
+
+    # Conservative repair for the common realtime boundary glitch:
+    # "... talking This next sentence ..." -> "... talking. This next sentence ..."
+    starters = "|".join(re.escape(word) for word in _SENTENCE_BOUNDARY_STARTERS)
+    text = re.sub(rf"(?<=[a-z0-9])\s+(?=({starters})\b)", ". ", text)
+
+    # Capitalize only after clear sentence boundaries.
+    def cap_sentence(match: re.Match) -> str:
+        return match.group(1) + match.group(2).upper()
+
+    text = re.sub(r"(^|[.!?]\s+)([a-z])", cap_sentence, text)
+
+    # Final dictation should usually land as a complete sentence.
+    if final and len(text) > 24 and text[-1] not in ".!?)]}\"'":
+        text += "."
+
+    return text
+
+
 def send_socket(message: str, timeout: float = 2.0) -> str:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)
@@ -755,7 +792,7 @@ def _focused_text_insertion_offset(text_iface) -> int:
 
 
 def should_prefix_space_before_paste(text: str) -> bool:
-    """Only add a space when the focused text field has non-space text immediately before the caret."""
+    """Add a space before pasted dictation when it is continuing existing text."""
     if not text or text[:1].isspace():
         return False
 
@@ -764,22 +801,36 @@ def should_prefix_space_before_paste(text: str) -> bool:
         return False
 
     text_iface = _focused_text_interface()
+
+    # Firefox, Discord, Electron apps, and some browser fields do not always expose
+    # caret text reliably through AT-SPI. In that unknown case, continuing text should not smash words together.
     if text_iface is None:
-        return False
+        return _truthy(os.environ.get("KDICTATE_CONTEXTUAL_SPACE_FALLBACK", "1"))
 
     offset = _focused_text_insertion_offset(text_iface)
     if offset <= 0:
         return False
 
+    previous = ""
+
     try:
-        previous = text_iface.getText(max(0, offset - 1), offset)
+        previous = text_iface.getText(max(0, offset - 1), offset) or ""
     except Exception:
-        return False
+        previous = ""
+
+    # Some apps fail single-character reads but allow a slightly wider slice.
+    if not previous:
+        with contextlib.suppress(Exception):
+            previous = text_iface.getText(max(0, offset - 160), offset) or ""
 
     if not previous:
+        return _truthy(os.environ.get("KDICTATE_CONTEXTUAL_SPACE_FALLBACK", "1"))
+
+    last = previous[-1]
+    if last.isspace() or last in "([{":
         return False
 
-    return not previous[-1].isspace()
+    return True
 
 
 def apply_contextual_leading_space(text: str) -> str:
@@ -1365,8 +1416,13 @@ class DictationEngine:
             task="transcribe",
             beam_size=1 if realtime else 5,
             vad_filter=False if realtime else True,
-            vad_parameters={"min_silence_duration_ms": 700 if realtime else 450},
-            condition_on_previous_text=False,
+            vad_parameters={"min_silence_duration_ms": 850 if realtime else 450},
+            condition_on_previous_text=False if realtime else True,
+            initial_prompt=(
+                "This is continuous voice dictation. "
+                "Use natural punctuation. Do not randomly capitalize words unless "
+                "they begin a sentence or are proper nouns."
+            ),
             temperature=0.0,
             no_speech_threshold=0.35,
             compression_ratio_threshold=2.4,
@@ -1422,7 +1478,7 @@ class DictationEngine:
     def _realtime_worker(self, frames, samplerate: int) -> None:
         try:
             text = self._write_wav_and_transcribe(frames, samplerate, realtime=True)
-            text = " ".join(text.split())
+            text = normalize_transcript_text(text, final=False)
 
             if text and self.recording and not self.cancelled and realtime_transcription_enabled():
                 self.ui.invoke_realtime_text(text)
@@ -1439,7 +1495,7 @@ class DictationEngine:
                 self.ui.invoke_cancel("no speech recognized")
                 return
 
-            text = " ".join(text.split())
+            text = normalize_transcript_text(text, final=True)
             log(f"Transcribed {len(text)} chars: {text[:240]!r}")
             self.ui.invoke_transcribed(text)
         except Exception as exc:
@@ -1720,9 +1776,12 @@ def daemon_main() -> int:
             return ((x - cx) * (x - cx) + (y - cy) * (y - cy)) <= radius * radius
 
         def on_click(self, gesture, n_press, x, y):
-            # Gear is on the left, close is on the far right.
+            # Settings/back control is on the left of the close button.
             if self._hit_circle(x, y, WINDOW_W - 58, 27):
-                self.open_settings()
+                if self.settings_open:
+                    self.show_and_record()
+                else:
+                    self.open_settings()
                 return
 
             if self._hit_circle(x, y, WINDOW_W - 27, 27):
@@ -1883,7 +1942,12 @@ def daemon_main() -> int:
                 items.append({"kind": "row", "key": key, "label": label, "y": y, "h": 38.0})
                 y += 44.0
 
-                if self.open_dropdown == key:
+                # Keep closing dropdowns in the layout until their opacity animation
+                # finishes. This prevents the "teleport then animate" close glitch.
+                anim_amount = max(0.0, min(1.0, self.dropdown_anim.get(key, 0.0)))
+                should_layout_options = self.open_dropdown == key or anim_amount > 0.02
+
+                if should_layout_options:
                     for value, option_label in self.settings_options(key):
                         items.append({
                             "kind": "option",
@@ -1933,7 +1997,7 @@ def daemon_main() -> int:
                 if item["y"] <= y <= item["y"] + item["h"]:
                     if item["kind"] == "row":
                         self.toggle_dropdown(item["key"])
-                    elif item["kind"] == "option":
+                    elif item["kind"] == "option" and self.open_dropdown == item["key"]:
                         self.apply_setting_choice(item["key"], item["value"])
                     return
 
@@ -1975,8 +2039,11 @@ def daemon_main() -> int:
             self.last_frame = now
 
             self.level_smooth += (self.level - self.level_smooth) * min(1.0, dt * 12.0)
-            self.fade_alpha += (self.fade_target - self.fade_alpha) * min(1.0, dt * 9.0)
-            self.open_anim += (self.open_target - self.open_anim) * min(1.0, dt * 6.5)
+
+            fade_rate = 9.5 if self.fade_target > self.fade_alpha else 5.2
+            open_rate = 7.8 if self.open_target > self.open_anim else 4.8
+            self.fade_alpha += (self.fade_target - self.fade_alpha) * min(1.0, dt * fade_rate)
+            self.open_anim += (self.open_target - self.open_anim) * min(1.0, dt * open_rate)
 
             target_settings = 1.0 if self.settings_open else 0.0
             self.settings_anim += (target_settings - self.settings_anim) * min(1.0, dt * 13.0)
@@ -1984,7 +2051,11 @@ def daemon_main() -> int:
 
             for key in self.dropdown_anim:
                 target = 1.0 if self.open_dropdown == key else 0.0
-                self.dropdown_anim[key] += (target - self.dropdown_anim[key]) * min(1.0, dt * 14.0)
+                rate = 12.0 if target > self.dropdown_anim[key] else 7.0
+                self.dropdown_anim[key] += (target - self.dropdown_anim[key]) * min(1.0, dt * rate)
+
+            if self.settings_open or any(value > 0.02 for value in self.dropdown_anim.values()):
+                self.update_settings_height()
 
             target_preview = 1.0 if self.engine.recording and realtime_transcription_enabled() and not self.settings_open else 0.0
             self.preview_anim += (target_preview - self.preview_anim) * min(1.0, dt * 13.0)
@@ -2080,6 +2151,8 @@ def daemon_main() -> int:
             self.open_target = 1.0
             self.visible = True
             self.monitor.arm(ignore_for=0.8)
+            with contextlib.suppress(Exception):
+                self.window.set_opacity(0.0)
             self.window.present()
 
             # Load GPU model only when the user invokes dictation.
@@ -2126,12 +2199,21 @@ def daemon_main() -> int:
         def _on_realtime_text(self, text: str):
             if self.engine.recording and realtime_transcription_enabled():
                 previous_len = len(self.realtime_preview)
+
+                # Whisper can occasionally emit a much shorter interim hypothesis.
+                # Ignoring that one frame regression prevents the live transcript
+                # from jumping upward and then snapping back down.
+                if previous_len > 80 and len(text) < previous_len * 0.72:
+                    log(
+                        "Ignored short realtime preview regression "
+                        f"old_len={previous_len} new_len={len(text)}"
+                    )
+                    return False
+
                 self.realtime_preview = text
 
                 if len(text) < previous_len:
-                    self.preview_draw_chars = float(len(text))
-                    self.preview_scroll = 0.0
-                    self.preview_scroll_target = 0.0
+                    self.preview_draw_chars = min(self.preview_draw_chars, float(len(text)))
 
                 # If the user has not intentionally scrolled back, keep the live
                 # transcript pinned to the newest line with a smooth upward drift.
@@ -2294,34 +2376,23 @@ def daemon_main() -> int:
             panel_y = 112
             panel_h = LISTENING_PREVIEW_EXTRA_H - 12
             viewport_x = 32
-            viewport_y = panel_y + 42
+            viewport_y = panel_y + 31
             viewport_w = width - 64
-            viewport_h = panel_h - 58
+            viewport_h = panel_h - 47
             line_h = 22.0
 
             cr.save()
             cr.rectangle(14, 102, width - 28, panel_h + 18)
             cr.clip()
 
-            pulse = 0.5 + 0.5 * math.sin(time.time() * 3.2)
-            glow = 0.040 + 0.030 * pulse
-            cr.set_source_rgba(base[0], base[1], base[2], glow * a)
+            cr.set_source_rgba(1, 1, 1, 0.066 * a)
             self.draw_round_rect(cr, 20, panel_y + 18, width - 40, panel_h - 20, 18)
             cr.fill()
 
-            cr.set_source_rgba(1, 1, 1, 0.074 * a)
-            self.draw_round_rect(cr, 20, panel_y + 18, width - 40, panel_h - 20, 18)
-            cr.fill()
-
-            cr.set_source_rgba(1, 1, 1, 0.125 * a)
+            cr.set_source_rgba(1, 1, 1, 0.118 * a)
             self.draw_round_rect(cr, 20.5, panel_y + 18.5, width - 41, panel_h - 21, 18)
             cr.set_line_width(1)
             cr.stroke()
-
-            cr.set_source_rgba(1, 1, 1, 0.78 * a)
-            cr.set_font_size(11.5)
-            cr.move_to(28, panel_y + 10)
-            cr.show_text("Live transcript")
 
             cr.set_font_size(15.0)
             visible_chars = max(0, min(len(self.realtime_preview), int(self.preview_draw_chars)))
@@ -2369,7 +2440,7 @@ def daemon_main() -> int:
                     last_line_y = viewport_y + (len(lines) - 1) * line_h - self.preview_scroll
                     if viewport_y - line_h < last_line_y < viewport_y + viewport_h + line_h:
                         caret_x = viewport_x + min(viewport_w - 6, self._text_width(cr, last_line) + 4)
-                        cr.set_source_rgba(base[0], base[1], base[2], 0.92 * a)
+                        cr.set_source_rgba(1, 1, 1, 0.82 * a)
                         cr.set_line_width(2)
                         cr.move_to(caret_x, last_line_y + 1)
                         cr.line_to(caret_x, last_line_y + 18)
@@ -2379,7 +2450,7 @@ def daemon_main() -> int:
             cr.restore()
 
         def draw(self, area, cr, width, height):
-            # Outside the card stays transparent; the card itself is a clean solid dark material.
+            # Outside the card stays transparent; the card itself is a clean solid material.
             a = max(0.0, min(1.0, self.fade_alpha))
             settings_alpha = a * max(0.0, min(1.0, self.settings_anim))
             preview_alpha = a * max(0.0, min(1.0, self.preview_anim))
@@ -2414,23 +2485,33 @@ def daemon_main() -> int:
             cr.set_line_width(1)
             cr.stroke()
 
-            # Settings gear button on the left of the close control.
-            gear_x = width - 58
+            # Settings gear normally; back arrow while already inside settings.
+            control_x = width - 58
             cr.set_source_rgba(1, 1, 1, 0.105 * a)
-            cr.arc(gear_x, 27, 13, 0, 2 * math.pi)
+            cr.arc(control_x, 27, 13, 0, 2 * math.pi)
             cr.fill()
 
             cr.set_source_rgba(1, 1, 1, 0.76 * a)
             cr.set_line_width(1.8)
 
-            for idx in range(8):
-                ang = idx * math.pi / 4.0
-                cr.move_to(gear_x + math.cos(ang) * 5.8, 27 + math.sin(ang) * 5.8)
-                cr.line_to(gear_x + math.cos(ang) * 8.7, 27 + math.sin(ang) * 8.7)
+            if self.settings_open:
+                # Simple back arrow: return to live dictation.
+                cr.move_to(control_x + 5, 21)
+                cr.line_to(control_x - 3, 27)
+                cr.line_to(control_x + 5, 33)
+                cr.move_to(control_x - 2, 27)
+                cr.line_to(control_x + 8, 27)
+                cr.stroke()
+            else:
+                # Gear icon.
+                for idx in range(8):
+                    ang = idx * math.pi / 4.0
+                    cr.move_to(control_x + math.cos(ang) * 5.8, 27 + math.sin(ang) * 5.8)
+                    cr.line_to(control_x + math.cos(ang) * 8.7, 27 + math.sin(ang) * 8.7)
 
-            cr.stroke()
-            cr.arc(gear_x, 27, 4.7, 0, 2 * math.pi)
-            cr.stroke()
+                cr.stroke()
+                cr.arc(control_x, 27, 4.7, 0, 2 * math.pi)
+                cr.stroke()
 
             # Close button in the far right corner.
             close_x = width - 27
@@ -2512,8 +2593,8 @@ def daemon_main() -> int:
 
             # Tiny level meter, directly on the solid card.
             if self.mode == "listening":
-                x0, y0 = 96, 88
-                x1 = width - 94
+                x0, y0 = 104, 88
+                x1 = width - 56
                 cr.set_line_width(4)
                 cr.set_line_cap(cairo.LINE_CAP_ROUND)
 
