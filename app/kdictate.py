@@ -792,20 +792,27 @@ def _focused_text_insertion_offset(text_iface) -> int:
 
 
 def should_prefix_space_before_paste(text: str) -> bool:
-    """Add a space before pasted dictation when it is continuing existing text."""
+    """Use AT-SPI when available to decide whether pasted dictation continues text."""
     if not text or text[:1].isspace():
         return False
 
-    # Do not force a space before punctuation-like dictated output.
+    # Never prepend a space before punctuation-like dictated output.
     if text[:1] in ".,!?;:%)]}":
         return False
 
     text_iface = _focused_text_interface()
-
-    # Firefox, Discord, Electron apps, and some browser fields do not always expose
-    # caret text reliably through AT-SPI. In that unknown case, continuing text should not smash words together.
     if text_iface is None:
-        return _truthy(os.environ.get("KDICTATE_CONTEXTUAL_SPACE_FALLBACK", "1"))
+        return False
+
+    # If the user selected text, paste should replace it directly.
+    try:
+        selection_count = int(text_iface.getNSelections())
+        if selection_count > 0:
+            start, end = text_iface.getSelection(0)
+            if int(start) != int(end):
+                return False
+    except Exception:
+        pass
 
     offset = _focused_text_insertion_offset(text_iface)
     if offset <= 0:
@@ -813,24 +820,18 @@ def should_prefix_space_before_paste(text: str) -> bool:
 
     previous = ""
 
-    try:
+    with contextlib.suppress(Exception):
         previous = text_iface.getText(max(0, offset - 1), offset) or ""
-    except Exception:
-        previous = ""
 
-    # Some apps fail single-character reads but allow a slightly wider slice.
     if not previous:
         with contextlib.suppress(Exception):
-            previous = text_iface.getText(max(0, offset - 160), offset) or ""
+            previous = text_iface.getText(max(0, offset - 64), offset) or ""
 
     if not previous:
-        return _truthy(os.environ.get("KDICTATE_CONTEXTUAL_SPACE_FALLBACK", "1"))
-
-    last = previous[-1]
-    if last.isspace() or last in "([{":
         return False
 
-    return True
+    last = previous[-1]
+    return not last.isspace() and last not in "([{"
 
 
 def apply_contextual_leading_space(text: str) -> str:
@@ -840,7 +841,15 @@ def apply_contextual_leading_space(text: str) -> str:
 
 
 class InputInjector:
-    """Persistent virtual keyboard used to send Ctrl+V on Wayland."""
+    """Persistent virtual keyboard used to send editing shortcuts on Wayland."""
+
+    KEY_LEFTCTRL = 29
+    KEY_RIGHTCTRL = 97
+    KEY_LEFTSHIFT = 42
+    KEY_C = 46
+    KEY_V = 47
+    KEY_LEFT = 105
+    KEY_RIGHT = 106
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -861,9 +870,13 @@ class InputInjector:
 
                 caps = {
                     ecodes.EV_KEY: [
-                        ecodes.KEY_LEFTCTRL,
-                        ecodes.KEY_RIGHTCTRL,
-                        ecodes.KEY_V,
+                        self.KEY_LEFTCTRL,
+                        self.KEY_RIGHTCTRL,
+                        self.KEY_LEFTSHIFT,
+                        self.KEY_C,
+                        self.KEY_V,
+                        self.KEY_LEFT,
+                        self.KEY_RIGHT,
                     ]
                 }
                 self._ui = UInput(caps, name="KDictate Virtual Keyboard", version=0x0003)
@@ -877,50 +890,86 @@ class InputInjector:
                 log(f"Could not create /dev/uinput virtual keyboard: {exc!r}")
                 return False
 
-    def paste_shortcut(self) -> bool:
+    def _ydotool_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        runtime_socket = RUNTIME_DIR / ".ydotool_socket"
+        if runtime_socket.exists():
+            env["YDOTOOL_SOCKET"] = str(runtime_socket)
+        elif Path("/tmp/.ydotool_socket").exists():
+            env["YDOTOOL_SOCKET"] = "/tmp/.ydotool_socket"
+        return env
+
+    def _emit_raw_key_events(self, events: list[tuple[int, int]], *, delay: float = 0.022) -> bool:
         if self.ensure() and self._ui is not None:
             try:
                 from evdev import ecodes
 
-                delay = self._ready_at - time.time()
-                if delay > 0:
-                    time.sleep(delay)
+                ready_delay = self._ready_at - time.time()
+                if ready_delay > 0:
+                    time.sleep(ready_delay)
+
                 with self._lock:
                     ui = self._ui
-                    ui.write(ecodes.EV_KEY, ecodes.KEY_LEFTCTRL, 1)
-                    ui.write(ecodes.EV_KEY, ecodes.KEY_V, 1)
-                    ui.syn()
-                    time.sleep(0.035)
-                    ui.write(ecodes.EV_KEY, ecodes.KEY_V, 0)
-                    ui.write(ecodes.EV_KEY, ecodes.KEY_LEFTCTRL, 0)
-                    ui.syn()
+                    for code, value in events:
+                        ui.write(ecodes.EV_KEY, code, value)
+                        ui.syn()
+                        time.sleep(delay)
+
                 return True
             except Exception as exc:
-                log(f"uinput paste shortcut failed: {exc!r}")
+                log(f"uinput key event injection failed: {exc!r}")
 
-        # Fallback for systems where python-evdev cannot access /dev/uinput.
         if command_exists("ydotool"):
-            env = os.environ.copy()
-            runtime_socket = RUNTIME_DIR / ".ydotool_socket"
-            if runtime_socket.exists():
-                env["YDOTOOL_SOCKET"] = str(runtime_socket)
-            elif Path("/tmp/.ydotool_socket").exists():
-                env["YDOTOOL_SOCKET"] = "/tmp/.ydotool_socket"
+            try:
+                proc = subprocess.run(
+                    ["ydotool", "key", *[f"{code}:{value}" for code, value in events]],
+                    env=self._ydotool_env(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=2.0,
+                    check=False,
+                )
+                if proc.returncode == 0:
+                    return True
+                log(f"ydotool key event injection failed: {proc.stderr.strip()}")
+            except Exception as exc:
+                log(f"ydotool key event injection exception: {exc!r}")
 
-            # New ydotool uses raw keycodes. Older Ubuntu builds often use names.
-            attempts = [
-                ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
-                ["ydotool", "key", "ctrl+v"],
-            ]
-            for cmd in attempts:
-                try:
-                    proc = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0)
-                    if proc.returncode == 0:
-                        return True
-                    log(f"ydotool attempt failed {cmd}: {proc.stderr.strip()}")
-                except Exception as exc:
-                    log(f"ydotool attempt exception {cmd}: {exc!r}")
         return False
+
+    def paste_shortcut(self) -> bool:
+        return self._emit_raw_key_events([
+            (self.KEY_LEFTCTRL, 1),
+            (self.KEY_V, 1),
+            (self.KEY_V, 0),
+            (self.KEY_LEFTCTRL, 0),
+        ], delay=0.030)
+
+    def copy_shortcut(self) -> bool:
+        return self._emit_raw_key_events([
+            (self.KEY_LEFTCTRL, 1),
+            (self.KEY_C, 1),
+            (self.KEY_C, 0),
+            (self.KEY_LEFTCTRL, 0),
+        ], delay=0.026)
+
+    def select_previous_character(self) -> bool:
+        return self._emit_raw_key_events([
+            (self.KEY_LEFTSHIFT, 1),
+            (self.KEY_LEFT, 1),
+            (self.KEY_LEFT, 0),
+            (self.KEY_LEFTSHIFT, 0),
+        ], delay=0.022)
+
+    def collapse_selection_to_original_caret(self) -> bool:
+        # After Shift+Left selects the previous character, Right collapses the
+        # selection at the original caret position.
+        return self._emit_raw_key_events([
+            (self.KEY_RIGHT, 1),
+            (self.KEY_RIGHT, 0),
+        ], delay=0.022)
+
 
 
 class ClipboardPaster:
@@ -928,59 +977,148 @@ class ClipboardPaster:
         self.injector = injector
         self.pause_monitor = pause_monitor
 
-    def paste_text(self, text: str) -> tuple[bool, str]:
-        text = apply_contextual_leading_space(text)
+    def _read_clipboard_text(self, timeout: float = 0.8) -> tuple[bool, str | None]:
+        if not command_exists("wl-paste"):
+            return False, None
 
+        try:
+            proc = run(["wl-paste", "--no-newline"], timeout=timeout)
+            if proc.returncode == 0:
+                return True, proc.stdout
+        except Exception:
+            pass
+
+        return False, None
+
+    def _set_clipboard_text(self, value: str, label: str) -> tuple[bool, str, subprocess.Popen | None]:
+        try:
+            proc = subprocess.Popen(
+                ["wl-copy", "--type", "text/plain;charset=utf-8"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            assert proc.stdin is not None
+            proc.stdin.write(value)
+            proc.stdin.close()
+
+            try:
+                rc = proc.wait(timeout=0.7)
+                if rc != 0:
+                    err = proc.stderr.read().strip() if proc.stderr else ""
+                    return False, f"wl-copy {label} failed: {err}", None
+                return True, "clipboard set", None
+            except subprocess.TimeoutExpired:
+                # On Wayland, wl-copy often remains alive as the clipboard owner.
+                # That is success. The owner must stay alive until the paste happens.
+                log(f"wl-copy {label} is still running as clipboard owner; treating as success")
+                return True, "clipboard owner active", proc
+        except Exception as exc:
+            return False, f"wl-copy {label} failed: {exc}", None
+
+    def _target_has_active_selection(self) -> bool:
+        sentinel = f"__KDICTATE_SELECTION_PROBE_{os.getpid()}_{time.time_ns()}__"
+
+        ok, _msg, _owner = self._set_clipboard_text(sentinel, "selection probe")
+        if not ok:
+            return False
+
+        time.sleep(0.06)
+
+        if not self.injector.copy_shortcut():
+            return False
+
+        time.sleep(0.11)
+
+        read_ok, copied = self._read_clipboard_text(timeout=0.7)
+        if not read_ok or copied is None:
+            return False
+
+        return copied != sentinel and copied != ""
+
+    def _probe_previous_character_for_spacing(self) -> bool:
+        """Fallback for browsers/Electron apps that do not expose AT-SPI text.
+
+        This probes the focused text field without permanently changing it:
+        set sentinel clipboard -> Shift+Left -> Ctrl+C -> read selected char
+        -> Right to collapse selection back to the original caret.
+        """
+        if not command_exists("wl-copy") or not command_exists("wl-paste"):
+            return False
+
+        # If text is already selected, the dictation should replace it directly.
+        # Do not add a leading space.
+        if self._target_has_active_selection():
+            return False
+
+        sentinel = f"__KDICTATE_CHAR_PROBE_{os.getpid()}_{time.time_ns()}__"
+
+        ok, _msg, _owner = self._set_clipboard_text(sentinel, "character probe")
+        if not ok:
+            return False
+
+        time.sleep(0.06)
+
+        if not self.injector.select_previous_character():
+            return False
+
+        time.sleep(0.06)
+
+        try:
+            if not self.injector.copy_shortcut():
+                return False
+
+            time.sleep(0.12)
+
+            read_ok, copied = self._read_clipboard_text(timeout=0.7)
+            if not read_ok or copied is None:
+                return False
+
+            if copied == sentinel or copied == "":
+                return False
+
+            previous_char = copied[-1]
+            return not previous_char.isspace() and previous_char not in "([{"
+        finally:
+            self.injector.collapse_selection_to_original_caret()
+            time.sleep(0.035)
+
+    def _should_prefix_space(self, text: str) -> bool:
+        if not text or text[:1].isspace():
+            return False
+
+        if text[:1] in ".,!?;:%)]}":
+            return False
+
+        if should_prefix_space_before_paste(text):
+            return True
+
+        return self._probe_previous_character_for_spacing()
+
+    def paste_text(self, text: str) -> tuple[bool, str]:
         if not command_exists("wl-copy"):
             return False, "wl-copy is not installed. The installer should have installed wl-clipboard."
 
-        old_clip: str | None = None
-        old_ok = False
-        if command_exists("wl-paste"):
-            try:
-                old = run(["wl-paste", "--no-newline"], timeout=0.8)
-                if old.returncode == 0:
-                    old_clip = old.stdout
-                    old_ok = True
-            except Exception:
-                old_ok = False
+        old_ok, old_clip = self._read_clipboard_text(timeout=0.8)
 
-        def set_clipboard(value: str, label: str) -> tuple[bool, str, subprocess.Popen | None]:
-            try:
-                proc = subprocess.Popen(
-                    ["wl-copy", "--type", "text/plain;charset=utf-8"],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-                assert proc.stdin is not None
-                proc.stdin.write(value)
-                proc.stdin.close()
+        if self._should_prefix_space(text):
+            text = " " + text
 
-                try:
-                    rc = proc.wait(timeout=0.7)
-                    if rc != 0:
-                        err = proc.stderr.read().strip() if proc.stderr else ""
-                        return False, f"wl-copy {label} failed: {err}", None
-                    return True, "clipboard set", None
-                except subprocess.TimeoutExpired:
-                    # Some Wayland compositors keep wl-copy alive as the clipboard
-                    # owner. That is success, not failure. Do not kill it before
-                    # the paste shortcut has consumed the clipboard.
-                    log(f"wl-copy {label} is still running as clipboard owner; treating as success")
-                    return True, "clipboard owner active", proc
-            except Exception as exc:
-                return False, f"wl-copy {label} failed: {exc}", None
-
-        ok, msg, owner_proc = set_clipboard(text, "dictation")
+        ok, msg, owner_proc = self._set_clipboard_text(text, "dictation")
         if not ok:
+            if old_ok and old_clip is not None:
+                with contextlib.suppress(Exception):
+                    self._set_clipboard_text(old_clip, "restore after failed dictation")
             return False, msg
 
         self.pause_monitor(1.5)
         time.sleep(0.18)
 
         if not self.injector.paste_shortcut():
+            if old_ok and old_clip is not None:
+                with contextlib.suppress(Exception):
+                    self._set_clipboard_text(old_clip, "restore after failed paste")
             return False, "Could not inject Ctrl+V through /dev/uinput or ydotool. Run kdictate doctor."
 
         if old_ok and old_clip is not None:
@@ -988,11 +1126,11 @@ class ClipboardPaster:
                 # Give the focused app enough time to consume Ctrl+V before restoring.
                 time.sleep(1.4)
                 with contextlib.suppress(Exception):
-                    set_clipboard(old_clip, "restore")
+                    self._set_clipboard_text(old_clip, "restore")
+
             threading.Thread(target=restore, daemon=True).start()
 
         return True, "pasted"
-
 
 class KeyboardMonitor:
     """Cancels dictation when the real user starts typing.
@@ -1779,7 +1917,7 @@ def daemon_main() -> int:
             # Settings/back control is on the left of the close button.
             if self._hit_circle(x, y, WINDOW_W - 58, 27):
                 if self.settings_open:
-                    self.show_and_record()
+                    self.show_and_record(preserve_position=True)
                 else:
                     self.open_settings()
                 return
@@ -1942,23 +2080,25 @@ def daemon_main() -> int:
                 items.append({"kind": "row", "key": key, "label": label, "y": y, "h": 38.0})
                 y += 44.0
 
-                # Keep closing dropdowns in the layout until their opacity animation
-                # finishes. This prevents the "teleport then animate" close glitch.
                 anim_amount = max(0.0, min(1.0, self.dropdown_anim.get(key, 0.0)))
-                should_layout_options = self.open_dropdown == key or anim_amount > 0.02
 
-                if should_layout_options:
-                    for value, option_label in self.settings_options(key):
+                if self.open_dropdown == key or anim_amount > 0.015:
+                    reveal = self.ease_out_cubic(anim_amount)
+                    options = self.settings_options(key)
+                    option_base_y = y
+
+                    for idx, (value, option_label) in enumerate(options):
                         items.append({
                             "kind": "option",
                             "key": key,
                             "value": value,
                             "label": option_label,
-                            "y": y,
+                            "y": option_base_y + idx * 30.0 * reveal,
                             "h": 30.0,
+                            "reveal": reveal,
                         })
-                        y += 30.0
-                    y += 6.0
+
+                    y += (len(options) * 30.0 + 6.0) * reveal
 
             return items, y + 12.0
 
@@ -1970,9 +2110,6 @@ def daemon_main() -> int:
 
         def toggle_dropdown(self, key: str) -> None:
             self.open_dropdown = None if self.open_dropdown == key else key
-
-            if key == "mic" and self.open_dropdown == "mic":
-                self.refresh_microphones()
 
             self.update_settings_height()
             self.area.queue_draw()
@@ -2010,7 +2147,10 @@ def daemon_main() -> int:
             self.preview_draw_chars = 0.0
             self.settings_extra_target = float(SETTINGS_EXTRA_H)
             self.set_window_height(SETTINGS_WINDOW_H)
-            self.position()
+            if self.visible:
+                self.move_overlay(self.window_x, self.window_y)
+            else:
+                self.position()
             self.set_status("settings", "Settings", "")
             self.fade_target = 1.0
             self.open_target = 1.0
@@ -2035,13 +2175,13 @@ def daemon_main() -> int:
 
         def animate(self):
             now = time.time()
-            dt = max(0.001, min(0.09, now - self.last_frame))
+            dt = max(0.001, min(0.033, now - self.last_frame))
             self.last_frame = now
 
             self.level_smooth += (self.level - self.level_smooth) * min(1.0, dt * 12.0)
 
-            fade_rate = 9.5 if self.fade_target > self.fade_alpha else 5.2
-            open_rate = 7.8 if self.open_target > self.open_anim else 4.8
+            fade_rate = 6.6 if self.fade_target > self.fade_alpha else 5.4
+            open_rate = 7.0 if self.open_target > self.open_anim else 5.8
             self.fade_alpha += (self.fade_target - self.fade_alpha) * min(1.0, dt * fade_rate)
             self.open_anim += (self.open_target - self.open_anim) * min(1.0, dt * open_rate)
 
@@ -2051,7 +2191,7 @@ def daemon_main() -> int:
 
             for key in self.dropdown_anim:
                 target = 1.0 if self.open_dropdown == key else 0.0
-                rate = 12.0 if target > self.dropdown_anim[key] else 7.0
+                rate = 12.0 if target > self.dropdown_anim[key] else 16.0
                 self.dropdown_anim[key] += (target - self.dropdown_anim[key]) * min(1.0, dt * rate)
 
             if self.settings_open or any(value > 0.02 for value in self.dropdown_anim.values()):
@@ -2122,7 +2262,7 @@ def daemon_main() -> int:
 
             self.move_overlay(int(x), int(y))
 
-        def show_and_record(self):
+        def show_and_record(self, *, preserve_position: bool = False):
             if self.engine.recording:
                 self.invoke_cancel("toggle")
                 return
@@ -2142,18 +2282,31 @@ def daemon_main() -> int:
                 self.set_window_height(WINDOW_H)
                 subtitle = "Speak now. Pause to finish."
 
-            self.position()
+            was_visible = self.visible
+
+            if preserve_position and was_visible:
+                self.move_overlay(self.window_x, self.window_y)
+            else:
+                self.position()
             self.set_status("listening", "Listening", subtitle)
             self.level = 0.0
-            self.fade_alpha = 0.0
+
+            if preserve_position and was_visible:
+                self.fade_alpha = max(self.fade_alpha, 0.92)
+                self.open_anim = max(self.open_anim, 0.92)
+            else:
+                self.fade_alpha = 0.0
+                self.open_anim = 0.0
+                with contextlib.suppress(Exception):
+                    self.window.set_opacity(0.0)
+
             self.fade_target = 1.0
-            self.open_anim = 0.0
             self.open_target = 1.0
+            self.last_frame = time.time()
             self.visible = True
             self.monitor.arm(ignore_for=0.8)
-            with contextlib.suppress(Exception):
-                self.window.set_opacity(0.0)
             self.window.present()
+            self.area.queue_draw()
 
             # Load GPU model only when the user invokes dictation.
             # This keeps the daemon ready without occupying NVIDIA VRAM 24/7.
@@ -2495,13 +2648,19 @@ def daemon_main() -> int:
             cr.set_line_width(1.8)
 
             if self.settings_open:
-                # Simple back arrow: return to live dictation.
-                cr.move_to(control_x + 5, 21)
-                cr.line_to(control_x - 3, 27)
-                cr.line_to(control_x + 5, 33)
-                cr.move_to(control_x - 2, 27)
-                cr.line_to(control_x + 8, 27)
+                cr.set_line_width(1.9)
+                cr.set_line_cap(cairo.LINE_CAP_ROUND)
+                cr.set_line_join(cairo.LINE_JOIN_ROUND)
+
+                cr.move_to(control_x + 8.0, 27.0)
+                cr.line_to(control_x - 5.2, 27.0)
+
+                cr.move_to(control_x - 0.8, 22.4)
+                cr.line_to(control_x - 5.6, 27.0)
+                cr.line_to(control_x - 0.8, 31.6)
+
                 cr.stroke()
+                cr.set_line_cap(cairo.LINE_CAP_BUTT)
             else:
                 # Gear icon.
                 for idx in range(8):
@@ -2637,16 +2796,17 @@ def daemon_main() -> int:
                     elif item["kind"] == "option":
                         key = item["key"]
                         open_amount = max(0.0, min(1.0, self.dropdown_anim.get(key, 0.0)))
-                        if open_amount <= 0.02:
+                        if open_amount <= 0.015:
                             continue
 
-                        slide = (1.0 - self.ease_out_cubic(open_amount)) * -8.0
+                        reveal = float(item.get("reveal", self.ease_out_cubic(open_amount)))
+                        slide = (1.0 - reveal) * -7.0
                         self.draw_settings_option(
                             cr,
                             item["y"] + slide,
                             item["label"],
                             item["value"] == selected_values.get(key),
-                            settings_alpha * open_amount,
+                            settings_alpha * reveal,
                         )
 
                 cr.restore()
