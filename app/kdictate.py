@@ -144,6 +144,10 @@ VR_AUDIO_STATE = {
     "easyeffects_kind": None,
 }
 
+VR_AUDIO_LOCK = threading.RLock()
+BACKGROUND_VR_AUDIO_MONITOR_STARTED = False
+BACKGROUND_VR_AUDIO_MONITOR_LOCK = threading.Lock()
+
 
 def wivrn_auto_audio_enabled() -> bool:
     return _truthy(os.environ.get("KDICTATE_WIVRN_AUTO_AUDIO", "1"))
@@ -404,6 +408,11 @@ def _restore_vr_audio_defaults() -> None:
 
 
 def apply_wivrn_audio_if_available(*, force: bool = False) -> dict[str, str] | None:
+    with VR_AUDIO_LOCK:
+        return _apply_wivrn_audio_if_available_locked(force=force)
+
+
+def _apply_wivrn_audio_if_available_locked(*, force: bool = False) -> dict[str, str] | None:
     if not wivrn_auto_audio_enabled():
         _restore_vr_audio_defaults()
         return None
@@ -451,6 +460,31 @@ def apply_wivrn_audio_if_available(*, force: bool = False) -> dict[str, str] | N
         "sink_label": sink.get("label") or sink["name"],
         "device_id": PULSE_SOURCE_PREFIX + source["name"],
     }
+
+
+def start_background_vr_audio_monitor() -> None:
+    global BACKGROUND_VR_AUDIO_MONITOR_STARTED
+
+    with BACKGROUND_VR_AUDIO_MONITOR_LOCK:
+        if BACKGROUND_VR_AUDIO_MONITOR_STARTED:
+            return
+        BACKGROUND_VR_AUDIO_MONITOR_STARTED = True
+
+    def worker() -> None:
+        log("Background WiVRn audio monitor started")
+
+        # Run immediately once, then keep polling independently of the GTK UI.
+        # This is what makes WiVRn audio switching work even when the overlay has
+        # not been opened for a long time.
+        while True:
+            try:
+                apply_wivrn_audio_if_available()
+            except Exception as exc:
+                log(f"Background WiVRn audio monitor failed: {exc!r}")
+
+            time.sleep(2.0)
+
+    threading.Thread(target=worker, daemon=True, name="KDictateWiVRnAudioMonitor").start()
 
 
 def _portaudio_pulse_bridge_index() -> int | None:
@@ -1806,6 +1840,7 @@ def daemon_main() -> int:
 
     injector = InputInjector()
     injector.ensure()
+    start_background_vr_audio_monitor()
     
     app = Gtk.Application(application_id=APP_ID)
     
