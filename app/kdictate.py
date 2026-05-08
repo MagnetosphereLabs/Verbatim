@@ -1404,6 +1404,7 @@ class DictationEngine:
         self.realtime_busy = False
         self.realtime_last_start = 0.0
         self.realtime_last_audio_seconds = 0.0
+        self.realtime_preview_audio_seconds = 0.0
 
     def start(self) -> None:
         if self.recording:
@@ -1414,6 +1415,7 @@ class DictationEngine:
         self.realtime_busy = False
         self.realtime_last_start = 0.0
         self.realtime_last_audio_seconds = 0.0
+        self.realtime_preview_audio_seconds = 0.0
         now = time.time()
         self.state.started_at = now
         self.state.last_speech_at = now
@@ -1532,6 +1534,7 @@ class DictationEngine:
         with self.lock:
             frames = list(self.state.frames)
             samplerate = self.state.samplerate
+            last_speech_elapsed = max(0.0, self.state.last_speech_at - self.state.started_at)
 
         if self.cancelled:
             return
@@ -1539,6 +1542,27 @@ class DictationEngine:
             self.cancel("no audio frames")
             self.ui.close_smoothly()
             return
+
+        # If the live preview already covers the last detected speech, paste it
+        # immediately instead of showing a second "Transcribing" pass.
+        preview_text = ""
+        if realtime_transcription_enabled():
+            preview_text = str(getattr(self.ui, "realtime_preview", "") or "").strip()
+
+        if preview_text:
+            preview_audio_seconds = max(0.0, float(self.realtime_preview_audio_seconds or 0.0))
+            speech_tail_gap = max(0.0, last_speech_elapsed - preview_audio_seconds)
+
+            if speech_tail_gap <= 0.75:
+                quick_text = normalize_transcript_text(preview_text, final=True)
+                if quick_text:
+                    log(
+                        "Using current realtime preview for final paste "
+                        f"preview_audio={preview_audio_seconds:.2f}s "
+                        f"last_speech={last_speech_elapsed:.2f}s"
+                    )
+                    self.ui.invoke_transcribed(quick_text)
+                    return
 
         self.ui.set_status("transcribing", "Transcribing", f"Whisper {MODEL_NAME} via {BACKEND}")
         threading.Thread(target=self._transcribe_worker, args=(frames, samplerate), daemon=True).start()
@@ -1615,11 +1639,12 @@ class DictationEngine:
 
     def _realtime_worker(self, frames, samplerate: int) -> None:
         try:
+            audio_seconds = sum(len(frame) for frame in frames) / float(samplerate) if samplerate > 0 else 0.0
             text = self._write_wav_and_transcribe(frames, samplerate, realtime=True)
             text = normalize_transcript_text(text, final=False)
 
             if text and self.recording and not self.cancelled and realtime_transcription_enabled():
-                self.ui.invoke_realtime_text(text)
+                self.ui.invoke_realtime_text(text, audio_seconds)
         except Exception as exc:
             log(f"Realtime transcription preview failed: {exc!r}")
         finally:
@@ -2335,8 +2360,8 @@ def daemon_main() -> int:
         def invoke_transcribed(self, text: str):
             GLib.idle_add(self._on_transcribed, text)
 
-        def invoke_realtime_text(self, text: str):
-            GLib.idle_add(self._on_realtime_text, text)
+        def invoke_realtime_text(self, text: str, audio_seconds: float = 0.0):
+            GLib.idle_add(self._on_realtime_text, text, audio_seconds)
 
         def invoke_error(self, msg: str):
             GLib.idle_add(self.show_error, msg)
@@ -2349,7 +2374,7 @@ def daemon_main() -> int:
             self.close_smoothly()
             return False
 
-        def _on_realtime_text(self, text: str):
+        def _on_realtime_text(self, text: str, audio_seconds: float = 0.0):
             if self.engine.recording and realtime_transcription_enabled():
                 previous_len = len(self.realtime_preview)
 
@@ -2364,6 +2389,10 @@ def daemon_main() -> int:
                     return False
 
                 self.realtime_preview = text
+                self.engine.realtime_preview_audio_seconds = max(
+                    self.engine.realtime_preview_audio_seconds,
+                    float(audio_seconds or 0.0),
+                )
 
                 if len(text) < previous_len:
                     self.preview_draw_chars = min(self.preview_draw_chars, float(len(text)))
@@ -2752,8 +2781,9 @@ def daemon_main() -> int:
 
             # Tiny level meter, directly on the solid card.
             if self.mode == "listening":
-                x0, y0 = 104, 88
-                x1 = width - 56
+                meter_label = "Transcribing as you speak."
+                x0, y0 = 96, 88
+                x1 = x0 + self._text_width(cr, meter_label)
                 cr.set_line_width(4)
                 cr.set_line_cap(cairo.LINE_CAP_ROUND)
 
