@@ -133,8 +133,280 @@ def active_silence_to_finish_seconds() -> float:
     return float(os.environ.get("KDICTATE_SILENCE_TO_FINISH_SECONDS", "1.55"))
 
 
+PULSE_SOURCE_PREFIX = "pulse-source:"
+WIVRN_AUTO_DEVICE_ID = "auto-wivrn"
+VR_AUDIO_STATE = {
+    "active": False,
+    "restore_source": None,
+    "restore_sink": None,
+}
+
+
+def wivrn_auto_audio_enabled() -> bool:
+    return _truthy(os.environ.get("KDICTATE_WIVRN_AUTO_AUDIO", "1"))
+
+
+def _shorten_label(value: str, limit: int = 48) -> str:
+    value = " ".join(str(value or "").split()).strip()
+    if len(value) <= limit:
+        return value
+    return value[: max(1, limit - 3)].rstrip() + "..."
+
+
+def _pactl_available() -> bool:
+    return command_exists("pactl")
+
+
+def _pactl(args: list[str], timeout: float = 0.85) -> subprocess.CompletedProcess[str] | None:
+    if not _pactl_available():
+        return None
+
+    try:
+        return subprocess.run(
+            ["pactl", *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except Exception as exc:
+        log(f"pactl {' '.join(args)} failed: {exc!r}")
+        return None
+
+
+def _pactl_default(kind: str) -> str:
+    proc = _pactl(["info"], timeout=0.7)
+    if proc is None or proc.returncode != 0:
+        return ""
+
+    wanted = "Default Source:" if kind == "source" else "Default Sink:"
+    for raw in proc.stdout.splitlines():
+        if raw.startswith(wanted):
+            return raw.split(":", 1)[1].strip()
+
+    return ""
+
+
+def _pactl_nodes(kind: str) -> list[dict[str, str]]:
+    # kind is "sources" or "sinks". The long form includes the friendly
+    # descriptions shown by desktop audio UIs, unlike PortAudio's generic
+    # "pulse" / "pipewire" bridge names.
+    proc = _pactl(["list", kind], timeout=1.2)
+    if proc is None or proc.returncode != 0:
+        return []
+
+    nodes: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+
+    def flush() -> None:
+        if current.get("name"):
+            name = current.get("name", "")
+            desc = current.get("description", "") or name
+            nodes.append({"name": name, "label": desc, "description": desc})
+
+    header = "Source #" if kind == "sources" else "Sink #"
+
+    for raw in proc.stdout.splitlines():
+        line = raw.strip()
+
+        if line.startswith(header):
+            flush()
+            current = {}
+            continue
+
+        if line.startswith("Name:"):
+            current["name"] = line.split(":", 1)[1].strip()
+        elif line.startswith("Description:"):
+            current["description"] = line.split(":", 1)[1].strip()
+        elif line.startswith("node.description =") and not current.get("description"):
+            current["description"] = line.split("=", 1)[1].strip().strip('"')
+
+    flush()
+
+    if kind == "sources":
+        filtered = []
+        for node in nodes:
+            hay = f"{node.get('name', '')} {node.get('label', '')}".lower()
+            if node.get("name", "").endswith(".monitor") or "monitor" in hay:
+                continue
+            filtered.append(node)
+        return filtered
+
+    return nodes
+
+
+def _is_wivrn_node(node: dict[str, str]) -> bool:
+    hay = f"{node.get('name', '')} {node.get('label', '')} {node.get('description', '')}".lower()
+    return "wivrn" in hay
+
+
+def _find_wivrn_audio() -> tuple[dict[str, str] | None, dict[str, str] | None]:
+    source = next((node for node in _pactl_nodes("sources") if _is_wivrn_node(node)), None)
+    sink = next((node for node in _pactl_nodes("sinks") if _is_wivrn_node(node)), None)
+    return source, sink
+
+
+def _set_default_audio(kind: str, name: str) -> None:
+    if not name:
+        return
+
+    cmd = "set-default-source" if kind == "source" else "set-default-sink"
+    proc = _pactl([cmd, name], timeout=0.8)
+
+    if proc is not None and proc.returncode != 0:
+        log(f"pactl {cmd} {name!r} failed: {proc.stderr.strip() or proc.stdout.strip()}")
+
+
+def _restore_vr_audio_defaults() -> None:
+    if not VR_AUDIO_STATE.get("active"):
+        return
+
+    restore_source = str(VR_AUDIO_STATE.get("restore_source") or "")
+    restore_sink = str(VR_AUDIO_STATE.get("restore_sink") or "")
+
+    known_sources = {node["name"] for node in _pactl_nodes("sources")}
+    known_sinks = {node["name"] for node in _pactl_nodes("sinks")}
+
+    if restore_source and restore_source in known_sources:
+        _set_default_audio("source", restore_source)
+
+    if restore_sink and restore_sink in known_sinks:
+        _set_default_audio("sink", restore_sink)
+
+    log("WiVRn audio disappeared; restored previous desktop audio defaults")
+    VR_AUDIO_STATE.update({"active": False, "restore_source": None, "restore_sink": None})
+
+
+def apply_wivrn_audio_if_available(*, force: bool = False) -> dict[str, str] | None:
+    if not wivrn_auto_audio_enabled():
+        _restore_vr_audio_defaults()
+        return None
+
+    selected = os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
+
+    # Do not override a deliberate non-VR microphone choice. Empty means
+    # "System default", where seamless VR auto-switching is allowed.
+    if not force and selected not in {"", WIVRN_AUTO_DEVICE_ID} and not selected.startswith(PULSE_SOURCE_PREFIX):
+        _restore_vr_audio_defaults()
+        return None
+
+    source, sink = _find_wivrn_audio()
+
+    # Only auto-switch when WiVRn has both its input and output present.
+    # That is the signal that the headset is connected, not merely that some
+    # unrelated app or audio bridge exists.
+    if source is None or sink is None:
+        _restore_vr_audio_defaults()
+        return None
+
+    current_source = _pactl_default("source")
+    current_sink = _pactl_default("sink")
+
+    if not VR_AUDIO_STATE.get("active"):
+        VR_AUDIO_STATE.update({
+            "active": True,
+            "restore_source": current_source,
+            "restore_sink": current_sink,
+        })
+        log(f"WiVRn audio appeared; saving defaults source={current_source!r} sink={current_sink!r}")
+
+    if current_source != source["name"]:
+        _set_default_audio("source", source["name"])
+
+    if current_sink != sink["name"]:
+        _set_default_audio("sink", sink["name"])
+
+    return {
+        "source": source["name"],
+        "sink": sink["name"],
+        "source_label": source.get("label") or source["name"],
+        "sink_label": sink.get("label") or sink["name"],
+        "device_id": PULSE_SOURCE_PREFIX + source["name"],
+    }
+
+
+def _portaudio_pulse_bridge_index() -> int | None:
+    try:
+        import sounddevice as sd
+
+        candidates: list[tuple[int, int]] = []
+
+        for idx, dev in enumerate(sd.query_devices()):
+            if int(dev.get("max_input_channels") or 0) <= 0:
+                continue
+
+            name = str(dev.get("name") or "").strip().lower()
+
+            if name == "pulse":
+                candidates.append((0, idx))
+            elif name == "pipewire":
+                candidates.append((1, idx))
+            elif "pulse" in name:
+                candidates.append((2, idx))
+            elif "pipewire" in name:
+                candidates.append((3, idx))
+
+        if candidates:
+            return sorted(candidates)[0][1]
+    except Exception as exc:
+        log(f"Could not find PortAudio Pulse/PipeWire bridge: {exc!r}")
+
+    return None
+
+
+def resolve_microphone_device(selected_mic: str) -> tuple[int | str | None, str]:
+    selected_mic = (selected_mic or "").strip()
+
+    if selected_mic in {"", WIVRN_AUTO_DEVICE_ID}:
+        active = apply_wivrn_audio_if_available(force=(selected_mic == WIVRN_AUTO_DEVICE_ID))
+
+        if active is not None:
+            bridge_idx = _portaudio_pulse_bridge_index()
+            if bridge_idx is not None:
+                return bridge_idx, f"WiVRn microphone via Pulse ({bridge_idx})"
+            return None, "WiVRn microphone via system default"
+
+    if selected_mic.startswith(PULSE_SOURCE_PREFIX):
+        source_name = selected_mic[len(PULSE_SOURCE_PREFIX):]
+        source = next((node for node in _pactl_nodes("sources") if node["name"] == source_name), None)
+
+        if source is not None:
+            _set_default_audio("source", source_name)
+
+            if _is_wivrn_node(source):
+                sink = next((node for node in _pactl_nodes("sinks") if _is_wivrn_node(node)), None)
+                if sink is not None:
+                    _set_default_audio("sink", sink["name"])
+
+        bridge_idx = _portaudio_pulse_bridge_index()
+        label = source.get("label") if source else source_name
+
+        if bridge_idx is not None:
+            return bridge_idx, f"{label} via Pulse ({bridge_idx})"
+
+        return None, f"{label} via system default"
+
+    device_arg: int | str | None = int(selected_mic) if selected_mic.isdigit() else (selected_mic or None)
+    return device_arg, "default" if device_arg is None else str(device_arg)
+
+
 def list_input_microphones() -> list[dict[str, str]]:
     devices = [{"id": "", "label": "System default"}]
+    seen_ids = {""}
+
+    wivrn_source, _wivrn_sink = _find_wivrn_audio()
+
+    if wivrn_source is not None:
+        devices.append({"id": WIVRN_AUTO_DEVICE_ID, "label": "WiVRn microphone (auto)"})
+        seen_ids.add(WIVRN_AUTO_DEVICE_ID)
+
+        source_id = PULSE_SOURCE_PREFIX + wivrn_source["name"]
+        devices.append({
+            "id": source_id,
+            "label": _shorten_label(wivrn_source.get("label") or "WiVRn microphone"),
+        })
+        seen_ids.add(source_id)
 
     try:
         import sounddevice as sd
@@ -142,8 +414,15 @@ def list_input_microphones() -> list[dict[str, str]]:
         for idx, dev in enumerate(sd.query_devices()):
             if int(dev.get("max_input_channels") or 0) <= 0:
                 continue
+
             name = str(dev.get("name") or f"Input {idx}").strip()
-            devices.append({"id": str(idx), "label": f"{name} ({idx})"})
+            device_id = str(idx)
+
+            if device_id in seen_ids:
+                continue
+
+            devices.append({"id": device_id, "label": f"{name} ({idx})"})
+            seen_ids.add(device_id)
     except Exception as exc:
         log(f"Could not enumerate microphones: {exc!r}")
 
@@ -196,6 +475,7 @@ LANGUAGE = os.environ.get("KDICTATE_LANGUAGE", "en")
 WHISPER_CPP_BIN = os.environ.get("KDICTATE_WHISPER_CPP_BIN", str(APP_DIR / "whisper.cpp/build/bin/whisper-cli"))
 WHISPER_CPP_MODEL = os.environ.get("KDICTATE_WHISPER_CPP_MODEL", str(APP_DIR / f"models/ggml-{MODEL_NAME}.bin"))
 MIC_DEVICE = os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
+WIVRN_AUTO_AUDIO = wivrn_auto_audio_enabled()
 REALTIME_TRANSCRIPTION = realtime_transcription_enabled()
 MAX_RECORD_SECONDS = float(os.environ.get("KDICTATE_MAX_RECORD_SECONDS", "90"))
 SILENCE_TO_FINISH_SECONDS = float(os.environ.get("KDICTATE_SILENCE_TO_FINISH_SECONDS", "1.55"))
@@ -724,7 +1004,7 @@ class DictationEngine:
             import sounddevice as sd
 
             selected_mic = os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
-            device_arg = int(selected_mic) if selected_mic.isdigit() else (selected_mic or None)
+            device_arg, resolved_mic_label = resolve_microphone_device(selected_mic)
 
             try:
                 if device_arg is None:
@@ -733,10 +1013,10 @@ class DictationEngine:
                     dev = sd.query_devices(device=device_arg, kind="input")
 
                 samplerate = int(dev.get("default_samplerate") or 48000)
-                mic_label = str(dev.get("name", "default"))
+                mic_label = str(dev.get("name", resolved_mic_label))
             except Exception:
                 samplerate = 48000
-                mic_label = "default"
+                mic_label = resolved_mic_label or "default"
 
             self.state.samplerate = samplerate
 
@@ -1158,6 +1438,7 @@ def daemon_main() -> int:
             self.drag_origin_x = 0
             self.drag_origin_y = 0
             self.microphones = list_input_microphones()
+            self.audio_poll_busy = False
             self.realtime_preview = ""
 
             self.area = Gtk.DrawingArea()
@@ -1197,6 +1478,7 @@ def daemon_main() -> int:
 
             GLib.timeout_add(16, self.animate)
             GLib.timeout_add(55, self.tick)
+            GLib.timeout_add_seconds(3, self.poll_vr_audio)
 
         def on_close_request(self, *args):
             self.invoke_cancel("closed")
@@ -1260,11 +1542,38 @@ def daemon_main() -> int:
                 with contextlib.suppress(Exception):
                     self.window.move(self.window_x, self.window_y)
 
+        def poll_vr_audio(self):
+            if self.audio_poll_busy:
+                return True
+
+            self.audio_poll_busy = True
+
+            def worker() -> None:
+                try:
+                    apply_wivrn_audio_if_available()
+                    GLib.idle_add(self._on_audio_devices_changed)
+                finally:
+                    self.audio_poll_busy = False
+
+            threading.Thread(target=worker, daemon=True).start()
+            return True
+
+        def _on_audio_devices_changed(self):
+            if self.settings_open:
+                self.refresh_microphones()
+                self.area.queue_draw()
+            return False
+
         def refresh_microphones(self) -> None:
             self.microphones = list_input_microphones()
 
         def selected_mic_label(self) -> str:
             selected = os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
+
+            if selected in {"", WIVRN_AUTO_DEVICE_ID}:
+                active = apply_wivrn_audio_if_available(force=(selected == WIVRN_AUTO_DEVICE_ID))
+                if active is not None:
+                    return "WiVRn microphone (auto)"
 
             for dev in self.microphones:
                 if dev["id"] == selected:
@@ -1279,13 +1588,19 @@ def daemon_main() -> int:
                 selected = os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
 
                 # Keep the dropdown elegant even on systems with many input devices,
-                # while ensuring the currently selected mic stays visible.
-                visible = options[:6]
-                if selected and all(value != selected for value, _label in visible):
-                    for value, label in options:
-                        if value == selected:
-                            visible[-1] = (value, label)
-                            break
+                # while ensuring WiVRn and the currently selected mic stay visible.
+                visible = options[:7]
+
+                for required in [WIVRN_AUTO_DEVICE_ID, selected]:
+                    if required and all(value != required for value, _label in visible):
+                        for value, label in options:
+                            if value == required:
+                                if len(visible) >= 7:
+                                    visible[-1] = (value, label)
+                                else:
+                                    visible.append((value, label))
+                                break
+
                 return visible
 
             if key == "quality":
@@ -2159,7 +2474,7 @@ def doctor_text() -> str:
     if BACKEND == "whisper.cpp":
         lines.append(f"whisper.cpp bin: {WHISPER_CPP_BIN}")
         lines.append(f"whisper.cpp model: {WHISPER_CPP_MODEL}")
-    for cmd in ["wl-copy", "wl-paste", "nvidia-smi"]:
+    for cmd in ["wl-copy", "wl-paste", "pactl", "nvidia-smi"]:
         lines.append(f"{cmd}: {'ok' if command_exists(cmd) else 'missing'}")
     try:
         import evdev  # noqa: F401
@@ -2192,6 +2507,19 @@ def doctor_text() -> str:
         lines.append(f"microphone: ok ({dev.get('name', 'default')})")
     except Exception as exc:
         lines.append(f"microphone: failed ({exc})")
+
+    try:
+        source, sink = _find_wivrn_audio()
+        if source and sink:
+            lines.append(
+                f"WiVRn audio: detected input={source.get('label', source['name'])} "
+                f"output={sink.get('label', sink['name'])}"
+            )
+        else:
+            lines.append("WiVRn audio: not connected")
+    except Exception as exc:
+        lines.append(f"WiVRn audio: check failed ({exc})")
+
     return "\n".join(lines)
 
 
