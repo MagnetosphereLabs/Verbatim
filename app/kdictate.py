@@ -205,7 +205,8 @@ WINDOW_W = 330
 WINDOW_H = 118
 LISTENING_PREVIEW_EXTRA_H = 144
 LISTENING_PREVIEW_WINDOW_H = WINDOW_H + LISTENING_PREVIEW_EXTRA_H
-SETTINGS_EXTRA_H = 214
+SETTINGS_EXTRA_H = 184
+SETTINGS_MAX_EXTRA_H = 360
 SETTINGS_WINDOW_H = WINDOW_H + SETTINGS_EXTRA_H
 
 
@@ -1130,6 +1131,8 @@ def daemon_main() -> int:
             self.visible = False
             self.fade_alpha = 0.0
             self.fade_target = 0.0
+            self.open_anim = 0.0
+            self.open_target = 0.0
             self.last_frame = time.time()
             self.engine = DictationEngine(self)
             self.monitor = KeyboardMonitor(lambda: GLib.idle_add(self.invoke_cancel, "manual typing"))
@@ -1139,9 +1142,21 @@ def daemon_main() -> int:
 
             self.settings_open = False
             self.settings_anim = 0.0
+            self.settings_extra = float(SETTINGS_EXTRA_H)
+            self.settings_extra_target = float(SETTINGS_EXTRA_H)
+            self.open_dropdown: str | None = None
+            self.dropdown_anim = {"mic": 0.0, "quality": 0.0, "realtime": 0.0}
             self.preview_anim = 0.0
             self.preview_draw_chars = 0.0
+            self.preview_scroll = 0.0
+            self.preview_scroll_target = 0.0
+            self.preview_user_scroll_lines = 0
             self.current_window_h = WINDOW_H
+            self.window_x = 0
+            self.window_y = 0
+            self.dragging_window = False
+            self.drag_origin_x = 0
+            self.drag_origin_y = 0
             self.microphones = list_input_microphones()
             self.realtime_preview = ""
 
@@ -1154,6 +1169,16 @@ def daemon_main() -> int:
             click = Gtk.GestureClick.new()
             click.connect("pressed", self.on_click)
             self.area.add_controller(click)
+
+            drag = Gtk.GestureDrag.new()
+            drag.connect("drag-begin", self.on_drag_begin)
+            drag.connect("drag-update", self.on_drag_update)
+            drag.connect("drag-end", self.on_drag_end)
+            self.area.add_controller(drag)
+
+            scroll = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+            scroll.connect("scroll", self.on_scroll)
+            self.area.add_controller(scroll)
 
             self.window.connect("close-request", self.on_close_request)
 
@@ -1181,16 +1206,59 @@ def daemon_main() -> int:
             return ((x - cx) * (x - cx) + (y - cy) * (y - cy)) <= radius * radius
 
         def on_click(self, gesture, n_press, x, y):
+            # Gear is on the left, close is on the far right.
             if self._hit_circle(x, y, WINDOW_W - 58, 27):
-                self.invoke_cancel("clicked close")
+                self.open_settings()
                 return
 
             if self._hit_circle(x, y, WINDOW_W - 27, 27):
-                self.open_settings()
+                self.invoke_cancel("clicked close")
                 return
 
             if self.settings_open:
                 self.on_settings_click(x, y)
+
+        def on_drag_begin(self, gesture, start_x, start_y):
+            top_band = max(30.0, self.current_window_h * 0.25)
+            on_button = self._hit_circle(start_x, start_y, WINDOW_W - 58, 27) or self._hit_circle(start_x, start_y, WINDOW_W - 27, 27)
+            self.dragging_window = bool(start_y <= top_band and not on_button)
+            self.drag_origin_x = self.window_x
+            self.drag_origin_y = self.window_y
+
+        def on_drag_update(self, gesture, offset_x, offset_y):
+            if not self.dragging_window:
+                return
+
+            self.move_overlay(self.drag_origin_x + int(offset_x), self.drag_origin_y + int(offset_y))
+
+        def on_drag_end(self, gesture, offset_x, offset_y):
+            if self.dragging_window:
+                self.move_overlay(self.drag_origin_x + int(offset_x), self.drag_origin_y + int(offset_y))
+            self.dragging_window = False
+
+        def on_scroll(self, controller, dx, dy):
+            if not (self.engine.recording and realtime_transcription_enabled() and self.preview_anim > 0.05):
+                return False
+
+            if dy < 0:
+                self.preview_user_scroll_lines = min(40, self.preview_user_scroll_lines + 1)
+            elif dy > 0:
+                self.preview_user_scroll_lines = max(0, self.preview_user_scroll_lines - 1)
+
+            self.area.queue_draw()
+            return True
+
+        def move_overlay(self, x: int, y: int) -> None:
+            self.window_x = int(max(0, x))
+            self.window_y = int(max(0, y))
+
+            if self.layer_enabled and LayerShell is not None:
+                with contextlib.suppress(Exception):
+                    LayerShell.set_margin(self.window, LayerShell.Edge.LEFT, self.window_x)
+                    LayerShell.set_margin(self.window, LayerShell.Edge.TOP, self.window_y)
+            else:
+                with contextlib.suppress(Exception):
+                    self.window.move(self.window_x, self.window_y)
 
         def refresh_microphones(self) -> None:
             self.microphones = list_input_microphones()
@@ -1204,52 +1272,134 @@ def daemon_main() -> int:
 
             return "System default"
 
-        def on_settings_click(self, x, y) -> None:
-            if 130 <= y <= 176:
-                self.cycle_microphone()
-            elif 184 <= y <= 230:
-                self.cycle_quality()
-            elif 238 <= y <= 284:
-                set_realtime_transcription(not realtime_transcription_enabled())
-                self.set_status("settings", "Settings", "Realtime transcription updated.")
+        def settings_options(self, key: str) -> list[tuple[str, str]]:
+            if key == "mic":
+                self.refresh_microphones()
+                options = [(dev["id"], dev["label"]) for dev in self.microphones]
+                selected = os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
 
+                # Keep the dropdown elegant even on systems with many input devices,
+                # while ensuring the currently selected mic stays visible.
+                visible = options[:6]
+                if selected and all(value != selected for value, _label in visible):
+                    for value, label in options:
+                        if value == selected:
+                            visible[-1] = (value, label)
+                            break
+                return visible
+
+            if key == "quality":
+                return [
+                    ("speed", QUALITY_LABELS["speed"]),
+                    ("balanced", QUALITY_LABELS["balanced"]),
+                    ("quality", QUALITY_LABELS["quality"]),
+                ]
+
+            if key == "realtime":
+                return [
+                    ("1", "On - live transcript"),
+                    ("0", "Off - final paste only"),
+                ]
+
+            return []
+
+        def selected_setting_value(self, key: str) -> str:
+            if key == "mic":
+                return os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
+            if key == "quality":
+                return _normalize_profile(os.environ.get("KDICTATE_PROFILE"), os.environ.get("KDICTATE_MODEL"))
+            if key == "realtime":
+                return "1" if realtime_transcription_enabled() else "0"
+            return ""
+
+        def setting_row_value(self, key: str) -> str:
+            if key == "mic":
+                return self.selected_mic_label()
+            if key == "quality":
+                quality = _normalize_profile(os.environ.get("KDICTATE_PROFILE"), os.environ.get("KDICTATE_MODEL"))
+                return QUALITY_LABELS.get(quality, QUALITY_LABELS["balanced"])
+            if key == "realtime":
+                return "On - live transcript" if realtime_transcription_enabled() else "Off - final paste only"
+            return ""
+
+        def settings_layout(self) -> tuple[list[dict], float]:
+            items: list[dict] = []
+            y = 116.0
+
+            for key, label in [
+                ("mic", "Microphone"),
+                ("quality", "Quality"),
+                ("realtime", "Realtime transcription"),
+            ]:
+                items.append({"kind": "row", "key": key, "label": label, "y": y, "h": 38.0})
+                y += 44.0
+
+                if self.open_dropdown == key:
+                    for value, option_label in self.settings_options(key):
+                        items.append({
+                            "kind": "option",
+                            "key": key,
+                            "value": value,
+                            "label": option_label,
+                            "y": y,
+                            "h": 30.0,
+                        })
+                        y += 30.0
+                    y += 6.0
+
+            return items, y + 12.0
+
+        def update_settings_height(self) -> None:
+            _items, bottom = self.settings_layout()
+            wanted_extra = max(SETTINGS_EXTRA_H, min(SETTINGS_MAX_EXTRA_H, bottom - WINDOW_H + 18.0))
+            self.settings_extra_target = wanted_extra
+            self.set_window_height(WINDOW_H + int(math.ceil(wanted_extra)))
+
+        def toggle_dropdown(self, key: str) -> None:
+            self.open_dropdown = None if self.open_dropdown == key else key
+            if key == "mic":
+                self.refresh_microphones()
+            self.update_settings_height()
             self.area.queue_draw()
 
-        def cycle_microphone(self) -> None:
-            self.refresh_microphones()
+        def apply_setting_choice(self, key: str, value: str) -> None:
+            if key == "mic":
+                set_microphone_device(value)
+            elif key == "quality":
+                profile, _model = apply_quality_profile(value)
+                if BACKEND != "whisper.cpp":
+                    ModelManager.warm_async()
+            elif key == "realtime":
+                set_realtime_transcription(value == "1")
 
-            selected = os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
-            ids = [dev["id"] for dev in self.microphones]
+            self.open_dropdown = None
+            self.update_settings_height()
+            self.set_status("settings", "Settings", "")
+            self.area.queue_draw()
 
-            if selected not in ids:
-                selected = ""
-
-            next_id = ids[(ids.index(selected) + 1) % len(ids)] if ids else ""
-            set_microphone_device(next_id)
-            self.set_status("settings", "Settings", f"Microphone: {self.selected_mic_label()}")
-
-        def cycle_quality(self) -> None:
-            order = ["speed", "balanced", "quality"]
-            current = _normalize_profile(os.environ.get("KDICTATE_PROFILE"), os.environ.get("KDICTATE_MODEL"))
-            next_profile = order[(order.index(current) + 1) % len(order)] if current in order else "balanced"
-
-            profile, model = apply_quality_profile(next_profile)
-            self.set_status("settings", "Settings", f"Quality: {QUALITY_LABELS[profile]}")
-
-            if BACKEND != "whisper.cpp":
-                ModelManager.warm_async()
+        def on_settings_click(self, x, y) -> None:
+            for item in self.settings_layout()[0]:
+                if item["y"] <= y <= item["y"] + item["h"]:
+                    if item["kind"] == "row":
+                        self.toggle_dropdown(item["key"])
+                    elif item["kind"] == "option":
+                        self.apply_setting_choice(item["key"], item["value"])
+                    return
 
         def open_settings(self):
             self.engine.cancel("settings opened")
             self.monitor.disarm()
             self.refresh_microphones()
             self.settings_open = True
+            self.open_dropdown = None
             self.realtime_preview = ""
             self.preview_draw_chars = 0.0
+            self.settings_extra_target = float(SETTINGS_EXTRA_H)
             self.set_window_height(SETTINGS_WINDOW_H)
             self.position()
-            self.set_status("settings", "Settings", "Choose microphone, quality, and realtime preview.")
+            self.set_status("settings", "Settings", "")
             self.fade_target = 1.0
+            self.open_target = 1.0
             self.visible = True
             self.window.present()
             self.area.queue_draw()
@@ -1275,24 +1425,38 @@ def daemon_main() -> int:
             self.last_frame = now
 
             self.level_smooth += (self.level - self.level_smooth) * min(1.0, dt * 12.0)
-            self.fade_alpha += (self.fade_target - self.fade_alpha) * min(1.0, dt * 16.0)
+            self.fade_alpha += (self.fade_target - self.fade_alpha) * min(1.0, dt * 9.0)
+            self.open_anim += (self.open_target - self.open_anim) * min(1.0, dt * 6.5)
 
             target_settings = 1.0 if self.settings_open else 0.0
-            self.settings_anim += (target_settings - self.settings_anim) * min(1.0, dt * 14.0)
+            self.settings_anim += (target_settings - self.settings_anim) * min(1.0, dt * 13.0)
+            self.settings_extra += (self.settings_extra_target - self.settings_extra) * min(1.0, dt * 12.0)
+
+            for key in self.dropdown_anim:
+                target = 1.0 if self.open_dropdown == key else 0.0
+                self.dropdown_anim[key] += (target - self.dropdown_anim[key]) * min(1.0, dt * 14.0)
 
             target_preview = 1.0 if self.engine.recording and realtime_transcription_enabled() and not self.settings_open else 0.0
-            self.preview_anim += (target_preview - self.preview_anim) * min(1.0, dt * 14.0)
+            self.preview_anim += (target_preview - self.preview_anim) * min(1.0, dt * 13.0)
 
             if self.realtime_preview:
                 target_chars = float(len(self.realtime_preview))
                 if self.preview_draw_chars < target_chars:
-                    self.preview_draw_chars = min(target_chars, self.preview_draw_chars + max(1.0, dt * 52.0))
+                    # Keep the existing typing feel, but make long updates feel fluid
+                    # by revealing faster as the transcript grows.
+                    speed = 58.0 + min(42.0, target_chars * 0.06)
+                    self.preview_draw_chars = min(target_chars, self.preview_draw_chars + max(1.0, dt * speed))
                 else:
                     self.preview_draw_chars = target_chars
             else:
                 self.preview_draw_chars = 0.0
 
-            if self.fade_target == 0.0 and self.fade_alpha < 0.03 and self.visible:
+            if not self.realtime_preview:
+                self.preview_scroll_target = 0.0
+
+            self.preview_scroll += (self.preview_scroll_target - self.preview_scroll) * min(1.0, dt * 10.0)
+
+            if self.fade_target == 0.0 and self.fade_alpha < 0.025 and self.open_anim < 0.04 and self.visible:
                 self.window.hide()
                 self.visible = False
 
@@ -1335,14 +1499,7 @@ def daemon_main() -> int:
                 x = ox + max(16, int((sw - WINDOW_W) / 2))
                 y = oy + max(16, int(sh * 0.18))
 
-            if self.layer_enabled and LayerShell is not None:
-                with contextlib.suppress(Exception):
-                    LayerShell.set_margin(self.window, LayerShell.Edge.LEFT, int(x))
-                    LayerShell.set_margin(self.window, LayerShell.Edge.TOP, int(y))
-            else:
-                # Wayland may ignore move(); this fallback is primarily for XWayland/X11.
-                with contextlib.suppress(Exception):
-                    self.window.move(int(x), int(y))
+            self.move_overlay(int(x), int(y))
 
         def show_and_record(self):
             if self.engine.recording:
@@ -1350,8 +1507,12 @@ def daemon_main() -> int:
                 return
 
             self.settings_open = False
+            self.open_dropdown = None
             self.realtime_preview = ""
             self.preview_draw_chars = 0.0
+            self.preview_scroll = 0.0
+            self.preview_scroll_target = 0.0
+            self.preview_user_scroll_lines = 0
 
             if realtime_transcription_enabled():
                 self.set_window_height(LISTENING_PREVIEW_WINDOW_H)
@@ -1365,6 +1526,8 @@ def daemon_main() -> int:
             self.level = 0.0
             self.fade_alpha = 0.0
             self.fade_target = 1.0
+            self.open_anim = 0.0
+            self.open_target = 1.0
             self.visible = True
             self.monitor.arm(ignore_for=0.8)
             self.window.present()
@@ -1379,7 +1542,9 @@ def daemon_main() -> int:
         def close_smoothly(self):
             self.monitor.disarm()
             self.settings_open = False
+            self.open_dropdown = None
             self.fade_target = 0.0
+            self.open_target = 0.0
 
         def set_level(self, rms: float) -> None:
             # Map microphone RMS into a stable visual 0..1 range.
@@ -1415,6 +1580,13 @@ def daemon_main() -> int:
 
                 if len(text) < previous_len:
                     self.preview_draw_chars = float(len(text))
+                    self.preview_scroll = 0.0
+                    self.preview_scroll_target = 0.0
+
+                # If the user has not intentionally scrolled back, keep the live
+                # transcript pinned to the newest line with a smooth upward drift.
+                if self.preview_user_scroll_lines == 0:
+                    self.preview_scroll_target = max(0.0, self.preview_scroll_target)
 
                 self.set_status("listening", "Listening live", "Transcribing as you speak.")
             return False
@@ -1449,11 +1621,31 @@ def daemon_main() -> int:
             cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
             cr.close_path()
 
+        def ease_out_cubic(self, t: float) -> float:
+            t = max(0.0, min(1.0, t))
+            return 1.0 - pow(1.0 - t, 3)
+
         def _text_width(self, cr, text: str) -> float:
             extents = cr.text_extents(text)
             return float(extents.width if hasattr(extents, "width") else extents[2])
 
-        def wrap_text_lines(self, cr, text: str, max_width: float, max_lines: int) -> list[str]:
+        def ellipsize_text(self, cr, text: str, max_width: float) -> str:
+            if self._text_width(cr, text) <= max_width:
+                return text
+
+            suffix = "..."
+            available = max(1.0, max_width - self._text_width(cr, suffix))
+            output = ""
+
+            for ch in text:
+                candidate = output + ch
+                if self._text_width(cr, candidate) > available:
+                    break
+                output = candidate
+
+            return output.rstrip() + suffix
+
+        def wrap_text_lines(self, cr, text: str, max_width: float) -> list[str]:
             words = text.split()
             if not words:
                 return []
@@ -1470,22 +1662,55 @@ def daemon_main() -> int:
                 if current:
                     lines.append(current)
                     current = word
+                else:
+                    # Extremely long single tokens still need to move instead of
+                    # blowing through the panel edge.
+                    chunk = ""
+                    for ch in word:
+                        candidate_chunk = chunk + ch
+                        if self._text_width(cr, candidate_chunk) > max_width and chunk:
+                            lines.append(chunk)
+                            chunk = ch
+                        else:
+                            chunk = candidate_chunk
+                    current = chunk
 
-                if len(lines) >= max_lines:
-                    break
-
-            if current and len(lines) < max_lines:
+            if current:
                 lines.append(current)
-
-            if len(lines) == max_lines and len(" ".join(words)) > len(" ".join(lines)):
-                lines[-1] = lines[-1].rstrip(". ") + "..."
 
             return lines
 
-        def draw_settings_row(self, cr, y: float, label: str, value: str, a: float) -> None:
+        def draw_chevron(self, cr, cx: float, cy: float, angle: float, a: float) -> None:
+            # Starts as a right-facing disclosure arrow and rotates down as the
+            # dropdown expands.
+            pts = [(-4.0, -5.0), (3.0, 0.0), (-4.0, 5.0)]
+            cos_a = math.cos(angle)
+            sin_a = math.sin(angle)
+
+            cr.set_source_rgba(1, 1, 1, 0.46 * a)
+            cr.set_line_width(1.7)
+
+            for idx, (px, py) in enumerate(pts):
+                rx = cx + px * cos_a - py * sin_a
+                ry = cy + px * sin_a + py * cos_a
+                if idx == 0:
+                    cr.move_to(rx, ry)
+                else:
+                    cr.line_to(rx, ry)
+
+            cr.stroke()
+
+        def draw_settings_row(self, cr, y: float, label: str, value: str, key: str, a: float) -> None:
+            open_amount = max(0.0, min(1.0, self.dropdown_anim.get(key, 0.0)))
+
             self.draw_round_rect(cr, 24, y, WINDOW_W - 48, 38, 13)
-            cr.set_source_rgba(1, 1, 1, 0.070 * a)
+            cr.set_source_rgba(1, 1, 1, (0.070 + 0.030 * open_amount) * a)
             cr.fill()
+
+            if open_amount > 0.02:
+                cr.set_source_rgba(0.72, 0.80, 1.00, 0.065 * open_amount * a)
+                self.draw_round_rect(cr, 24, y, WINDOW_W - 48, 38, 13)
+                cr.fill()
 
             cr.set_source_rgba(1, 1, 1, 0.92 * a)
             cr.set_font_size(12.4)
@@ -1494,42 +1719,58 @@ def daemon_main() -> int:
 
             cr.set_source_rgba(1, 1, 1, 0.58 * a)
             cr.set_font_size(11.0)
-            shown = value[:34] + ("..." if len(value) > 34 else "")
+            shown = self.ellipsize_text(cr, value, WINDOW_W - 104)
             cr.move_to(39, y + 31)
             cr.show_text(shown)
 
-            cr.set_source_rgba(1, 1, 1, 0.42 * a)
-            cr.set_line_width(1.6)
-            cr.move_to(WINDOW_W - 45, y + 16)
-            cr.line_to(WINDOW_W - 38, y + 19)
-            cr.line_to(WINDOW_W - 45, y + 22)
-            cr.stroke()
+            self.draw_chevron(cr, WINDOW_W - 42, y + 19, open_amount * (math.pi / 2.0), a)
+
+        def draw_settings_option(self, cr, y: float, label: str, selected: bool, a: float) -> None:
+            self.draw_round_rect(cr, 34, y, WINDOW_W - 68, 26, 10)
+            cr.set_source_rgba(1, 1, 1, (0.060 if not selected else 0.105) * a)
+            cr.fill()
+
+            if selected:
+                cr.set_source_rgba(0.72, 0.80, 1.00, 0.20 * a)
+                cr.arc(47, y + 13, 3.2, 0, 2 * math.pi)
+                cr.fill()
+
+            cr.set_source_rgba(1, 1, 1, (0.62 if not selected else 0.91) * a)
+            cr.set_font_size(10.8)
+            cr.move_to(58, y + 17)
+            cr.show_text(self.ellipsize_text(cr, label, WINDOW_W - 108))
 
         def draw_live_preview(self, cr, width: int, a: float, base: tuple[float, float, float]) -> None:
-            y = 110
-            panel_h = LISTENING_PREVIEW_EXTRA_H - 14
+            panel_y = 112
+            panel_h = LISTENING_PREVIEW_EXTRA_H - 12
+            viewport_x = 32
+            viewport_y = panel_y + 42
+            viewport_w = width - 64
+            viewport_h = panel_h - 58
+            line_h = 22.0
 
             cr.save()
-            cr.rectangle(14, 102, width - 28, panel_h + 12)
+            cr.rectangle(14, 102, width - 28, panel_h + 18)
             cr.clip()
 
-            glow = 0.035 + 0.025 * (0.5 + 0.5 * math.sin(time.time() * 3.6))
+            pulse = 0.5 + 0.5 * math.sin(time.time() * 3.2)
+            glow = 0.040 + 0.030 * pulse
             cr.set_source_rgba(base[0], base[1], base[2], glow * a)
-            self.draw_round_rect(cr, 20, y + 20, width - 40, panel_h - 24, 18)
+            self.draw_round_rect(cr, 20, panel_y + 18, width - 40, panel_h - 20, 18)
             cr.fill()
 
-            cr.set_source_rgba(1, 1, 1, 0.072 * a)
-            self.draw_round_rect(cr, 20, y + 20, width - 40, panel_h - 24, 18)
+            cr.set_source_rgba(1, 1, 1, 0.074 * a)
+            self.draw_round_rect(cr, 20, panel_y + 18, width - 40, panel_h - 20, 18)
             cr.fill()
 
-            cr.set_source_rgba(1, 1, 1, 0.12 * a)
-            self.draw_round_rect(cr, 20.5, y + 20.5, width - 41, panel_h - 25, 18)
+            cr.set_source_rgba(1, 1, 1, 0.125 * a)
+            self.draw_round_rect(cr, 20.5, panel_y + 18.5, width - 41, panel_h - 21, 18)
             cr.set_line_width(1)
             cr.stroke()
 
             cr.set_source_rgba(1, 1, 1, 0.78 * a)
             cr.set_font_size(11.5)
-            cr.move_to(28, y + 11)
+            cr.move_to(28, panel_y + 10)
             cr.show_text("Live transcript")
 
             cr.set_font_size(15.0)
@@ -1537,29 +1778,54 @@ def daemon_main() -> int:
             text = self.realtime_preview[:visible_chars].strip()
 
             if not text:
-                text = "Listening..."
+                lines = ["Listening..."]
+            else:
+                lines = self.wrap_text_lines(cr, text, viewport_w)
 
-            lines = self.wrap_text_lines(cr, text, width - 62, 4)
+            total_h = max(viewport_h, len(lines) * line_h)
+            max_scroll = max(0.0, total_h - viewport_h)
+            visible_line_count = max(1, int(viewport_h // line_h))
+            max_user_lines = max(0, len(lines) - visible_line_count)
+            self.preview_user_scroll_lines = min(self.preview_user_scroll_lines, max_user_lines)
 
-            cr.set_source_rgba(1, 1, 1, 0.92 * a)
-            text_y = y + 47
-            for line in lines:
-                cr.move_to(32, text_y)
+            if self.preview_user_scroll_lines > 0:
+                self.preview_scroll_target = max(0.0, max_scroll - self.preview_user_scroll_lines * line_h)
+            else:
+                self.preview_scroll_target = max_scroll
+
+            cr.save()
+            cr.rectangle(viewport_x, viewport_y - 2, viewport_w, viewport_h + 5)
+            cr.clip()
+
+            for idx, line in enumerate(lines):
+                yy = viewport_y + idx * line_h - self.preview_scroll
+
+                if yy < viewport_y - line_h or yy > viewport_y + viewport_h + line_h:
+                    continue
+
+                top_fade = max(0.35, min(1.0, (yy - viewport_y + 18.0) / 24.0))
+                bottom_fade = max(0.35, min(1.0, (viewport_y + viewport_h - yy + 4.0) / 26.0))
+                newest = 1.0 if idx >= len(lines) - 1 else 0.76
+                line_alpha = min(top_fade, bottom_fade) * newest * a
+
+                cr.set_source_rgba(1, 1, 1, line_alpha)
+                cr.move_to(viewport_x, yy + 15)
                 cr.show_text(line)
-                text_y += 22
 
             if realtime_transcription_enabled() and self.engine.recording:
                 caret_on = math.sin(time.time() * 7.5) > -0.15
-                if caret_on:
-                    last_line = lines[-1] if lines else ""
-                    caret_x = 32 + min(width - 72, self._text_width(cr, last_line) + 4)
-                    caret_y = text_y - 20
-                    cr.set_source_rgba(base[0], base[1], base[2], 0.92 * a)
-                    cr.set_line_width(2)
-                    cr.move_to(caret_x, caret_y - 13)
-                    cr.line_to(caret_x, caret_y + 4)
-                    cr.stroke()
+                if caret_on and lines:
+                    last_line = lines[-1]
+                    last_line_y = viewport_y + (len(lines) - 1) * line_h - self.preview_scroll
+                    if viewport_y - line_h < last_line_y < viewport_y + viewport_h + line_h:
+                        caret_x = viewport_x + min(viewport_w - 6, self._text_width(cr, last_line) + 4)
+                        cr.set_source_rgba(base[0], base[1], base[2], 0.92 * a)
+                        cr.set_line_width(2)
+                        cr.move_to(caret_x, last_line_y + 1)
+                        cr.line_to(caret_x, last_line_y + 18)
+                        cr.stroke()
 
+            cr.restore()
             cr.restore()
 
         def draw(self, area, cr, width, height):
@@ -1567,14 +1833,20 @@ def daemon_main() -> int:
             a = max(0.0, min(1.0, self.fade_alpha))
             settings_alpha = a * max(0.0, min(1.0, self.settings_anim))
             preview_alpha = a * max(0.0, min(1.0, self.preview_anim))
-            panel_extra = max(
-                SETTINGS_EXTRA_H * max(0.0, min(1.0, self.settings_anim)),
-                LISTENING_PREVIEW_EXTRA_H * max(0.0, min(1.0, self.preview_anim)),
-            )
+            settings_extra = self.settings_extra * max(0.0, min(1.0, self.settings_anim))
+            preview_extra = LISTENING_PREVIEW_EXTRA_H * max(0.0, min(1.0, self.preview_anim))
+            panel_extra = max(settings_extra, preview_extra)
             effective_h = WINDOW_H + panel_extra
+
+            presence = self.ease_out_cubic(self.open_anim)
+            scale = 0.965 + 0.035 * presence
+            drift = (1.0 - presence) * (14.0 if self.open_target > 0.0 else -10.0)
 
             cr.save()
             cr.set_operator(cairo.OPERATOR_OVER)  # normal alpha compositing; do not punch transparent holes
+            cr.translate(width / 2.0, 7 + effective_h / 2.0 + drift)
+            cr.scale(scale, scale)
+            cr.translate(-width / 2.0, -(7 + effective_h / 2.0))
 
             # Soft shadow only outside the card.
             cr.set_source_rgba(0, 0, 0, 0.28 * a)
@@ -1592,22 +1864,8 @@ def daemon_main() -> int:
             cr.set_line_width(1)
             cr.stroke()
 
-            # Close button, moved left just enough to make room for Settings.
-            close_x = width - 58
-            cr.set_source_rgba(1, 1, 1, 0.105 * a)
-            cr.arc(close_x, 27, 13, 0, 2 * math.pi)
-            cr.fill()
-
-            cr.set_source_rgba(1, 1, 1, 0.78 * a)
-            cr.set_line_width(2)
-            cr.move_to(close_x - 5, 22)
-            cr.line_to(close_x + 5, 32)
-            cr.move_to(close_x + 5, 22)
-            cr.line_to(close_x - 5, 32)
-            cr.stroke()
-
-            # Settings gear button.
-            gear_x = width - 27
+            # Settings gear button on the left of the close control.
+            gear_x = width - 58
             cr.set_source_rgba(1, 1, 1, 0.105 * a)
             cr.arc(gear_x, 27, 13, 0, 2 * math.pi)
             cr.fill()
@@ -1622,6 +1880,20 @@ def daemon_main() -> int:
 
             cr.stroke()
             cr.arc(gear_x, 27, 4.7, 0, 2 * math.pi)
+            cr.stroke()
+
+            # Close button in the far right corner.
+            close_x = width - 27
+            cr.set_source_rgba(1, 1, 1, 0.105 * a)
+            cr.arc(close_x, 27, 13, 0, 2 * math.pi)
+            cr.fill()
+
+            cr.set_source_rgba(1, 1, 1, 0.78 * a)
+            cr.set_line_width(2)
+            cr.move_to(close_x - 5, 22)
+            cr.line_to(close_x + 5, 32)
+            cr.move_to(close_x + 5, 22)
+            cr.line_to(close_x - 5, 32)
             cr.stroke()
 
             # Reactive microphone glow.
@@ -1681,10 +1953,12 @@ def daemon_main() -> int:
             cr.set_font_size(18)
             cr.move_to(96, 47)
             cr.show_text(self.title)
-            cr.set_source_rgba(1, 1, 1, 0.69 * a)
-            cr.set_font_size(12.8)
-            cr.move_to(96, 70)
-            cr.show_text(self.subtitle)
+
+            if self.subtitle:
+                cr.set_source_rgba(1, 1, 1, 0.69 * a)
+                cr.set_font_size(12.8)
+                cr.move_to(96, 70)
+                cr.show_text(self.ellipsize_text(cr, self.subtitle, width - 164))
 
             # Tiny level meter, directly on the solid card.
             if self.mode == "listening":
@@ -1710,32 +1984,39 @@ def daemon_main() -> int:
 
             if settings_alpha > 0.02:
                 cr.save()
-                cr.rectangle(14, 106, width - 28, SETTINGS_EXTRA_H - 10)
+                cr.rectangle(14, 104, width - 28, self.settings_extra - 4)
                 cr.clip()
 
-                cr.set_source_rgba(1, 1, 1, 0.86 * settings_alpha)
-                cr.set_font_size(13.4)
-                cr.move_to(24, 120)
-                cr.show_text("Settings")
+                selected_values = {
+                    "mic": self.selected_setting_value("mic"),
+                    "quality": self.selected_setting_value("quality"),
+                    "realtime": self.selected_setting_value("realtime"),
+                }
 
-                self.draw_settings_row(cr, 130, "Microphone", self.selected_mic_label(), settings_alpha)
+                for item in self.settings_layout()[0]:
+                    if item["kind"] == "row":
+                        self.draw_settings_row(
+                            cr,
+                            item["y"],
+                            item["label"],
+                            self.setting_row_value(item["key"]),
+                            item["key"],
+                            settings_alpha,
+                        )
+                    elif item["kind"] == "option":
+                        key = item["key"]
+                        open_amount = max(0.0, min(1.0, self.dropdown_anim.get(key, 0.0)))
+                        if open_amount <= 0.02:
+                            continue
 
-                quality = _normalize_profile(os.environ.get("KDICTATE_PROFILE"), os.environ.get("KDICTATE_MODEL"))
-                self.draw_settings_row(
-                    cr,
-                    184,
-                    "Quality",
-                    QUALITY_LABELS.get(quality, QUALITY_LABELS["balanced"]),
-                    settings_alpha,
-                )
-
-                realtime_label = "On - live preview, longer pause" if realtime_transcription_enabled() else "Off - paste after pause"
-                self.draw_settings_row(cr, 238, "Realtime transcription", realtime_label, settings_alpha)
-
-                cr.set_source_rgba(1, 1, 1, 0.38 * settings_alpha)
-                cr.set_font_size(10.5)
-                cr.move_to(25, 307)
-                cr.show_text("Click a row to cycle it. Gear cancels dictation and opens this menu.")
+                        slide = (1.0 - self.ease_out_cubic(open_amount)) * -8.0
+                        self.draw_settings_option(
+                            cr,
+                            item["y"] + slide,
+                            item["label"],
+                            item["value"] == selected_values.get(key),
+                            settings_alpha * open_amount,
+                        )
 
                 cr.restore()
 
