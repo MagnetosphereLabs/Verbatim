@@ -819,6 +819,37 @@ def run(cmd: list[str], *, input_text: str | None = None, timeout: float = 4.0) 
 def command_exists(name: str) -> bool:
     return subprocess.run(["sh", "-lc", f"command -v {name} >/dev/null 2>&1"], check=False).returncode == 0
 
+def repair_gui_environment_for_user_service() -> None:
+    """Repair display environment when launched by systemd --user too early.
+
+    On some desktops, the user service can start before WAYLAND_DISPLAY or
+    DBUS_SESSION_BUS_ADDRESS are present in the service environment. The daemon
+    can still run, but GTK cannot create the overlay until these are available.
+    """
+    os.environ.setdefault("XDG_RUNTIME_DIR", str(RUNTIME_DIR))
+
+    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        bus_path = RUNTIME_DIR / "bus"
+        if bus_path.exists():
+            os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
+
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        for candidate in sorted(RUNTIME_DIR.glob("wayland-*")):
+            if candidate.name.endswith(".lock"):
+                continue
+            if candidate.is_socket():
+                os.environ["WAYLAND_DISPLAY"] = candidate.name
+                os.environ.setdefault("XDG_SESSION_TYPE", "wayland")
+                log(f"Detected Wayland display for user service: {candidate.name}")
+                break
+
+    if not os.environ.get("DISPLAY"):
+        for display_num in range(0, 4):
+            if Path(f"/tmp/.X11-unix/X{display_num}").exists():
+                os.environ["DISPLAY"] = f":{display_num}"
+                os.environ.setdefault("XDG_SESSION_TYPE", "x11")
+                log(f"Detected X11 display for user service: :{display_num}")
+                break
 
 _SENTENCE_BOUNDARY_STARTERS = (
     "This", "That", "It", "There", "These", "Those",
@@ -1954,6 +1985,8 @@ def daemon_main() -> int:
         log("Another KDictate/Verbatim daemon already holds the daemon lock; exiting")
         return 0
 
+    repair_gui_environment_for_user_service()
+
     # GTK imports are intentionally delayed so CLI commands stay lightweight.
     try:
         import gi
@@ -3049,22 +3082,54 @@ def daemon_main() -> int:
 
             cr.restore()
 
-    overlay_ref: dict[str, Overlay] = {}
+    overlay_ref: dict[str, object] = {
+        "overlay": None,
+        "creating": False,
+        "last_error": "",
+    }
+    overlay_lock = threading.Lock()
+
+    def create_overlay_if_needed(reason: str) -> None:
+        with overlay_lock:
+            if overlay_ref.get("overlay") is not None or overlay_ref.get("creating"):
+                return
+            overlay_ref["creating"] = True
+
+        try:
+            repair_gui_environment_for_user_service()
+            overlay_ref["overlay"] = Overlay(app)
+            overlay_ref["last_error"] = ""
+            log(f"Daemon overlay initialized reason={reason!r}")
+        except Exception as exc:
+            overlay_ref["last_error"] = repr(exc)
+            log(f"Daemon overlay initialization failed reason={reason!r}: {exc!r}\n{traceback.format_exc()}")
+        finally:
+            with overlay_lock:
+                overlay_ref["creating"] = False
+
+    def request_overlay_creation(reason: str) -> None:
+        GLib.idle_add(lambda: (create_overlay_if_needed(reason), False)[1])
 
     def on_activate(_app):
-        overlay_ref["overlay"] = Overlay(_app)
-        log("Daemon activated")
+        create_overlay_if_needed("activate")
 
     app.connect("activate", on_activate)
 
     def wait_for_overlay() -> Overlay | None:
+        request_overlay_creation("socket-command")
+
         deadline = time.time() + 3.0
         while time.time() < deadline:
             overlay = overlay_ref.get("overlay")
             if overlay is not None:
-                return overlay
+                return overlay  # type: ignore[return-value]
             time.sleep(0.05)
-        return overlay_ref.get("overlay")
+
+        last_error = str(overlay_ref.get("last_error") or "")
+        if last_error:
+            log(f"Overlay still not ready after socket command: {last_error}")
+
+        return None
 
     def handle_socket(msg: str) -> str:
         if msg == "status":
