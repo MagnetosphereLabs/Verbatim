@@ -164,7 +164,7 @@ def _pactl_available() -> bool:
     return command_exists("pactl")
 
 
-def _pactl(args: list[str], timeout: float = 0.85) -> subprocess.CompletedProcess[str] | None:
+def _pactl(args: list[str], timeout: float = 3.0) -> subprocess.CompletedProcess[str] | None:
     if not _pactl_available():
         return None
 
@@ -183,7 +183,7 @@ def _pactl(args: list[str], timeout: float = 0.85) -> subprocess.CompletedProces
 
 
 def _pactl_default(kind: str) -> str:
-    proc = _pactl(["info"], timeout=0.7)
+    proc = _pactl(["info"], timeout=3.0)
     if proc is None or proc.returncode != 0:
         return ""
 
@@ -199,7 +199,7 @@ def _pactl_nodes(kind: str) -> list[dict[str, str]]:
     # kind is "sources" or "sinks". The long form includes the friendly
     # descriptions shown by desktop audio UIs, unlike PortAudio's generic
     # "pulse" / "pipewire" bridge names.
-    proc = _pactl(["list", kind], timeout=1.2)
+    proc = _pactl(["list", kind], timeout=4.0)
     if proc is None or proc.returncode != 0:
         return []
 
@@ -259,7 +259,7 @@ def _set_default_audio(kind: str, name: str) -> None:
         return
 
     cmd = "set-default-source" if kind == "source" else "set-default-sink"
-    proc = _pactl([cmd, name], timeout=0.8)
+    proc = _pactl([cmd, name], timeout=3.0)
 
     if proc is not None and proc.returncode != 0:
         log(f"pactl {cmd} {name!r} failed: {proc.stderr.strip() or proc.stdout.strip()}")
@@ -412,6 +412,7 @@ def apply_wivrn_audio_if_available(*, force: bool = False) -> dict[str, str] | N
         return _apply_wivrn_audio_if_available_locked(force=force)
 
 
+
 def _apply_wivrn_audio_if_available_locked(*, force: bool = False) -> dict[str, str] | None:
     if not wivrn_auto_audio_enabled():
         _restore_vr_audio_defaults()
@@ -445,11 +446,22 @@ def _apply_wivrn_audio_if_available_locked(*, force: bool = False) -> dict[str, 
         })
         log(f"WiVRn audio appeared; saving defaults source={current_source!r} sink={current_sink!r}")
 
+    changed = False
+
     if current_source != source["name"]:
         _set_default_audio("source", source["name"])
+        changed = True
 
     if current_sink != sink["name"]:
         _set_default_audio("sink", sink["name"])
+        changed = True
+
+    if changed:
+        log(
+            "WiVRn audio routed "
+            f"source={source['name']!r} sink={sink['name']!r} "
+            f"previous_source={current_source!r} previous_sink={current_sink!r}"
+        )
 
     _pause_easyeffects_for_vr()
 
@@ -461,7 +473,6 @@ def _apply_wivrn_audio_if_available_locked(*, force: bool = False) -> dict[str, 
         "device_id": PULSE_SOURCE_PREFIX + source["name"],
     }
 
-
 def start_background_vr_audio_monitor() -> None:
     global BACKGROUND_VR_AUDIO_MONITOR_STARTED
 
@@ -470,21 +481,88 @@ def start_background_vr_audio_monitor() -> None:
             return
         BACKGROUND_VR_AUDIO_MONITOR_STARTED = True
 
-    def worker() -> None:
-        log("Background WiVRn audio monitor started")
+    def run_audio_check(reason: str) -> None:
+        try:
+            active = apply_wivrn_audio_if_available()
 
-        # Run immediately once, then keep polling independently of the GTK UI.
-        # This is what makes WiVRn audio switching work even when the overlay has
-        # not been opened for a long time.
+            if active is not None and reason != "watchdog":
+                log(
+                    "Background WiVRn audio check completed "
+                    f"reason={reason!r} source={active['source']!r} sink={active['sink']!r}"
+                )
+        except Exception as exc:
+            log(f"Background WiVRn audio check failed reason={reason!r}: {exc!r}")
+
+    def subscribe_worker() -> None:
+        log("Background WiVRn audio monitor started with pactl subscribe")
+        run_audio_check("startup")
+
         while True:
+            if not command_exists("pactl"):
+                log("Background WiVRn audio monitor waiting: pactl is missing")
+                time.sleep(10.0)
+                continue
+
+            proc: subprocess.Popen[str] | None = None
+
             try:
-                apply_wivrn_audio_if_available()
+                proc = subprocess.Popen(
+                    ["pactl", "subscribe"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
+
+                assert proc.stdout is not None
+
+                for raw in proc.stdout:
+                    line = raw.strip()
+                    lower = line.lower()
+
+                    if not line:
+                        continue
+
+                    if any(token in lower for token in ("sink", "source", "card", "server")):
+                        # Let PipeWire/Pulse finish publishing both sides of the
+                        # device before scanning sources/sinks.
+                        time.sleep(0.35)
+                        run_audio_check(f"pactl event: {line}")
+
+                rc = proc.wait()
+
+                err = ""
+                if proc.stderr is not None:
+                    with contextlib.suppress(Exception):
+                        err = proc.stderr.read().strip()
+
+                log(f"Background WiVRn pactl subscribe exited rc={rc} stderr={err!r}")
             except Exception as exc:
-                log(f"Background WiVRn audio monitor failed: {exc!r}")
+                log(f"Background WiVRn pactl subscribe failed: {exc!r}")
+
+                if proc is not None:
+                    with contextlib.suppress(Exception):
+                        proc.kill()
 
             time.sleep(2.0)
 
-    threading.Thread(target=worker, daemon=True, name="KDictateWiVRnAudioMonitor").start()
+    def watchdog_worker() -> None:
+        # Fallback for missed events, PipeWire restarts, or desktop policy resets.
+        while True:
+            time.sleep(15.0)
+            run_audio_check("watchdog")
+
+    threading.Thread(
+        target=subscribe_worker,
+        daemon=True,
+        name="KDictateWiVRnAudioSubscribe",
+    ).start()
+
+    threading.Thread(
+        target=watchdog_worker,
+        daemon=True,
+        name="KDictateWiVRnAudioWatchdog",
+    ).start()
 
 
 def _portaudio_pulse_bridge_index() -> int | None:
