@@ -142,6 +142,8 @@ VR_AUDIO_STATE = {
     "restore_sink": None,
     "easyeffects_paused": False,
     "easyeffects_kind": None,
+    "easyeffects_restore_until": 0.0,
+    "easyeffects_last_restore_attempt": 0.0,
 }
 
 VR_AUDIO_LOCK = threading.RLock()
@@ -358,30 +360,91 @@ def _pause_easyeffects_for_vr() -> None:
         log(f"Could not pause EasyEffects for WiVRn mode: {exc!r}")
 
 
-def _restore_easyeffects_after_vr() -> None:
-    if not VR_AUDIO_STATE.get("easyeffects_paused"):
-        return
+def _easyeffects_server_command(command: str, timeout: float = 0.75) -> bool:
+    server_path = RUNTIME_DIR / "EasyEffectsServer"
 
+    if not server_path.exists():
+        return False
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(str(server_path))
+            sock.sendall((command.strip() + "\n").encode("utf-8"))
+        return True
+    except Exception as exc:
+        log(f"EasyEffects server command {command!r} failed: {exc!r}")
+        return False
+
+
+def _hide_easyeffects_window_soon() -> None:
+    def worker() -> None:
+        deadline = time.time() + 7.0
+
+        while time.time() < deadline:
+            if _easyeffects_server_command("hide_window"):
+                log("Asked EasyEffects to hide its window after restore")
+                return
+
+            time.sleep(0.35)
+
+        log("Could not hide EasyEffects window after restore; leaving it open")
+
+    threading.Thread(target=worker, daemon=True, name="KDictateEasyEffectsHide").start()
+
+
+def _start_easyeffects_windowed_then_hide(reason: str) -> None:
     preferred = str(VR_AUDIO_STATE.get("easyeffects_kind") or "")
     prefix, kind = _easyeffects_command_prefix(preferred or None)
-
-    VR_AUDIO_STATE["easyeffects_paused"] = False
-    VR_AUDIO_STATE["easyeffects_kind"] = None
 
     if prefix is None:
         return
 
+    now = time.time()
+    last_attempt = float(VR_AUDIO_STATE.get("easyeffects_last_restore_attempt") or 0.0)
+
+    # Do not hammer EasyEffects if the desktop is slow or the user has just
+    # left VR. This is a safety throttle, not a restart loop.
+    if now - last_attempt < 20.0:
+        return
+
+    VR_AUDIO_STATE["easyeffects_last_restore_attempt"] = now
+
     try:
+        # Launch the normal app, not --gapplication-service. On this machine the
+        # normal minimized app is what keeps EasyEffects reliably active.
         subprocess.Popen(
-            [*prefix, "--gapplication-service"],
+            prefix,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
-        log(f"Restored EasyEffects after WiVRn mode kind={kind!r}")
+        log(f"Started EasyEffects normal app after WiVRn mode kind={kind!r} reason={reason!r}")
+        _hide_easyeffects_window_soon()
     except Exception as exc:
-        log(f"Could not restore EasyEffects after WiVRn mode: {exc!r}")
+        log(f"Could not start EasyEffects normal app after WiVRn mode: {exc!r}")
+
+
+def _restore_easyeffects_after_vr() -> None:
+    now = time.time()
+    restore_until = float(VR_AUDIO_STATE.get("easyeffects_restore_until") or 0.0)
+
+    if VR_AUDIO_STATE.get("easyeffects_paused"):
+        # EasyEffects was running before VR and Verbatim intentionally quit it
+        # for VR. Bring it back after VR, then keep an eye on it briefly because
+        # some desktops dislike hidden service-only EasyEffects.
+        VR_AUDIO_STATE["easyeffects_paused"] = False
+        VR_AUDIO_STATE["easyeffects_restore_until"] = now + 600.0
+        _start_easyeffects_windowed_then_hide("vr-exit")
+        return
+
+    # For a few minutes after VR exit, if EasyEffects disappears again, reopen
+    # it once in the normal app mode and hide it. This avoids a permanent
+    # aggressive restart loop while still fixing the post-VR drop-out.
+    if now < restore_until and not _easyeffects_is_running():
+        _start_easyeffects_windowed_then_hide("post-vr-keepalive")
+        return
 
 
 def _restore_vr_audio_defaults() -> None:
