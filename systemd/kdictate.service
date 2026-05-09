@@ -13,4 +13,4 @@ Environment=KDICTATE_APPDIR=%h/.local/share/kdictate-cosmic
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
