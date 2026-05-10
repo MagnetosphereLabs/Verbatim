@@ -138,9 +138,15 @@ PULSE_SOURCE_PREFIX = "pulse-source:"
 WIVRN_AUTO_DEVICE_ID = "auto-wivrn"
 VR_AUDIO_STATE = {
     "active": False,
+
     "restore_source": None,
     "restore_sink": None,
+    "last_desktop_source": None,
+    "last_desktop_sink": None,
+    "restore_deadline": 0.0,
+    "restore_attempts": 0,
     "easyeffects_paused": False,
+    "easyeffects_was_running": False,
     "easyeffects_kind": None,
     "easyeffects_restore_until": 0.0,
     "easyeffects_last_restore_attempt": 0.0,
@@ -255,6 +261,92 @@ def _find_wivrn_audio() -> tuple[dict[str, str] | None, dict[str, str] | None]:
     sink = next((node for node in _pactl_nodes("sinks") if _is_wivrn_node(node)), None)
     return source, sink
 
+def _node_by_name(nodes: list[dict[str, str]], name: str) -> dict[str, str] | None:
+    if not name:
+        return None
+    return next((node for node in nodes if node.get("name") == name), None)
+
+
+def _is_non_wivrn_audio_name(name: str, nodes: list[dict[str, str]]) -> bool:
+    node = _node_by_name(nodes, name)
+    return node is not None and not _is_wivrn_node(node)
+
+
+def _first_non_wivrn_audio_name(nodes: list[dict[str, str]]) -> str:
+    for node in nodes:
+        name = node.get("name", "")
+        if name and not _is_wivrn_node(node):
+            return name
+    return ""
+
+
+def _remember_desktop_audio_defaults(
+    *,
+    current_source: str | None = None,
+    current_sink: str | None = None,
+    sources: list[dict[str, str]] | None = None,
+    sinks: list[dict[str, str]] | None = None,
+) -> None:
+    """This is intentionally separate from restore_source/restore_sink. It gives us
+    a good fallback if the desktop switches to WiVRn before we notice VR entry.
+    """
+    sources = sources if sources is not None else _pactl_nodes("sources")
+    sinks = sinks if sinks is not None else _pactl_nodes("sinks")
+
+    current_source = current_source if current_source is not None else _pactl_default("source")
+    current_sink = current_sink if current_sink is not None else _pactl_default("sink")
+
+    changed: list[str] = []
+
+    if current_source and _is_non_wivrn_audio_name(current_source, sources):
+        if VR_AUDIO_STATE.get("last_desktop_source") != current_source:
+            VR_AUDIO_STATE["last_desktop_source"] = current_source
+            changed.append(f"source={current_source!r}")
+
+    if current_sink and _is_non_wivrn_audio_name(current_sink, sinks):
+        if VR_AUDIO_STATE.get("last_desktop_sink") != current_sink:
+            VR_AUDIO_STATE["last_desktop_sink"] = current_sink
+            changed.append(f"sink={current_sink!r}")
+
+    if changed:
+        log("Remembered desktop audio default " + " ".join(changed))
+
+
+def _preferred_restore_target(
+    kind: str,
+    saved_name: str,
+    nodes: list[dict[str, str]],
+) -> tuple[str, bool]:
+    """Return the best non-WiVRn restore target and whether it is available."""
+    saved_name = str(saved_name or "")
+
+    if _is_non_wivrn_audio_name(saved_name, nodes):
+        return saved_name, True
+
+    last_key = "last_desktop_source" if kind == "source" else "last_desktop_sink"
+    last_name = str(VR_AUDIO_STATE.get(last_key) or "")
+
+    if last_name != saved_name and _is_non_wivrn_audio_name(last_name, nodes):
+        return last_name, True
+
+    return saved_name, False
+
+
+def _restore_audio_default(kind: str, target: str) -> bool:
+    if not target:
+        return True
+
+    _set_default_audio(kind, target)
+
+    actual = _pactl_default(kind)
+    if actual == target:
+        return True
+
+    log(
+        "WiVRn audio restore verification pending "
+        f"kind={kind!r} wanted={target!r} actual={actual!r}"
+    )
+    return False
 
 def _set_default_audio(kind: str, name: str) -> None:
     if not name:
@@ -345,6 +437,7 @@ def _pause_easyeffects_for_vr() -> None:
         return
 
     VR_AUDIO_STATE["easyeffects_paused"] = True
+    VR_AUDIO_STATE["easyeffects_was_running"] = True
     VR_AUDIO_STATE["easyeffects_kind"] = kind
 
     try:
@@ -394,6 +487,12 @@ def _hide_easyeffects_window_soon() -> None:
 
 
 def _start_easyeffects_windowed_then_hide(reason: str) -> None:
+    # If it is already running, the remaining requirement is to hide the window.
+    if _easyeffects_is_running():
+        log(f"EasyEffects already running after WiVRn mode reason={reason!r}; hiding window")
+        _hide_easyeffects_window_soon()
+        return
+
     preferred = str(VR_AUDIO_STATE.get("easyeffects_kind") or "")
     prefix, kind = _easyeffects_command_prefix(preferred or None)
 
@@ -403,16 +502,14 @@ def _start_easyeffects_windowed_then_hide(reason: str) -> None:
     now = time.time()
     last_attempt = float(VR_AUDIO_STATE.get("easyeffects_last_restore_attempt") or 0.0)
 
-    # Do not hammer EasyEffects if the desktop is slow or the user has just
-    # left VR. This is a safety throttle, not a restart loop.
+    # Do not hammer EasyEffects if the desktop is slow or the user has just left vr
     if now - last_attempt < 20.0:
         return
 
     VR_AUDIO_STATE["easyeffects_last_restore_attempt"] = now
 
     try:
-        # Launch the normal app, not --gapplication-service. On this machine the
-        # normal minimized app is what keeps EasyEffects reliably active.
+        # Launch the normal app, not --gapplication-service.
         subprocess.Popen(
             prefix,
             stdout=subprocess.DEVNULL,
@@ -430,11 +527,15 @@ def _restore_easyeffects_after_vr() -> None:
     now = time.time()
     restore_until = float(VR_AUDIO_STATE.get("easyeffects_restore_until") or 0.0)
 
-    if VR_AUDIO_STATE.get("easyeffects_paused"):
-        # EasyEffects was running before VR and Verbatim intentionally quit it
-        # for VR. Bring it back after VR, then keep an eye on it briefly because
-        # some desktops dislike hidden service-only EasyEffects.
+    should_restore = bool(
+        VR_AUDIO_STATE.get("easyeffects_paused")
+        or VR_AUDIO_STATE.get("easyeffects_was_running")
+    )
+
+    if should_restore:
+
         VR_AUDIO_STATE["easyeffects_paused"] = False
+        VR_AUDIO_STATE["easyeffects_was_running"] = False
         VR_AUDIO_STATE["easyeffects_restore_until"] = now + 600.0
         _start_easyeffects_windowed_then_hide("vr-exit")
         return
@@ -446,28 +547,103 @@ def _restore_easyeffects_after_vr() -> None:
         _start_easyeffects_windowed_then_hide("post-vr-keepalive")
         return
 
+    # If it is running during the restore window, still enforce the minimized
+    # hidden state. This handles the case where launch worked but hide raced.
+    if now < restore_until and _easyeffects_is_running():
+        _hide_easyeffects_window_soon()
+        return
+
 
 def _restore_vr_audio_defaults() -> None:
     if not VR_AUDIO_STATE.get("active"):
+        _remember_desktop_audio_defaults()
         _restore_easyeffects_after_vr()
         return
 
-    restore_source = str(VR_AUDIO_STATE.get("restore_source") or "")
-    restore_sink = str(VR_AUDIO_STATE.get("restore_sink") or "")
+    now = time.time()
+    restore_deadline = float(VR_AUDIO_STATE.get("restore_deadline") or 0.0)
 
-    known_sources = {node["name"] for node in _pactl_nodes("sources")}
-    known_sinks = {node["name"] for node in _pactl_nodes("sinks")}
+    if restore_deadline <= 0.0:
+        restore_deadline = now + 30.0
+        VR_AUDIO_STATE["restore_deadline"] = restore_deadline
 
-    if restore_source and restore_source in known_sources:
-        _set_default_audio("source", restore_source)
+    saved_source = str(VR_AUDIO_STATE.get("restore_source") or "")
+    saved_sink = str(VR_AUDIO_STATE.get("restore_sink") or "")
 
-    if restore_sink and restore_sink in known_sinks:
-        _set_default_audio("sink", restore_sink)
+    sources = _pactl_nodes("sources")
+    sinks = _pactl_nodes("sinks")
+
+    restore_source, source_ready = _preferred_restore_target("source", saved_source, sources)
+    restore_sink, sink_ready = _preferred_restore_target("sink", saved_sink, sinks)
+
+    waiting_for: list[str] = []
+
+    if restore_source and not source_ready:
+        waiting_for.append(f"source={restore_source!r}")
+
+    if restore_sink and not sink_ready:
+        waiting_for.append(f"sink={restore_sink!r}")
+
+    if waiting_for and now < restore_deadline:
+        VR_AUDIO_STATE["restore_attempts"] = int(VR_AUDIO_STATE.get("restore_attempts") or 0) + 1
+        log(
+            "WiVRn audio restore waiting for previous device(s) "
+            f"{' '.join(waiting_for)} "
+            f"attempt={VR_AUDIO_STATE['restore_attempts']}"
+        )
+        _restore_easyeffects_after_vr()
+        return
+
+    if restore_source and not source_ready:
+        fallback = _first_non_wivrn_audio_name(sources)
+        if fallback:
+            log(f"WiVRn source restore target unavailable; falling back to {fallback!r}")
+            restore_source = fallback
+            source_ready = True
+
+    if restore_sink and not sink_ready:
+        fallback = _first_non_wivrn_audio_name(sinks)
+        if fallback:
+            log(f"WiVRn sink restore target unavailable; falling back to {fallback!r}")
+            restore_sink = fallback
+            sink_ready = True
+
+    source_done = True
+    sink_done = True
+
+    if restore_source and source_ready:
+        source_done = _restore_audio_default("source", restore_source)
+
+    if restore_sink and sink_ready:
+        sink_done = _restore_audio_default("sink", restore_sink)
+
+    if not (source_done and sink_done) and now < restore_deadline:
+        VR_AUDIO_STATE["restore_attempts"] = int(VR_AUDIO_STATE.get("restore_attempts") or 0) + 1
+        log(
+            "WiVRn audio restore not verified yet; keeping restore state "
+            f"attempt={VR_AUDIO_STATE['restore_attempts']} "
+            f"source_done={source_done} sink_done={sink_done}"
+        )
+        _restore_easyeffects_after_vr()
+        return
 
     _restore_easyeffects_after_vr()
 
-    log("WiVRn audio disappeared; restored previous desktop audio defaults")
-    VR_AUDIO_STATE.update({"active": False, "restore_source": None, "restore_sink": None})
+    log(
+        "WiVRn audio disappeared; restored previous desktop audio defaults "
+        f"source={restore_source!r} sink={restore_sink!r}"
+    )
+
+    VR_AUDIO_STATE.update({
+        "active": False,
+        "restore_source": None,
+        "restore_sink": None,
+        "restore_deadline": 0.0,
+        "restore_attempts": 0,
+        "easyeffects_was_running": False,
+    })
+
+    _remember_desktop_audio_defaults()
 
 
 def apply_wivrn_audio_if_available(*, force: bool = False) -> dict[str, str] | None:
@@ -495,19 +671,50 @@ def _apply_wivrn_audio_if_available_locked(*, force: bool = False) -> dict[str, 
     # That is the signal that the headset is connected, not merely that some
     # unrelated app or audio bridge exists.
     if source is None or sink is None:
+        if not VR_AUDIO_STATE.get("active"):
+            _remember_desktop_audio_defaults()
         _restore_vr_audio_defaults()
         return None
 
     current_source = _pactl_default("source")
     current_sink = _pactl_default("sink")
 
+    known_sources = _pactl_nodes("sources")
+    known_sinks = _pactl_nodes("sinks")
+
+    _remember_desktop_audio_defaults(
+        current_source=current_source,
+        current_sink=current_sink,
+        sources=known_sources,
+        sinks=known_sinks,
+    )
+
     if not VR_AUDIO_STATE.get("active"):
+        restore_source = (
+            current_source
+            if _is_non_wivrn_audio_name(current_source, known_sources)
+            else str(VR_AUDIO_STATE.get("last_desktop_source") or "")
+        )
+        restore_sink = (
+            current_sink
+            if _is_non_wivrn_audio_name(current_sink, known_sinks)
+            else str(VR_AUDIO_STATE.get("last_desktop_sink") or "")
+        )
+
         VR_AUDIO_STATE.update({
             "active": True,
-            "restore_source": current_source,
-            "restore_sink": current_sink,
+            "restore_source": restore_source,
+            "restore_sink": restore_sink,
+            "restore_deadline": 0.0,
+            "restore_attempts": 0,
+            "easyeffects_was_running": _easyeffects_is_running(),
         })
-        log(f"WiVRn audio appeared; saving defaults source={current_source!r} sink={current_sink!r}")
+        log(
+            "WiVRn audio appeared; saving desktop defaults "
+            f"source={restore_source!r} sink={restore_sink!r} "
+            f"observed_source={current_source!r} observed_sink={current_sink!r} "
+            f"easyeffects_was_running={VR_AUDIO_STATE['easyeffects_was_running']!r}"
+        )
 
     changed = False
 
