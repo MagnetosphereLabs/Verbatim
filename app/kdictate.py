@@ -453,37 +453,48 @@ def _pause_easyeffects_for_vr() -> None:
         log(f"Could not pause EasyEffects for WiVRn mode: {exc!r}")
 
 
-def _easyeffects_server_command(command: str, timeout: float = 0.75) -> bool:
-    server_path = RUNTIME_DIR / "EasyEffectsServer"
-
-    if not server_path.exists():
-        return False
-
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
-            sock.connect(str(server_path))
-            sock.sendall((command.strip() + "\n").encode("utf-8"))
-        return True
-    except Exception as exc:
-        log(f"EasyEffects server command {command!r} failed: {exc!r}")
-        return False
-
-
 def _hide_easyeffects_window_soon() -> None:
     def worker() -> None:
+        time.sleep(2.0)
         deadline = time.time() + 7.0
 
+        commands: list[list[str]] = []
+
+        if command_exists("wlrctl"):
+            commands.extend([
+                ["wlrctl", "toplevel", "minimize", "app_id:easyeffects"],
+                ["wlrctl", "toplevel", "minimize", "app_id:com.github.wwmm.easyeffects"],
+                ["wlrctl", "toplevel", "minimize", "title:EasyEffects"],
+            ])
+
+        if command_exists("wmctrl"):
+            commands.extend([
+                ["wmctrl", "-x", "-r", "easyeffects", "-b", "add,hidden"],
+                ["wmctrl", "-x", "-r", "com.github.wwmm.easyeffects", "-b", "add,hidden"],
+                ["wmctrl", "-r", "EasyEffects", "-b", "add,hidden"],
+            ])
+
         while time.time() < deadline:
-            if _easyeffects_server_command("hide_window"):
-                log("Asked EasyEffects to hide its window after restore")
-                return
+            for command in commands:
+                try:
+                    proc = subprocess.run(
+                        command,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=1.0,
+                        check=False,
+                    )
+                    if proc.returncode == 0:
+                        log("Asked Linux desktop to minimize EasyEffects window after restore")
+                        return
+                except Exception as exc:
+                    log(f"Could not minimize EasyEffects window with {command[0]!r}: {exc!r}")
 
             time.sleep(0.35)
 
-        log("Could not hide EasyEffects window after restore; leaving it open")
+        log("Could not minimize EasyEffects window after restore; leaving it open")
 
-    threading.Thread(target=worker, daemon=True, name="KDictateEasyEffectsHide").start()
+    threading.Thread(target=worker, daemon=True, name="KDictateEasyEffectsMinimize").start()
 
 
 def _start_easyeffects_windowed_then_hide(reason: str) -> None:
@@ -584,8 +595,12 @@ def _restore_vr_audio_defaults() -> None:
     if restore_sink and not sink_ready:
         waiting_for.append(f"sink={restore_sink!r}")
 
-    if waiting_for and now < restore_deadline:
+    if waiting_for:
         VR_AUDIO_STATE["restore_attempts"] = int(VR_AUDIO_STATE.get("restore_attempts") or 0) + 1
+
+        if now >= restore_deadline:
+            VR_AUDIO_STATE["restore_deadline"] = now + 30.0
+
         log(
             "WiVRn audio restore waiting for previous device(s) "
             f"{' '.join(waiting_for)} "
@@ -593,20 +608,6 @@ def _restore_vr_audio_defaults() -> None:
         )
         _restore_easyeffects_after_vr()
         return
-
-    if restore_source and not source_ready:
-        fallback = _first_non_wivrn_audio_name(sources)
-        if fallback:
-            log(f"WiVRn source restore target unavailable; falling back to {fallback!r}")
-            restore_source = fallback
-            source_ready = True
-
-    if restore_sink and not sink_ready:
-        fallback = _first_non_wivrn_audio_name(sinks)
-        if fallback:
-            log(f"WiVRn sink restore target unavailable; falling back to {fallback!r}")
-            restore_sink = fallback
-            sink_ready = True
 
     source_done = True
     sink_done = True
