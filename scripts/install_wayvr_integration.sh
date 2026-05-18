@@ -75,11 +75,12 @@ keyboard = keyboard_path.read_text(encoding="utf-8")
 # Desired symmetrical 2x2 watch grid:
 #   top-left:     Keyboard
 #   top-right:    Verbatim Mic
-#   bottom-left:  Recenter
+#   bottom-left:  Fix Floor
 #   bottom-right: Edit Mode
 #
-# We remove Fix Floor from the quick grid because dictation is more useful
-# beside the keyboard button, and adding a fifth button would break symmetry.
+# We remove Playspace Recenter from the quick grid because dictation is more
+# useful beside the keyboard button, and adding a fifth button would break
+# symmetry. Fix Floor stays available on the watch.
 # ---------------------------------------------------------------------
 
 watch_button_grid = f'''          <!-- Four buttons -->
@@ -93,8 +94,8 @@ watch_button_grid = f'''          <!-- Four buttons -->
               </Button>
             </div>
             <div gap="8">
-              <Button id="btn_recenter" macro="button_style" _press="::PlayspaceRecenter" tooltip="WATCH.RECENTER" tooltip_side="left">
-                <sprite width="40" height="40" color="~color_text" src="watch/recenter.svg" />
+              <Button id="btn_fix_floor" macro="button_style" _press="::PlayspaceFixFloor" tooltip="WATCH.FIX_FLOOR" tooltip_side="left">
+                <sprite width="40" height="40" color="~color_text" src="watch/fix-floor.svg" />
               </Button>
               <Button id="btn_edit_mode" macro="button_style" _press="::EditToggle" tooltip="WATCH.EDIT_MODE" tooltip_side="left">
                 <sprite color="~color_text" width="40" height="40" src="watch/edit.svg" />
