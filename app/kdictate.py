@@ -989,12 +989,19 @@ MAX_RECORD_SECONDS = float(os.environ.get("KDICTATE_MAX_RECORD_SECONDS", "90"))
 SILENCE_TO_FINISH_SECONDS = float(os.environ.get("KDICTATE_SILENCE_TO_FINISH_SECONDS", "1.55"))
 REALTIME_SILENCE_TO_FINISH_SECONDS = float(os.environ.get("KDICTATE_REALTIME_SILENCE_TO_FINISH_SECONDS", "2.85"))
 
+
 AUDIO_RMS_AVERAGE_WINDOW = max(2, int(os.environ.get("KDICTATE_RMS_AVERAGE_WINDOW", "10")))
 AUDIO_NOISE_CALIBRATION_SECONDS = float(os.environ.get("KDICTATE_NOISE_CALIBRATION_SECONDS", "0.75"))
 AUDIO_MIN_SPEECH_THRESHOLD = float(os.environ.get("KDICTATE_MIN_SPEECH_THRESHOLD", "0.0065"))
 AUDIO_SPEECH_THRESHOLD_MULTIPLIER = float(os.environ.get("KDICTATE_SPEECH_THRESHOLD_MULTIPLIER", "2.65"))
 AUDIO_LOWEST_FLOOR_HEADROOM = float(os.environ.get("KDICTATE_LOWEST_FLOOR_HEADROOM", "1.12"))
 
+# Long dictations need the floor to keep learning because fan noise can ramp after the first calibration window.
+AUDIO_ADAPTIVE_NOISE_SECONDS = float(os.environ.get("KDICTATE_ADAPTIVE_NOISE_SECONDS", "12.0"))
+AUDIO_ADAPTIVE_NOISE_PERCENTILE = float(os.environ.get("KDICTATE_ADAPTIVE_NOISE_PERCENTILE", "22"))
+AUDIO_ADAPTIVE_NOISE_RISE_SECONDS = float(os.environ.get("KDICTATE_ADAPTIVE_NOISE_RISE_SECONDS", "5.5"))
+AUDIO_ADAPTIVE_NOISE_FALL_SECONDS = float(os.environ.get("KDICTATE_ADAPTIVE_NOISE_FALL_SECONDS", "28.0"))
+AUDIO_NOISE_LEARN_MAX_SPEECH_RATIO = float(os.environ.get("KDICTATE_NOISE_LEARN_MAX_SPEECH_RATIO", "1.55"))
 
 WINDOW_W = 330
 WINDOW_H = 118
@@ -1883,11 +1890,14 @@ class AudioState:
     latest_avg_rms: float = 0.0
     lowest_avg_rms: float = 0.0
     noise_floor: float = 0.0
+    adaptive_noise_floor: float = 0.0
+    last_noise_adapt_at: float = 0.0
     started_at: float = 0.0
     last_speech_at: float = 0.0
     speech_seen: bool = False
     noise: list[float] = dataclasses.field(default_factory=list)
     rms_window: list[float] = dataclasses.field(default_factory=list)
+    recent_avg_rms: list[tuple[float, float]] = dataclasses.field(default_factory=list)
 
 
 class DictationEngine:
@@ -2018,6 +2028,14 @@ class DictationEngine:
             if avg_rms > 1e-6:
                 self.state.noise.append(avg_rms)
 
+        self.state.recent_avg_rms.append((now, avg_rms))
+        cutoff = now - max(2.0, AUDIO_ADAPTIVE_NOISE_SECONDS)
+        self.state.recent_avg_rms = [
+            (sample_at, level)
+            for sample_at, level in self.state.recent_avg_rms
+            if sample_at >= cutoff and level > 1e-7
+        ]
+
         try:
             import numpy as np
             learned_floor = float(np.percentile(self.state.noise, 70)) if self.state.noise else 0.003
@@ -2026,7 +2044,58 @@ class DictationEngine:
 
         # lowest averaged volume heard by the mic after the keybind started.
         observed_floor = float(lowest_avg_rms or 0.0)
-        noise_floor = max(learned_floor, observed_floor)
+        previous_adaptive_floor = float(self.state.adaptive_noise_floor or 0.0)
+        provisional_floor = max(learned_floor, observed_floor, previous_adaptive_floor)
+        provisional_threshold = max(
+            AUDIO_MIN_SPEECH_THRESHOLD,
+            provisional_floor * AUDIO_SPEECH_THRESHOLD_MULTIPLIER,
+            observed_floor * AUDIO_LOWEST_FLOOR_HEADROOM,
+        )
+
+        try:
+            import numpy as np
+            learn_ceiling = max(
+                provisional_threshold * AUDIO_NOISE_LEARN_MAX_SPEECH_RATIO,
+                provisional_floor * AUDIO_SPEECH_THRESHOLD_MULTIPLIER,
+            )
+            floor_candidates = [
+                level
+                for _sample_at, level in self.state.recent_avg_rms
+                if level <= learn_ceiling
+            ]
+
+            if len(floor_candidates) >= 5:
+                adaptive_target = float(
+                    np.percentile(
+                        floor_candidates,
+                        max(1.0, min(50.0, AUDIO_ADAPTIVE_NOISE_PERCENTILE)),
+                    )
+                )
+            else:
+                adaptive_target = provisional_floor
+        except Exception:
+            adaptive_target = provisional_floor
+
+        last_adapt_at = float(self.state.last_noise_adapt_at or now)
+        adapt_dt = max(0.001, min(1.0, now - last_adapt_at))
+        self.state.last_noise_adapt_at = now
+
+        if previous_adaptive_floor <= 0.0:
+            adaptive_floor = adaptive_target
+        else:
+            adapt_seconds = (
+                AUDIO_ADAPTIVE_NOISE_RISE_SECONDS
+                if adaptive_target > previous_adaptive_floor
+                else AUDIO_ADAPTIVE_NOISE_FALL_SECONDS
+            )
+            adapt_alpha = min(1.0, adapt_dt / max(0.25, adapt_seconds))
+            adaptive_floor = previous_adaptive_floor + (
+                adaptive_target - previous_adaptive_floor
+            ) * adapt_alpha
+
+        self.state.adaptive_noise_floor = max(0.0, adaptive_floor)
+
+        noise_floor = max(learned_floor, observed_floor, self.state.adaptive_noise_floor)
         self.state.noise_floor = noise_floor
 
         threshold = max(
