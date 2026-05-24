@@ -1068,7 +1068,84 @@ _SENTENCE_BOUNDARY_STARTERS = (
     "This", "That", "It", "There", "These", "Those",
     "Then", "So", "But", "However", "Now", "Next",
     "Also", "Finally", "Basically", "Actually", "Overall",
+    "The", "A", "An", "I", "You", "We", "They", "He", "She",
+    "If", "When", "Because", "Maybe", "Sometimes", "Today",
 )
+
+_REALTIME_LOOP_MIN_WORDS = int(os.environ.get("KDICTATE_REALTIME_LOOP_MIN_WORDS", "18"))
+_REALTIME_REPEAT_MAX_RUNS = int(os.environ.get("KDICTATE_REALTIME_REPEAT_MAX_RUNS", "3"))
+_REALTIME_MAX_TEXT_GROWTH_RATIO = float(os.environ.get("KDICTATE_REALTIME_MAX_TEXT_GROWTH_RATIO", "2.35"))
+
+
+def _word_tokens(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9']+", text or "")
+
+
+def looks_like_realtime_loop(text: str) -> bool:
+    """Detect obvious Whisper realtime repetition before it reaches the preview.
+
+    This only rejects pathological interim text. Final transcription still gets
+    its normal full pass.
+    """
+    words = [word.lower() for word in _word_tokens(text)]
+    if len(words) < _REALTIME_LOOP_MIN_WORDS:
+        return False
+
+    for ngram_size in range(2, 8):
+        run = 1
+        previous: tuple[str, ...] | None = None
+
+        for idx in range(0, len(words) - ngram_size + 1, ngram_size):
+            current = tuple(words[idx:idx + ngram_size])
+            if current == previous:
+                run += 1
+                if run >= _REALTIME_REPEAT_MAX_RUNS:
+                    return True
+            else:
+                run = 1
+                previous = current
+
+    tail = words[-24:]
+    if len(tail) >= 18:
+        unique_ratio = len(set(tail)) / float(len(tail))
+        if unique_ratio < 0.34:
+            return True
+
+    return False
+
+
+def repair_missing_sentence_punctuation(text: str) -> str:
+    """Add a period where Whisper clearly capitalized a new sentence but omitted punctuation."""
+    if not text:
+        return ""
+
+    starters = "|".join(re.escape(word) for word in _SENTENCE_BOUNDARY_STARTERS)
+
+    text = re.sub(rf"(?<=[a-z0-9])\s+(?=({starters})\b)", ". ", text)
+
+    def fix_boundary(match: re.Match) -> str:
+        previous_word = match.group(1)
+        next_word = match.group(2)
+
+        if len(previous_word) < 4:
+            return match.group(0)
+
+        if previous_word.lower() in {
+            "using", "called", "named", "like", "with", "from", "into",
+            "about", "inside", "before", "after", "between",
+        }:
+            return match.group(0)
+
+        if next_word in {"I"}:
+            return f"{previous_word}. {next_word}"
+
+        if not re.match(r"[A-Z][a-z]{2,}$", next_word):
+            return match.group(0)
+
+        return f"{previous_word}. {next_word}"
+
+    text = re.sub(r"\b([a-z][a-z']+)\s+([A-Z][A-Za-z']+)\b", fix_boundary, text)
+    return text
 
 
 def normalize_transcript_text(text: str, *, final: bool = False) -> str:
@@ -1082,10 +1159,7 @@ def normalize_transcript_text(text: str, *, final: bool = False) -> str:
     text = re.sub(r"([(\[\{])\s+", r"\1", text)
     text = re.sub(r"([.!?])([A-Za-z])", r"\1 \2", text)
 
-    # Conservative repair for the common realtime boundary glitch:
-    # "... talking This next sentence ..." -> "... talking. This next sentence ..."
-    starters = "|".join(re.escape(word) for word in _SENTENCE_BOUNDARY_STARTERS)
-    text = re.sub(rf"(?<=[a-z0-9])\s+(?=({starters})\b)", ". ", text)
+    text = repair_missing_sentence_punctuation(text)
 
     # Capitalize only after clear sentence boundaries.
     def cap_sentence(match: re.Match) -> str:
@@ -1828,6 +1902,8 @@ class DictationEngine:
         self.realtime_last_start = 0.0
         self.realtime_last_audio_seconds = 0.0
         self.realtime_preview_audio_seconds = 0.0
+        self.realtime_last_good_text = ""
+        self.realtime_last_good_audio_seconds = 0.0
 
     def start(self) -> None:
         if self.recording:
@@ -1839,6 +1915,8 @@ class DictationEngine:
         self.realtime_last_start = 0.0
         self.realtime_last_audio_seconds = 0.0
         self.realtime_preview_audio_seconds = 0.0
+        self.realtime_last_good_text = ""
+        self.realtime_last_good_audio_seconds = 0.0
         now = time.time()
         self.state.started_at = now
         self.state.last_speech_at = now
@@ -2005,10 +2083,11 @@ class DictationEngine:
         if realtime_transcription_enabled():
             preview_text = str(getattr(self.ui, "realtime_preview", "") or "").strip()
 
-        if preview_text:
+        if preview_text and not looks_like_realtime_loop(preview_text):
             preview_audio_seconds = max(0.0, float(self.realtime_preview_audio_seconds or 0.0))
             speech_tail_gap = max(0.0, last_speech_elapsed - preview_audio_seconds)
-            allowed_preview_lag = max(1.25, active_silence_to_finish_seconds() + 0.35)
+
+            allowed_preview_lag = 0.90
 
             if speech_tail_gap <= allowed_preview_lag:
                 quick_text = normalize_transcript_text(preview_text, final=True)
@@ -2096,7 +2175,29 @@ class DictationEngine:
             text = self._write_wav_and_transcribe(frames, samplerate, realtime=True)
             text = normalize_transcript_text(text, final=False)
 
+            if not text:
+                return
+
+            if looks_like_realtime_loop(text):
+                log(
+                    "Rejected loop-like realtime preview "
+                    f"audio={audio_seconds:.2f}s chars={len(text)} text={text[:180]!r}"
+                )
+                return
+
+            previous = self.realtime_last_good_text or str(getattr(self.ui, "realtime_preview", "") or "")
+            if previous:
+                if len(previous) > 45 and len(text) > len(previous) * _REALTIME_MAX_TEXT_GROWTH_RATIO:
+                    log(
+                        "Rejected oversized realtime preview jump "
+                        f"old_len={len(previous)} new_len={len(text)} "
+                        f"audio={audio_seconds:.2f}s"
+                    )
+                    return
+
             if text and self.recording and not self.cancelled and realtime_transcription_enabled():
+                self.realtime_last_good_text = text
+                self.realtime_last_good_audio_seconds = audio_seconds
                 self.ui.invoke_realtime_text(text, audio_seconds)
         except Exception as exc:
             log(f"Realtime transcription preview failed: {exc!r}")
@@ -2851,15 +2952,27 @@ def daemon_main() -> int:
 
         def _on_realtime_text(self, text: str, audio_seconds: float = 0.0):
             if self.engine.recording and realtime_transcription_enabled():
-                previous_len = len(self.realtime_preview)
+                text = normalize_transcript_text(text, final=False)
 
-                # Whisper can occasionally emit a much shorter interim hypothesis.
-                # Ignoring that one frame regression prevents the live transcript
-                # from jumping upward and then snapping back down.
-                if previous_len > 80 and len(text) < previous_len * 0.72:
+                if not text or looks_like_realtime_loop(text):
+                    log(f"Ignored unsafe realtime preview text={text[:180]!r}")
+                    return False
+
+                previous_text = self.realtime_preview
+                previous_len = len(previous_text)
+                new_len = len(text)
+
+                if previous_len > 80 and new_len < previous_len * 0.72:
                     log(
                         "Ignored short realtime preview regression "
-                        f"old_len={previous_len} new_len={len(text)}"
+                        f"old_len={previous_len} new_len={new_len}"
+                    )
+                    return False
+
+                if previous_len > 45 and new_len > previous_len * _REALTIME_MAX_TEXT_GROWTH_RATIO:
+                    log(
+                        "Ignored oversized realtime preview growth "
+                        f"old_len={previous_len} new_len={new_len}"
                     )
                     return False
 
@@ -2869,11 +2982,12 @@ def daemon_main() -> int:
                     float(audio_seconds or 0.0),
                 )
 
-                if len(text) < previous_len:
-                    self.preview_draw_chars = min(self.preview_draw_chars, float(len(text)))
+                if new_len < previous_len:
+                    self.preview_draw_chars = min(self.preview_draw_chars, float(new_len))
 
-                # If the user has not intentionally scrolled back, keep the live
-                # transcript pinned to the newest line with a smooth upward drift.
+                if previous_text and not text.startswith(previous_text[: min(32, len(previous_text))]):
+                    self.preview_draw_chars = min(self.preview_draw_chars, float(new_len))
+
                 if self.preview_user_scroll_lines == 0:
                     self.preview_scroll_target = max(0.0, self.preview_scroll_target)
 
