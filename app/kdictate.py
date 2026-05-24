@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-KDictate Cosmic: local Whisper dictation overlay for COSMIC/Wayland.
-
 Core design:
 - Wayland-friendly UI using GTK4; uses gtk4-layer-shell when available so the
   overlay does not steal keyboard focus from the text field being dictated into.
@@ -991,6 +989,13 @@ MAX_RECORD_SECONDS = float(os.environ.get("KDICTATE_MAX_RECORD_SECONDS", "90"))
 SILENCE_TO_FINISH_SECONDS = float(os.environ.get("KDICTATE_SILENCE_TO_FINISH_SECONDS", "1.55"))
 REALTIME_SILENCE_TO_FINISH_SECONDS = float(os.environ.get("KDICTATE_REALTIME_SILENCE_TO_FINISH_SECONDS", "2.85"))
 
+AUDIO_RMS_AVERAGE_WINDOW = max(2, int(os.environ.get("KDICTATE_RMS_AVERAGE_WINDOW", "10")))
+AUDIO_NOISE_CALIBRATION_SECONDS = float(os.environ.get("KDICTATE_NOISE_CALIBRATION_SECONDS", "0.75"))
+AUDIO_MIN_SPEECH_THRESHOLD = float(os.environ.get("KDICTATE_MIN_SPEECH_THRESHOLD", "0.0065"))
+AUDIO_SPEECH_THRESHOLD_MULTIPLIER = float(os.environ.get("KDICTATE_SPEECH_THRESHOLD_MULTIPLIER", "2.65"))
+AUDIO_LOWEST_FLOOR_HEADROOM = float(os.environ.get("KDICTATE_LOWEST_FLOOR_HEADROOM", "1.12"))
+
+
 WINDOW_W = 330
 WINDOW_H = 118
 LISTENING_PREVIEW_EXTRA_H = 144
@@ -1801,10 +1806,14 @@ class AudioState:
     frames: list
     samplerate: int = 48000
     latest_rms: float = 0.0
+    latest_avg_rms: float = 0.0
+    lowest_avg_rms: float = 0.0
+    noise_floor: float = 0.0
     started_at: float = 0.0
     last_speech_at: float = 0.0
     speech_seen: bool = False
     noise: list[float] = dataclasses.field(default_factory=list)
+    rms_window: list[float] = dataclasses.field(default_factory=list)
 
 
 class DictationEngine:
@@ -1858,11 +1867,28 @@ class DictationEngine:
             def callback(indata, frames, time_info, status):
                 if status:
                     log(f"Audio status: {status}")
+
                 mono = indata[:, 0].astype(np.float32).copy()
                 rms = float(np.sqrt(np.mean(np.square(mono))) + 1e-9)
+
                 with self.lock:
                     self.state.frames.append(mono)
                     self.state.latest_rms = rms
+
+                    # Smooth the mic level before VAD decisions.
+                    self.state.rms_window.append(rms)
+                    if len(self.state.rms_window) > AUDIO_RMS_AVERAGE_WINDOW:
+                        self.state.rms_window = self.state.rms_window[-AUDIO_RMS_AVERAGE_WINDOW:]
+
+                    avg_rms = float(np.mean(self.state.rms_window)) if self.state.rms_window else rms
+                    self.state.latest_avg_rms = avg_rms
+
+                    # Track the quietest averaged mic level heard after the keybind.
+                    if avg_rms > 1e-7:
+                        if self.state.lowest_avg_rms <= 0.0:
+                            self.state.lowest_avg_rms = avg_rms
+                        else:
+                            self.state.lowest_avg_rms = min(self.state.lowest_avg_rms, avg_rms)
 
             self.stream = sd.InputStream(
                 samplerate=samplerate,
@@ -1899,21 +1925,39 @@ class DictationEngine:
         age = now - self.state.started_at
         with self.lock:
             rms = self.state.latest_rms
-        self.ui.set_level(rms)
+            avg_rms = self.state.latest_avg_rms or rms
+            lowest_avg_rms = self.state.lowest_avg_rms
+
+        self.ui.set_level(avg_rms)
 
         if age < 0.45:
-            if rms > 1e-6:
-                self.state.noise.append(rms)
+            if avg_rms > 1e-6:
+                self.state.noise.append(avg_rms)
             return
+
+        # Keep learning the audio floor until speech is actually detected.
+        if age < AUDIO_NOISE_CALIBRATION_SECONDS and not self.state.speech_seen:
+            if avg_rms > 1e-6:
+                self.state.noise.append(avg_rms)
 
         try:
             import numpy as np
-            noise_floor = float(np.percentile(self.state.noise, 70)) if self.state.noise else 0.003
+            learned_floor = float(np.percentile(self.state.noise, 70)) if self.state.noise else 0.003
         except Exception:
-            noise_floor = 0.003
-        threshold = max(0.0065, noise_floor * 2.35)
+            learned_floor = 0.003
 
-        if rms > threshold:
+        # lowest averaged volume heard by the mic after the keybind started.
+        observed_floor = float(lowest_avg_rms or 0.0)
+        noise_floor = max(learned_floor, observed_floor)
+        self.state.noise_floor = noise_floor
+
+        threshold = max(
+            AUDIO_MIN_SPEECH_THRESHOLD,
+            noise_floor * AUDIO_SPEECH_THRESHOLD_MULTIPLIER,
+            observed_floor * AUDIO_LOWEST_FLOOR_HEADROOM,
+        )
+
+        if avg_rms > threshold:
             self.state.speech_seen = True
             self.state.last_speech_at = now
 
@@ -1957,8 +2001,6 @@ class DictationEngine:
             self.ui.close_smoothly()
             return
 
-        # If the live preview already covers the last detected speech, paste it
-        # immediately instead of showing a second "Transcribing" pass.
         preview_text = ""
         if realtime_transcription_enabled():
             preview_text = str(getattr(self.ui, "realtime_preview", "") or "").strip()
