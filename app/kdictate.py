@@ -862,6 +862,41 @@ def _portaudio_pulse_bridge_index() -> int | None:
 
     return None
 
+_PORTAUDIO_PULSE_BRIDGE_INDEX_CACHE: int | None | bool = False
+_PORTAUDIO_PULSE_BRIDGE_INDEX_LOCK = threading.Lock()
+
+
+def _cached_portaudio_pulse_bridge_index() -> int | None:
+    global _PORTAUDIO_PULSE_BRIDGE_INDEX_CACHE
+
+    with _PORTAUDIO_PULSE_BRIDGE_INDEX_LOCK:
+        if _PORTAUDIO_PULSE_BRIDGE_INDEX_CACHE is not False:
+            return _PORTAUDIO_PULSE_BRIDGE_INDEX_CACHE
+
+        _PORTAUDIO_PULSE_BRIDGE_INDEX_CACHE = _portaudio_pulse_bridge_index()
+        return _PORTAUDIO_PULSE_BRIDGE_INDEX_CACHE
+
+
+def resolve_microphone_device_for_keybind(selected_mic: str) -> tuple[int | str | None, str]:
+    """Fast keybind resolver.
+
+    The background WiVRn monitor already keeps system defaults routed.
+    On the keybind path, avoid fresh pactl scans unless the user selected a specific non-default device.
+    """
+    selected_mic = (selected_mic or "").strip()
+
+    if not FAST_START_AUDIO:
+        return resolve_microphone_device(selected_mic)
+
+    if selected_mic in {"", WIVRN_AUTO_DEVICE_ID}:
+        if selected_mic == WIVRN_AUTO_DEVICE_ID and VR_AUDIO_STATE.get("active"):
+            bridge_idx = _cached_portaudio_pulse_bridge_index()
+            if bridge_idx is not None:
+                return bridge_idx, f"WiVRn microphone via Pulse ({bridge_idx}, cached)"
+
+        return None, "system default fast path"
+
+    return resolve_microphone_device(selected_mic)
 
 def resolve_microphone_device(selected_mic: str) -> tuple[int | str | None, str]:
     selected_mic = (selected_mic or "").strip()
@@ -985,6 +1020,23 @@ WHISPER_CPP_MODEL = os.environ.get("KDICTATE_WHISPER_CPP_MODEL", str(APP_DIR / f
 MIC_DEVICE = os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
 WIVRN_AUTO_AUDIO = wivrn_auto_audio_enabled()
 REALTIME_TRANSCRIPTION = realtime_transcription_enabled()
+
+# Keep KDictate hot like a system process.
+# The keybind path should only show UI and start recording.
+KEEP_MODEL_WARM = _truthy(os.environ.get("KDICTATE_KEEP_MODEL_WARM", "1"))
+PRECREATE_OVERLAY = _truthy(os.environ.get("KDICTATE_PRECREATE_OVERLAY", "1"))
+MODEL_WARMUP_DELAY_SECONDS = float(os.environ.get("KDICTATE_MODEL_WARMUP_DELAY_SECONDS", "1.0"))
+
+# Fast path defaults.
+# Avoid slow caret/AT-SPI scans and slow Pulse/WiVRn probing on the keybind path.
+FAST_KEYBIND_START = _truthy(os.environ.get("KDICTATE_FAST_KEYBIND_START", "1"))
+FAST_START_AUDIO = _truthy(os.environ.get("KDICTATE_FAST_START_AUDIO", "1"))
+CARET_POSITION_ON_KEYBIND = _truthy(os.environ.get("KDICTATE_CARET_POSITION_ON_KEYBIND", "0"))
+
+# Start live preview sooner. The preview worker can catch up from recorded audio.
+REALTIME_FIRST_CHUNK_SECONDS = float(os.environ.get("KDICTATE_REALTIME_FIRST_CHUNK_SECONDS", "0.75"))
+REALTIME_MIN_INTERVAL_SECONDS = float(os.environ.get("KDICTATE_REALTIME_MIN_INTERVAL_SECONDS", "0.75"))
+REALTIME_MIN_ADVANCE_SECONDS = float(os.environ.get("KDICTATE_REALTIME_MIN_ADVANCE_SECONDS", "0.45"))
 MAX_RECORD_SECONDS = float(os.environ.get("KDICTATE_MAX_RECORD_SECONDS", "90"))
 SILENCE_TO_FINISH_SECONDS = float(os.environ.get("KDICTATE_SILENCE_TO_FINISH_SECONDS", "1.55"))
 REALTIME_SILENCE_TO_FINISH_SECONDS = float(os.environ.get("KDICTATE_REALTIME_SILENCE_TO_FINISH_SECONDS", "2.85"))
@@ -1829,14 +1881,36 @@ class ModelManager:
                 cls._loading = False
 
     @classmethod
-    def warm_async(cls) -> None:
-        def worker() -> None:
-            try:
-                cls.load()
-            except Exception:
-                pass
+    def is_loaded(cls) -> bool:
+        return cls._model is not None and cls._model_name == MODEL_NAME
 
-        threading.Thread(target=worker, daemon=True).start()
+    @classmethod
+    def warm_async(cls, *, reason: str = "warmup", delay: float = 0.0) -> None:
+        if BACKEND == "whisper.cpp":
+            return
+
+        if cls.is_loaded() or cls._loading:
+            return
+
+        def worker() -> None:
+            if delay > 0:
+                time.sleep(delay)
+
+            if cls.is_loaded() or cls._loading:
+                return
+
+            try:
+                log(f"Starting async model warmup reason={reason!r}")
+                cls.load()
+                log(f"Async model warmup complete reason={reason!r}")
+            except Exception as exc:
+                log(f"Async model warmup failed reason={reason!r}: {exc!r}")
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name="KDictateModelWarmup",
+        ).start()
 
 def transcribe_with_whisper_cpp(wav_path: str) -> str:
     """Transcribe via whisper.cpp, usually Vulkan on AMD/Intel/non-NVIDIA GPUs."""
@@ -1946,6 +2020,13 @@ class DictationEngine:
         self.realtime_last_good_text = ""
         self.realtime_last_good_audio_seconds = 0.0
 
+    def start_async(self) -> None:
+        threading.Thread(
+            target=self.start,
+            daemon=True,
+            name="KDictateAudioStart",
+        ).start()
+  
     def start(self) -> None:
         if self.recording:
             self.cancel("restarted")
@@ -1967,7 +2048,7 @@ class DictationEngine:
             import sounddevice as sd
 
             selected_mic = os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
-            device_arg, resolved_mic_label = resolve_microphone_device(selected_mic)
+            device_arg, resolved_mic_label = resolve_microphone_device_for_keybind(selected_mic)
 
             try:
                 if device_arg is None:
@@ -2024,7 +2105,7 @@ class DictationEngine:
             )
         except Exception as exc:
             self.recording = False
-            self.ui.show_error(f"Microphone failed: {exc}")
+            self.ui.invoke_error(f"Microphone failed: {exc}")
             log(f"Microphone failed: {exc!r}\n{traceback.format_exc()}")
 
     def cancel(self, reason: str) -> None:
@@ -2248,7 +2329,7 @@ class DictationEngine:
         if self.realtime_busy or self.cancelled:
             return
 
-        if now - self.realtime_last_start < 1.25:
+        if now - self.realtime_last_start < REALTIME_MIN_INTERVAL_SECONDS:
             return
 
         with self.lock:
@@ -2260,7 +2341,10 @@ class DictationEngine:
 
         audio_seconds = sum(len(frame) for frame in frames) / float(samplerate)
 
-        if audio_seconds < 1.1 or audio_seconds - self.realtime_last_audio_seconds < 0.65:
+        if (
+            audio_seconds < REALTIME_FIRST_CHUNK_SECONDS
+            or audio_seconds - self.realtime_last_audio_seconds < REALTIME_MIN_ADVANCE_SECONDS
+        ):
             return
 
         self.realtime_busy = True
@@ -2987,6 +3071,25 @@ def daemon_main() -> int:
 
             if preserve_position and was_visible:
                 self.move_overlay(self.window_x, self.window_y)
+            elif FAST_KEYBIND_START and not CARET_POSITION_ON_KEYBIND:
+                display = Gdk.Display.get_default()
+                geom = None
+                try:
+                    monitors = display.get_monitors()
+                    monitor = monitors.get_item(0) if monitors.get_n_items() else None
+                    geom = monitor.get_geometry() if monitor else None
+                except Exception:
+                    geom = None
+            
+                if geom is not None:
+                    sw, sh, ox, oy = int(geom.width), int(geom.height), int(geom.x), int(geom.y)
+                else:
+                    sw, sh, ox, oy = 1920, 1080, 0, 0
+            
+                self.move_overlay(
+                    ox + max(16, int((sw - WINDOW_W) / 2)),
+                    oy + max(16, int(sh * 0.18)),
+                )
             else:
                 self.position()
             self.set_status("listening", "Listening", subtitle)
@@ -3009,12 +3112,14 @@ def daemon_main() -> int:
             self.window.present()
             self.area.queue_draw()
 
-            # Load GPU model only when the user invokes dictation.
-            # This keeps the daemon ready without occupying NVIDIA VRAM 24/7.
-            if BACKEND != "whisper.cpp":
-                ModelManager.warm_async()
+            # Fallback only. Normal startup should already have the model hot.
+            if KEEP_MODEL_WARM and BACKEND != "whisper.cpp" and not ModelManager.is_loaded():
+                ModelManager.warm_async(reason="keybind-fallback")
 
-            self.engine.start()
+            if FAST_KEYBIND_START:
+                self.engine.start_async()
+            else:
+                self.engine.start()
 
         def close_smoothly(self):
             self.monitor.disarm()
@@ -3579,6 +3684,20 @@ def daemon_main() -> int:
 
     app.connect("activate", on_activate)
 
+    def daemon_hot_start_tasks():
+        if PRECREATE_OVERLAY:
+            create_overlay_if_needed("daemon-hot-start")
+
+        if KEEP_MODEL_WARM:
+            ModelManager.warm_async(
+                reason="daemon-hot-start",
+                delay=MODEL_WARMUP_DELAY_SECONDS,
+            )
+
+        return False
+
+    GLib.timeout_add(250, daemon_hot_start_tasks)
+  
     def wait_for_overlay() -> Overlay | None:
         request_overlay_creation("socket-command")
 
