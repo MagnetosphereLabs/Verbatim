@@ -1122,37 +1122,68 @@ def looks_like_realtime_loop(text: str) -> bool:
 
 
 def repair_missing_sentence_punctuation(text: str) -> str:
-    """Add a period where Whisper clearly capitalized a new sentence but omitted punctuation."""
+    """Conservatively add a period where Whisper likely missed a sentence boundary."""
     if not text:
         return ""
 
-    starters = "|".join(re.escape(word) for word in _SENTENCE_BOUNDARY_STARTERS)
+    # Avoid very common noun-phrase starters like "The", "A", and "An".
+    # They are too likely to be normal mid-sentence words.
+    sentence_starters = set(_SENTENCE_BOUNDARY_STARTERS) - {"The", "A", "An", "That"}
 
-    text = re.sub(rf"(?<=[a-z0-9])\s+(?=({starters})\b)", ". ", text)
+    continuation_words = {
+        "and", "or", "but", "because", "if", "when", "while", "although",
+        "though", "unless", "since", "than", "that", "which", "who",
+        "whom", "whose", "where", "whether", "as",
+        "using", "called", "named", "like", "with", "from", "into",
+        "onto", "about", "inside", "outside", "before", "after",
+        "between", "during", "without", "within", "including",
+        "for", "to", "of", "in", "on", "at", "by",
+        "is", "are", "was", "were", "be", "been", "being", "am",
+        "do", "does", "did", "can", "could", "would", "should",
+        "will", "shall", "may", "might", "must", "have", "has", "had",
+    }
+
+    pronoun_like_starters = {
+        "This", "It", "There", "These", "Those",
+        "You", "We", "They", "He", "She",
+    }
+
+    likely_sentence_verbs = {
+        "is", "are", "was", "were", "will", "would", "can", "could",
+        "should", "has", "have", "had", "does", "do", "did", "looks",
+        "seems", "feels", "works", "means", "needs", "goes",
+    }
 
     def fix_boundary(match: re.Match) -> str:
         previous_word = match.group(1)
         next_word = match.group(2)
 
-        if len(previous_word) < 4:
+        if next_word not in sentence_starters:
             return match.group(0)
 
-        if previous_word.lower() in {
-            "using", "called", "named", "like", "with", "from", "into",
-            "about", "inside", "before", "after", "between",
-        }:
+        if previous_word.lower() in continuation_words:
             return match.group(0)
 
-        if next_word in {"I"}:
-            return f"{previous_word}. {next_word}"
-
-        if not re.match(r"[A-Z][a-z]{2,}$", next_word):
+        if len(previous_word) < 4 and not previous_word.isdigit() and next_word != "I":
             return match.group(0)
+
+        before_words = _word_tokens(text[max(0, match.start() - 120):match.start(2)])
+        after_words = _word_tokens(text[match.start(2):match.end(2) + 120])
+
+        # Require a little context on both sides so short phrases do not get chopped up.
+        if len(before_words) < 3 or len(after_words) < 2:
+            return match.group(0)
+
+        # "It/This/They/etc." are only split when the next word looks sentence-like.
+        # This avoids cases like "delete This file" or "move These folders".
+        if next_word in pronoun_like_starters:
+            following_word = after_words[1].lower() if len(after_words) > 1 else ""
+            if following_word not in likely_sentence_verbs:
+                return match.group(0)
 
         return f"{previous_word}. {next_word}"
 
-    text = re.sub(r"\b([a-z][a-z']+)\s+([A-Z][A-Za-z']+)\b", fix_boundary, text)
-    return text
+    return re.sub(r"\b([a-z0-9][a-z0-9']*)\s+([A-Z][A-Za-z']+)\b", fix_boundary, text)
 
 
 def normalize_transcript_text(text: str, *, final: bool = False) -> str:
