@@ -1742,7 +1742,15 @@ class ClipboardPaster:
         if FAST_PASTE_RESTORE_CLIPBOARD:
             old_ok, old_clip = self._read_clipboard_text(timeout=FAST_PASTE_OLD_CLIPBOARD_TIMEOUT)
     
-        if FAST_PASTE_CONTEXT_PROBE and self._should_prefix_space(text):
+        if (
+            text
+            and not text[:1].isspace()
+            and text[:1] not in ".,!?;:%)]}"
+            and (
+                should_prefix_space_before_paste(text)
+                or (FAST_PASTE_CONTEXT_PROBE and self._probe_previous_character_for_spacing())
+            )
+        ):
             text = " " + text
     
         ok, msg, owner_proc = self._set_clipboard_text(text, "fast dictation")
