@@ -1033,6 +1033,15 @@ FAST_KEYBIND_START = _truthy(os.environ.get("KDICTATE_FAST_KEYBIND_START", "1"))
 FAST_START_AUDIO = _truthy(os.environ.get("KDICTATE_FAST_START_AUDIO", "1"))
 CARET_POSITION_ON_KEYBIND = _truthy(os.environ.get("KDICTATE_CARET_POSITION_ON_KEYBIND", "0"))
 
+# Fast paste path.
+# This reduces the delay after the UI says "Typing".
+FAST_PASTE = _truthy(os.environ.get("KDICTATE_FAST_PASTE", "1"))
+FAST_PASTE_RESTORE_CLIPBOARD = _truthy(os.environ.get("KDICTATE_FAST_PASTE_RESTORE_CLIPBOARD", "1"))
+FAST_PASTE_CONTEXT_PROBE = _truthy(os.environ.get("KDICTATE_FAST_PASTE_CONTEXT_PROBE", "0"))
+FAST_PASTE_OLD_CLIPBOARD_TIMEOUT = float(os.environ.get("KDICTATE_FAST_PASTE_OLD_CLIPBOARD_TIMEOUT", "0.16"))
+FAST_PASTE_PRE_PASTE_DELAY = float(os.environ.get("KDICTATE_FAST_PASTE_PRE_PASTE_DELAY", "0.08"))
+FAST_PASTE_RESTORE_DELAY = float(os.environ.get("KDICTATE_FAST_PASTE_RESTORE_DELAY", "0.9"))
+
 # Start live preview sooner. The preview worker can catch up from recorded audio.
 REALTIME_FIRST_CHUNK_SECONDS = float(os.environ.get("KDICTATE_REALTIME_FIRST_CHUNK_SECONDS", "0.75"))
 REALTIME_MIN_INTERVAL_SECONDS = float(os.environ.get("KDICTATE_REALTIME_MIN_INTERVAL_SECONDS", "0.75"))
@@ -1680,40 +1689,84 @@ class ClipboardPaster:
         return self._probe_previous_character_for_spacing()
 
     def paste_text(self, text: str) -> tuple[bool, str]:
+        if FAST_PASTE:
+            return self.paste_text_fast(text)
+    
         if not command_exists("wl-copy"):
             return False, "wl-copy is not installed. The installer should have installed wl-clipboard."
-
+    
         old_ok, old_clip = self._read_clipboard_text(timeout=0.8)
-
+    
         if self._should_prefix_space(text):
             text = " " + text
-
+    
         ok, msg, owner_proc = self._set_clipboard_text(text, "dictation")
         if not ok:
             if old_ok and old_clip is not None:
                 with contextlib.suppress(Exception):
                     self._set_clipboard_text(old_clip, "restore after failed dictation")
             return False, msg
-
+    
         self.pause_monitor(1.5)
         time.sleep(0.18)
-
+    
         if not self.injector.paste_shortcut():
             if old_ok and old_clip is not None:
                 with contextlib.suppress(Exception):
                     self._set_clipboard_text(old_clip, "restore after failed paste")
             return False, "Could not inject Ctrl+V through /dev/uinput or ydotool. Run kdictate doctor."
-
+    
         if old_ok and old_clip is not None:
             def restore() -> None:
-                # Give the focused app enough time to consume Ctrl+V before restoring.
                 time.sleep(1.4)
                 with contextlib.suppress(Exception):
                     self._set_clipboard_text(old_clip, "restore")
-
+    
             threading.Thread(target=restore, daemon=True).start()
-
+    
         return True, "pasted"
+
+    def paste_text_fast(self, text: str) -> tuple[bool, str]:
+        """Low-latency paste path for dictation.
+    
+        The careful paste path probes the target field to decide whether to add a
+        leading space. That is safer, but it can add noticeable delay after the UI
+        already says "Typing". This fast path prioritizes immediate paste.
+        """
+        if not command_exists("wl-copy"):
+            return False, "wl-copy is not installed. The installer should have installed wl-clipboard."
+    
+        old_ok = False
+        old_clip: str | None = None
+    
+        if FAST_PASTE_RESTORE_CLIPBOARD:
+            old_ok, old_clip = self._read_clipboard_text(timeout=FAST_PASTE_OLD_CLIPBOARD_TIMEOUT)
+    
+        if FAST_PASTE_CONTEXT_PROBE and self._should_prefix_space(text):
+            text = " " + text
+    
+        ok, msg, owner_proc = self._set_clipboard_text(text, "fast dictation")
+        if not ok:
+            return False, msg
+    
+        self.pause_monitor(1.5)
+        time.sleep(max(0.0, FAST_PASTE_PRE_PASTE_DELAY))
+    
+        if not self.injector.paste_shortcut():
+            if old_ok and old_clip is not None:
+                with contextlib.suppress(Exception):
+                    self._set_clipboard_text(old_clip, "restore after failed fast paste")
+            return False, "Could not inject Ctrl+V through /dev/uinput or ydotool. Run kdictate doctor."
+    
+        if old_ok and old_clip is not None:
+            def restore() -> None:
+                time.sleep(max(0.15, FAST_PASTE_RESTORE_DELAY))
+                with contextlib.suppress(Exception):
+                    self._set_clipboard_text(old_clip, "fast restore")
+    
+            threading.Thread(target=restore, daemon=True).start()
+    
+        return True, "fast pasted"
 
 class KeyboardMonitor:
     """Cancels dictation when the real user starts typing.
