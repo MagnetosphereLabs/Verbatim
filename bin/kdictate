@@ -44,7 +44,7 @@ if [ -n "$LIB_PATH" ]; then
   export LD_LIBRARY_PATH="$LIB_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
-LS_LIB="$(ldconfig -p 2>/dev/null | awk '/libgtk4-layer-shell.so/{print $NF; exit}')"
+LS_LIB="$(ldconfig -p 2>/dev/null | awk '/libgtk4-layer-shell.so/ && !found {print $NF; found=1}' || true)"
 if [ -n "$LS_LIB" ]; then
   export LD_PRELOAD="$LS_LIB${LD_PRELOAD:+:$LD_PRELOAD}"
 fi
