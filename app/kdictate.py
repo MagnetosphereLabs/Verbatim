@@ -128,8 +128,8 @@ def realtime_transcription_enabled() -> bool:
 
 def active_silence_to_finish_seconds() -> float:
     if realtime_transcription_enabled():
-        return float(os.environ.get("KDICTATE_REALTIME_SILENCE_TO_FINISH_SECONDS", "2.85"))
-    return float(os.environ.get("KDICTATE_SILENCE_TO_FINISH_SECONDS", "1.55"))
+        return float(os.environ.get("KDICTATE_REALTIME_SILENCE_TO_FINISH_SECONDS", "4"))
+    return float(os.environ.get("KDICTATE_SILENCE_TO_FINISH_SECONDS", "3"))
 
 
 PULSE_SOURCE_PREFIX = "pulse-source:"
