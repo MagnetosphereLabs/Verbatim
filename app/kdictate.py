@@ -1039,8 +1039,8 @@ FAST_PASTE = _truthy(os.environ.get("KDICTATE_FAST_PASTE", "1"))
 FAST_PASTE_RESTORE_CLIPBOARD = _truthy(os.environ.get("KDICTATE_FAST_PASTE_RESTORE_CLIPBOARD", "1"))
 FAST_PASTE_CONTEXT_PROBE = _truthy(os.environ.get("KDICTATE_FAST_PASTE_CONTEXT_PROBE", "0"))
 FAST_PASTE_OLD_CLIPBOARD_TIMEOUT = float(os.environ.get("KDICTATE_FAST_PASTE_OLD_CLIPBOARD_TIMEOUT", "0.16"))
-FAST_PASTE_PRE_PASTE_DELAY = float(os.environ.get("KDICTATE_FAST_PASTE_PRE_PASTE_DELAY", "0.08"))
-FAST_PASTE_RESTORE_DELAY = float(os.environ.get("KDICTATE_FAST_PASTE_RESTORE_DELAY", "0.9"))
+FAST_PASTE_PRE_PASTE_DELAY = float(os.environ.get("KDICTATE_FAST_PASTE_PRE_PASTE_DELAY", "0.18"))
+FAST_PASTE_RESTORE_DELAY = float(os.environ.get("KDICTATE_FAST_PASTE_RESTORE_DELAY", "1.4"))
 
 # Start live preview sooner. The preview worker can catch up from recorded audio.
 REALTIME_FIRST_CHUNK_SECONDS = float(os.environ.get("KDICTATE_REALTIME_FIRST_CHUNK_SECONDS", "0.75"))
@@ -1252,6 +1252,10 @@ def normalize_transcript_text(text: str, *, final: bool = False) -> str:
     text = " ".join((text or "").split()).strip()
     if not text:
         return ""
+
+    # A single spoken word is usually a spelling lookup rather than a sentence.
+    if final and len(_word_tokens(text)) == 1:
+        return text.rstrip(".").lower()
 
     # Normal spacing around punctuation.
     text = re.sub(r"\s+([,.;:!?%)\]\}])", r"\1", text)
@@ -2295,7 +2299,7 @@ class DictationEngine:
             self.finish()
         elif age >= MAX_RECORD_SECONDS:
             self.finish()
-        elif not self.state.speech_seen and age >= 12.0:
+        elif not self.state.speech_seen and age >= 21.0:
             self.cancel("no speech detected")
             self.ui.close_smoothly()
 
