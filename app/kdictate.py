@@ -706,6 +706,7 @@ def _apply_wivrn_audio_if_available_locked(*, force: bool = False) -> dict[str, 
             "restore_sink": restore_sink,
             "restore_deadline": 0.0,
             "restore_attempts": 0,
+            "enforce_until": time.time() + 180.0,
             "easyeffects_was_running": _easyeffects_is_running(),
         })
         log(
@@ -717,13 +718,14 @@ def _apply_wivrn_audio_if_available_locked(*, force: bool = False) -> dict[str, 
 
     changed = False
 
-    if current_source != source["name"]:
-        _set_default_audio("source", source["name"])
-        changed = True
+    if time.time() < float(VR_AUDIO_STATE.get("enforce_until") or 0.0):
+        if current_source != source["name"]:
+            _set_default_audio("source", source["name"])
+            changed = True
 
-    if current_sink != sink["name"]:
-        _set_default_audio("sink", sink["name"])
-        changed = True
+        if current_sink != sink["name"]:
+            _set_default_audio("sink", sink["name"])
+            changed = True
 
     if changed:
         log(
