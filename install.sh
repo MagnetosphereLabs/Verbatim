@@ -1,10 +1,57 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-if [ ! -f "$ROOT/app/kdictate.py" ] || [ ! -f "$ROOT/scripts/platform.sh" ]; then
-  echo 'Extract the complete Verbatim bundle, then run bash install.sh inside it.' >&2
-  exit 1
+# Support the public curl | bash entry point as well as an extracted checkout.
+# stdin has no script path: never mistake the caller's working directory for
+# the requested update, even when it contains an older complete checkout.
+INSTALL_SOURCE="${BASH_SOURCE[0]:-}"
+ROOT=''
+if [ -n "$INSTALL_SOURCE" ] && [ -f "$INSTALL_SOURCE" ]; then
+  ROOT="$(cd -- "$(dirname -- "$INSTALL_SOURCE")" && pwd)"
 fi
+REQUIRED_FILES=(
+  install.sh requirements.txt app/kdictate.py bin/kdictate
+  scripts/platform.sh scripts/verbatim-session scripts/verbatim-wayvr
+  scripts/register_desktop_shortcut.py scripts/register_cosmic_shortcut.py
+  scripts/install_wayvr_integration.sh systemd/kdictate.service
+  native/build.sh native/blur.c native/ext-background-effect-v1.xml native/kde-blur.xml
+)
+complete_bundle() {
+  local directory="$1" file
+  [ -n "$directory" ] || return 1
+  for file in "${REQUIRED_FILES[@]}"; do
+    [ -s "$directory/$file" ] || return 1
+  done
+}
+bootstrap_verbatim() (
+  local dependency bootstrap_directory
+  for dependency in curl tar mktemp; do
+    command -v "$dependency" >/dev/null || { echo "Install $dependency, then retry the Verbatim install command." >&2; exit 1; }
+  done
+  bootstrap_directory="$(mktemp -d "${TMPDIR:-/tmp}/verbatim-install.XXXXXX")"
+  trap 'rm -rf -- "$bootstrap_directory"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  echo 'Downloading the complete Verbatim update from GitHub...'
+  # A single repository archive keeps every companion file at the same revision.
+  # Complete staging happens before the installed daemon or files are touched.
+  curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 --max-time 300 \
+    'https://github.com/MagnetosphereLabs/Verbatim/archive/refs/heads/main.tar.gz' \
+    --output "$bootstrap_directory/repository.tar.gz"
+  tar --extract --gzip --file "$bootstrap_directory/repository.tar.gz" \
+    --directory "$bootstrap_directory" --strip-components=1 --no-same-owner --no-same-permissions
+  if ! complete_bundle "$bootstrap_directory"; then
+    echo 'The downloaded repository is missing required Verbatim files. Your existing installation has not been changed.' >&2
+    exit 1
+  fi
+  # Do not feed the still-arriving outer script into a child command's stdin.
+  # Installer prompts explicitly use /dev/tty, so interactive setup still works.
+  bash "$bootstrap_directory/install.sh" "$@" </dev/null
+)
+if ! complete_bundle "$ROOT"; then
+  bootstrap_verbatim "$@"
+  exit $?
+fi
+
 . "$ROOT/scripts/platform.sh"
 FAMILY="$(verbatim_family)" || { echo 'Supported package families: Ubuntu/Mint/Pop (APT), Fedora (DNF), Arch/CachyOS (pacman).' >&2; exit 1; }
 if [ "${1:-}" = '--print-package-plan' ]; then
