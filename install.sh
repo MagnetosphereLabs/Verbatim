@@ -64,6 +64,9 @@ if [ "$(id -u)" -eq 0 ]; then
   echo 'Run this installer as your desktop user, without sudo. It requests sudo for system packages and device access.' >&2
   exit 1
 fi
+# These variables belong to the caller's Python environment. Changes here are
+# confined to this installer process and do not deactivate or modify Conda.
+unset PYTHONHOME PYTHONPATH
 APP="${KDICTATE_APPDIR:-$HOME/.local/share/kdictate-cosmic}"
 BIN="$HOME/.local/bin"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -80,10 +83,6 @@ packages() {
     pacman) sudo pacman -S --needed --noconfirm "$@" ;;
   esac
 }
-# Stop the old daemon before replacing code. Keep the restoration journal and
-# lock inode intact, allowing an interrupted VR session to recover after update.
-if command -v systemctl >/dev/null; then systemctl --user stop kdictate.service || true; fi
-if [ -x "$BIN/kdictate" ]; then "$BIN/kdictate" quit >/dev/null 2>&1 || true; fi
 if [ "$FAMILY" = apt ]; then sudo apt-get update; fi
 read -r -a BASE_PACKAGES <<< "$(verbatim_packages "$FAMILY" base)"
 packages "${BASE_PACKAGES[@]}"
@@ -102,9 +101,10 @@ if [ "$PORTAL" != cosmic ]; then
     echo "Desktop portal package unavailable; retaining the installed portal backend."
   fi
 fi
-PYTHON="${VERBATIM_PYTHON:-$(command -v python3)}"
-"$PYTHON" -c 'import gi,cairo; gi.require_version("Gtk","4.0"); from gi.repository import Gtk' || {
-  echo 'The selected Python must match the distribution PyGObject/GTK packages. Set VERBATIM_PYTHON to the system Python.' >&2; exit 1;
+PYTHON="$(verbatim_python)"
+printf 'Using Python: %s (Verbatim keeps its own virtual environment)\n' "$PYTHON"
+"$PYTHON" -c 'import gi,cairo; gi.require_version("Gtk","4.0"); gi.require_version("Atspi","2.0"); from gi.repository import Gtk,Atspi' || {
+  echo 'The selected Python must match the distribution GTK and accessibility packages. VERBATIM_PYTHON, if set, must select that interpreter.' >&2; exit 1;
 }
 # Preserve model/appearance/mic preferences when updating. Never source config
 # as shell code; paths and tokens can contain spaces or shell punctuation.
@@ -140,6 +140,10 @@ PERCENT="${VERBATIM_BUILD_CPU_PERCENT:-50}"
 BUILD_JOBS=$((CPU_THREADS * PERCENT / 100)); [ "$BUILD_JOBS" -gt 0 ] || BUILD_JOBS=1
 export CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS"
 build() { nice -n 10 "$@"; }
+# Dependencies and Python are validated before interrupting an existing daemon.
+# Keep the restoration journal and lock inode intact for VR session recovery.
+if command -v systemctl >/dev/null; then systemctl --user stop kdictate.service || true; fi
+if [ -x "$BIN/kdictate" ]; then "$BIN/kdictate" quit >/dev/null 2>&1 || true; fi
 # Copy only application-owned trees. Config, models, recovery files, and journal
 # remain intact. Installing this bundle never fetches an unpatched app from main.
 for tree in app scripts systemd native; do
@@ -201,7 +205,12 @@ else
     fi
   fi
 fi
-"$PYTHON" -m venv --system-site-packages "$APP/venv"
+if [ -e "$APP/venv/pyvenv.cfg" ] && ! verbatim_venv_matches "$PYTHON" "$APP/venv"; then
+  echo "Rebuilding Verbatim's virtual environment for the selected Python; preferences and models are retained."
+  "$PYTHON" -m venv --clear --system-site-packages "$APP/venv"
+else
+  "$PYTHON" -m venv --system-site-packages "$APP/venv"
+fi
 "$APP/venv/bin/python" -m pip install --upgrade pip wheel setuptools
 CORE_REQUIREMENTS="$(mktemp)"
 trap 'rm -f -- "$CORE_REQUIREMENTS"' EXIT
