@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
 """
 Core design:
-- Wayland-friendly UI using GTK4; uses gtk4-layer-shell when available so the
-  overlay does not steal keyboard focus from the text field being dictated into.
-- Clipboard paste uses wl-copy plus a persistent /dev/uinput virtual keyboard,
-  so full Unicode text can be pasted into Firefox, COSMIC apps, Electron apps,
-  terminals, etc. without X11.
-- Whisper large-v3 runs locally through faster-whisper/CTranslate2 on CUDA FP16.
+- GTK4 overlay with session-aware focus, clipboard, and paste backends for X11
+  and Wayland; compositor blur or real locally blurred backdrop pixels.
+- Audio capture is independent of a killable local inference worker. Completed
+  transcripts and failed recordings remain recoverable.
+- WiVRn headset evidence drives confirmed audio transitions, with a persistent
+  journal for exact system and application device restoration.
+- Local faster-whisper or whisper.cpp inference supports GPU and CPU runtimes.
 """
 from __future__ import annotations
 
 import contextlib
+import atexit
+import ctypes
+import ctypes.util
 import dataclasses
 import errno
 import fcntl
 import math
+import json
 import os
+import queue
 import select
 import signal
 import socket
+import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -26,6 +34,7 @@ import threading
 import time
 import traceback
 import re
+import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -91,34 +100,35 @@ def _normalize_profile(value: str | None, model: str | None = None) -> str:
 
 
 def save_runtime_config(updates: dict[str, str]) -> None:
-    """Persist user-adjustable settings without disturbing existing installer keys."""
-    try:
-        _ensure_dirs()
-
-        existing = CONFIG_FILE.read_text(encoding="utf-8").splitlines() if CONFIG_FILE.exists() else []
-        seen: set[str] = set()
-        output: list[str] = []
-
-        for raw in existing:
-            line = raw.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key = line.split("=", 1)[0].strip()
+    """Atomic, serialized updates preserve installer keys and concurrent theme edits."""
+    with CONFIG_LOCK:
+        try:
+            _ensure_dirs()
+            existing = CONFIG_FILE.read_text(encoding="utf-8").splitlines() if CONFIG_FILE.exists() else []
+            seen = set()
+            output = []
+            for raw in existing:
+                key = raw.split("=", 1)[0].strip() if "=" in raw and not raw.lstrip().startswith("#") else ""
                 if key in updates:
-                    output.append(f"{key}={updates[key]}")
-                    seen.add(key)
-                    continue
-            output.append(raw)
-
-        for key, value in updates.items():
-            if key not in seen:
-                output.append(f"{key}={value}")
-
-        CONFIG_FILE.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
-
-        for key, value in updates.items():
-            os.environ[key] = value
-    except Exception as exc:
-        log(f"Could not persist runtime config {updates!r}: {exc!r}")
+                    if key not in seen:
+                        output.append(f"{key}={updates[key]}")
+                        seen.add(key)
+                else:
+                    output.append(raw)
+            output.extend(f"{key}={value}" for key, value in updates.items() if key not in seen)
+            fd, temporary = tempfile.mkstemp(prefix="config-", dir=APP_DIR)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    stream.write("\n".join(output).rstrip() + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, CONFIG_FILE)
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(temporary)
+            os.environ.update(updates)
+        except Exception as exc:
+            log(f"Could not persist settings {list(updates)}: {exc!r}")
 
 
 def realtime_transcription_enabled() -> bool:
@@ -153,6 +163,42 @@ VR_AUDIO_STATE = {
 VR_AUDIO_LOCK = threading.RLock()
 BACKGROUND_VR_AUDIO_MONITOR_STARTED = False
 BACKGROUND_VR_AUDIO_MONITOR_LOCK = threading.Lock()
+CONFIG_LOCK = threading.RLock()
+
+THEME_LABELS = {
+    "dark": "Dark", "light": "Light",
+    "glass-dark": "Glass dark", "glass-light": "Glass light",
+}
+
+
+def active_theme() -> str:
+    value = os.environ.get("KDICTATE_THEME", "glass-dark").strip().lower()
+    return value if value in THEME_LABELS else "glass-dark"
+
+
+def theme_palette() -> dict:
+    light = active_theme() in {"light", "glass-light"}
+    return {
+        "light": light,
+        "glass": active_theme().startswith("glass-"),
+        "text": (0.09, 0.12, 0.18) if light else (1.0, 1.0, 1.0),
+        "surface": (0.97, 0.98, 1.0) if light else (0.070, 0.078, 0.10),
+        "accent": (0.23, 0.38, 0.78) if light else (0.72, 0.80, 1.0),
+    }
+
+
+def atomic_json_write(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
 
 
 def wivrn_auto_audio_enabled() -> bool:
@@ -181,6 +227,7 @@ def _pactl(args: list[str], timeout: float = 3.0) -> subprocess.CompletedProcess
             stderr=subprocess.PIPE,
             text=True,
             timeout=timeout,
+            env={**os.environ, "LC_ALL": "C"},
             check=False,
         )
     except Exception as exc:
@@ -189,6 +236,9 @@ def _pactl(args: list[str], timeout: float = 3.0) -> subprocess.CompletedProcess
 
 
 def _pactl_default(kind: str) -> str:
+    direct = _pactl([f"get-default-{kind}"], timeout=1.0)
+    if direct is not None and direct.returncode == 0:
+        return direct.stdout.strip()
     proc = _pactl(["info"], timeout=3.0)
     if proc is None or proc.returncode != 0:
         return ""
@@ -202,6 +252,25 @@ def _pactl_default(kind: str) -> str:
 
 
 def _pactl_nodes(kind: str) -> list[dict[str, str]]:
+    # Machine-readable properties preserve identities and avoid localized parsing.
+    result = _pactl(["--format=json", "list", kind], timeout=2.0)
+    if result is not None and result.returncode == 0:
+        try:
+            nodes = []
+            for item in json.loads(result.stdout):
+                props = item.get("properties", {})
+                name = str(item.get("name", ""))
+                if kind == "sources" and (name.endswith(".monitor") or
+                        item.get("monitor_of_sink") not in {None, "n/a", 4294967295}):
+                    continue
+                nodes.append({"name": name,
+                    "label": str(item.get("description") or name),
+                    "description": str(item.get("description") or name),
+                    "properties": props,
+                    "index": str(item.get("index", ""))})
+            return nodes
+        except (ValueError, TypeError, AttributeError):
+            pass
     # kind is "sources" or "sinks". The long form includes the friendly
     # descriptions shown by desktop audio UIs, unlike PortAudio's generic
     # "pulse" / "pipewire" bridge names.
@@ -645,195 +714,567 @@ def _restore_vr_audio_defaults() -> None:
     _remember_desktop_audio_defaults()
 
 
+class DiscordVoiceRPC:
+    """Optional approved Discord RPC adapter; live streams are always routed separately.
+
+    Voice scopes are restricted by Discord. Never read account tokens from client
+    storage or assume a Rich Presence socket grants voice-setting access.
+    """
+    def __init__(self) -> None:
+        self.data: dict = {}
+        self.next_check = 0.0
+        self.status = "stream routing (voice RPC not configured)"
+
+    @staticmethod
+    def _receive(sock: socket.socket) -> tuple[int, dict]:
+        def exact(length: int) -> bytes:
+            chunks = bytearray()
+            while len(chunks) < length:
+                block = sock.recv(length - len(chunks))
+                if not block:
+                    raise ConnectionError("Discord RPC closed")
+                chunks.extend(block)
+            return bytes(chunks)
+        opcode, length = struct.unpack("<II", exact(8))
+        if length > 1024 * 1024:
+            raise ValueError("Discord RPC frame too large")
+        return opcode, json.loads(exact(length).decode("utf-8"))
+
+    @staticmethod
+    def _send(sock: socket.socket, opcode: int, payload: dict) -> None:
+        data = json.dumps(payload).encode("utf-8")
+        sock.sendall(struct.pack("<II", opcode, len(data)) + data)
+
+    def _request(self, sock: socket.socket, command: str, args: dict) -> dict:
+        nonce = uuid.uuid4().hex
+        self._send(sock, 1, {"cmd": command, "args": args, "nonce": nonce})
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            opcode, reply = self._receive(sock)
+            if opcode == 3:
+                self._send(sock, 4, reply)
+                continue
+            if reply.get("nonce") != nonce:
+                continue
+            if reply.get("evt") == "ERROR":
+                raise RuntimeError(str(reply.get("data", {}).get("message", "Discord RPC rejected request")))
+            return reply.get("data", {})
+        raise TimeoutError("Discord voice RPC response timed out")
+
+    def sync(self, vr: bool, persist: Callable[[], bool]) -> None:
+        client_id = os.environ.get("KDICTATE_DISCORD_RPC_CLIENT_ID", "").strip()
+        token = os.environ.get("KDICTATE_DISCORD_RPC_ACCESS_TOKEN", "").strip()
+        if not client_id or not token or time.monotonic() < self.next_check:
+            return
+        self.next_check = time.monotonic() + 10.0
+        if not hasattr(self, "owners"):
+            self.owners = {}
+        roots = [RUNTIME_DIR, RUNTIME_DIR / "app/com.discordapp.Discord",
+                 RUNTIME_DIR / "app/dev.vencord.Vesktop", Path("/tmp")]
+        paths = list(dict.fromkeys(root / f"discord-ipc-{i}" for root in roots for i in range(10)))
+        found = False
+        for path in paths:
+            key = str(path)
+            if not path.is_socket():
+                owner = self.owners.pop(key, None)
+                if owner:
+                    owner.close()
+                continue
+            found = True
+            sock = self.owners.get(key)
+            try:
+                if sock is None:
+                    # A persistent authenticated connection owns the temporary
+                    # override. Reconnecting every scan would oscillate preferences.
+                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    sock.settimeout(2.0)
+                    sock.connect(key)
+                    self._send(sock, 0, {"v": 1, "client_id": client_id})
+                    opcode, hello = self._receive(sock)
+                    if opcode != 1 or hello.get("evt") != "READY":
+                        raise RuntimeError("Voice RPC handshake unavailable")
+                    self._request(sock, "AUTHENTICATE", {"access_token": token})
+                    self.owners[key] = sock
+                settings = self._request(sock, "GET_VOICE_SETTINGS", {})
+                baseline = self.data.setdefault(key, {})
+                pending = set(baseline.get("_pending", []))
+                changes = {}
+                for direction in ("input", "output"):
+                    current = settings.get(direction, {}).get("device_id")
+                    if current is None:
+                        continue
+                    if vr:
+                        # Snapshot the current user choice for each new VR
+                        # session. A pending recovery retains its old original.
+                        if direction not in pending:
+                            baseline[direction] = current
+                        devices = settings.get(direction, {}).get("available_devices", [])
+                        targets = [d for d in devices if "wivrn" in str(d.get("name", "")).lower()]
+                        if len(targets) == 1 and current != targets[0]["id"]:
+                            changes[direction] = {"device_id": targets[0]["id"]}
+                    elif direction in pending:
+                        if current != baseline.get(direction):
+                            changes[direction] = {"device_id": baseline[direction]}
+                        else:
+                            pending.discard(direction)
+                    else:
+                        # Desktop observation is read-only. Never enforce an
+                        # old baseline after the user changes their preferences.
+                        baseline[direction] = current
+                if changes:
+                    if vr:
+                        pending.update(changes)
+                    baseline["_pending"] = sorted(pending)
+                    if not persist():
+                        continue
+                    self._request(sock, "SET_VOICE_SETTINGS", changes)
+                    settings = self._request(sock, "GET_VOICE_SETTINGS", {})
+                    if not all(settings.get(k, {}).get("device_id") == v["device_id"] for k, v in changes.items()):
+                        raise RuntimeError("Discord device selection readback did not match")
+                    if not vr:
+                        pending.difference_update(changes)
+                baseline["_pending"] = sorted(pending)
+                persist()
+                if not vr:
+                    # Closing RPC also releases Discord's temporary preference lock.
+                    sock.close()
+                    self.owners.pop(key, None)
+                self.status = "voice preferences verified" if not vr else "voice preference override active"
+            except Exception as exc:
+                self.status = "stream routing; approved voice RPC unavailable"
+                # Never include authentication credentials in status/log messages.
+                if sock is not None:
+                    sock.close()
+                self.owners.pop(key, None)
+        if not found:
+            self.status = "client closed; stream routing resumes when voice starts"
+
+    def release(self) -> None:
+        for owner in getattr(self, "owners", {}).values():
+            owner.close()
+        self.owners = {}
+
+
+@dataclasses.dataclass
+class HeadsetDebouncer:
+    """Connection evidence is independent of audio-node or VR-app lifetime."""
+    stable: bool = False
+    candidate: bool | None = None
+    since: float = 0.0
+    midpoint_checked: bool = False
+
+    def observe(self, connected: bool | None, now: float) -> bool:
+        if connected is None:
+            self.candidate = None  # uncertainty cannot count as sustained evidence
+            self.midpoint_checked = False
+            return False
+        if connected == self.stable:
+            self.candidate = None
+            self.midpoint_checked = False
+            return False
+        if self.candidate != connected:
+            self.candidate = connected
+            self.since = now
+            self.midpoint_checked = False
+            return False
+        elapsed = now - self.since
+        if connected and elapsed >= 7.0:
+            self.stable = True
+            self.candidate = None
+            return True
+        if not connected and elapsed >= 7.0 and not self.midpoint_checked:
+            # The second seven seconds starts at this fresh check, not an old timer.
+            self.midpoint_checked = True
+            self.since = now
+        elif not connected and self.midpoint_checked and elapsed >= 7.0:
+            self.stable = False
+            self.candidate = None
+            self.midpoint_checked = False
+            return True
+        return False
+
+
+class WiVRnTruth:
+    def __init__(self) -> None:
+        self.bus = None
+        self.last_error = ""
+        self.owner = ""
+
+    def read(self) -> bool | None:
+        try:
+            from gi.repository import Gio, GLib
+            if self.bus is None or self.bus.is_closed():
+                self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            owner = self.bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                "org.freedesktop.DBus", "GetNameOwner",
+                GLib.Variant("(s)", ("io.github.wivrn.Server",)),
+                GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE, 750, None)
+            current_owner = owner.unpack()[0]
+            if self.owner and self.owner != current_owner:
+                self.owner = current_owner
+                return None  # invalidate evidence across server restarts
+            self.owner = current_owner
+            value = self.bus.call_sync(current_owner, "/io/github/wivrn/Server",
+                "org.freedesktop.DBus.Properties", "Get",
+                GLib.Variant("(ss)", ("io.github.wivrn.Server", "HeadsetConnected")),
+                GLib.VariantType.new("(v)"), Gio.DBusCallFlags.NONE, 750, None)
+            connected = value.unpack()[0]
+            self.last_error = ""
+            return connected if isinstance(connected, bool) else None
+        except Exception as exc:
+            error = str(exc)
+            if "NameHasNoOwner" in error or "ServiceUnknown" in error:
+                self.owner = ""
+                self.last_error = ""
+                return False
+            if error != self.last_error:
+                log(f"WiVRn connection evidence unavailable: {error}")
+            self.last_error = error
+            return None
+
+
+def _audio_identity(node: dict | None) -> dict:
+    if not node:
+        return {}
+    props = node.get("properties", {})
+    return {"name": node.get("name", ""), "properties": {
+        key: str(props[key]) for key in ("device.serial", "device.bus_path",
+            "device.name", "device.profile.name", "node.name", "alsa.card_name")
+        if props.get(key)}}
+
+
+def _resolve_audio_identity(identity: dict, nodes: list[dict]) -> str:
+    exact = _node_by_name(nodes, str(identity.get("name", "")))
+    if exact and not _is_wivrn_node(exact):
+        return str(exact["name"])
+    saved = identity.get("properties", {})
+    strong = {k: v for k, v in saved.items() if k in {"device.serial", "device.bus_path", "device.name"}}
+    if not strong:
+        return ""
+    matches = [n for n in nodes if not _is_wivrn_node(n) and all(
+        str(n.get("properties", {}).get(k, "")) == v for k, v in strong.items()) and
+        (not saved.get("device.profile.name") or
+         n.get("properties", {}).get("device.profile.name") == saved["device.profile.name"])]
+    return str(matches[0]["name"]) if len(matches) == 1 else ""
+
+
+def _discord_stream_identity(item: dict, kind: str) -> str:
+    props = item.get("properties", {})
+    binary = Path(str(props.get("application.process.binary", ""))).name.lower()
+    app_id = str(props.get("application.id", "")).lower()
+    name = str(props.get("application.name", "")).lower()
+    known = {"discord", "discordcanary", "discordptb", "vesktop", "legcord", "equicord"}
+    client = binary if binary in known else ""
+    if not client:
+        ids = {"com.discordapp.discord": "discord", "dev.vencord.vesktop": "vesktop",
+               "xyz.armcord.armcord": "legcord", "io.github.legcord.legcord": "legcord"}
+        client = ids.get(app_id, "")
+    if not client and name in known:
+        client = name
+    if not client:
+        return ""
+    role = str(props.get("media.role", "")).lower()
+    media_name = str(props.get("media.name", "")).lower()
+    if kind == "source-outputs" and (role in {"screen", "production"} or
+            any(token in media_name for token in ("screenshare", "screen capture", "monitor capture"))):
+        return ""
+    restore_id = str(props.get("module-stream-restore.id", ""))
+    return f"{client}|{kind}|{restore_id or role or 'voice'}"
+
+
+class AudioCoordinator:
+    """One background writer; dictation and UI only read its cached result."""
+    def __init__(self) -> None:
+        self.path = APP_DIR / "audio-state.json"
+        self.truth = WiVRnTruth()
+        self.wake = threading.Event()
+        self.stop = threading.Event()
+        self.pulse_changed = threading.Event()
+        self.subscriber = None
+        self.last_scan = 0.0
+        atexit.register(self.shutdown)
+        self.data = {"version": 1, "in_vr": False, "original": {},
+                     "desktop": {}, "streams": {}, "last_applied": {}, "overridden": []}
+        try:
+            saved = json.loads(self.path.read_text(encoding="utf-8"))
+            if saved.get("version") == 1:
+                self.data.update(saved)
+        except (OSError, ValueError, AttributeError):
+            pass
+        self.machine = HeadsetDebouncer(stable=bool(self.data["in_vr"]))
+        self.last_saved = ""
+        self.current = None
+        self.next_scan = 0.0
+        self.evidence = None
+        self.evidence_lock = threading.RLock()
+        self.preferences = DiscordVoiceRPC()
+        self.preferences.data = self.data.setdefault("discord_preferences", {})
+        VR_AUDIO_STATE.update({"active": self.machine.stable,
+            "last_desktop_source": self.data["desktop"].get("source", {}).get("name", ""),
+            "last_desktop_sink": self.data["desktop"].get("sink", {}).get("name", ""),
+            "easyeffects_was_running": bool(self.data.get("easyeffects_was_running")),
+            "easyeffects_kind": self.data.get("easyeffects_kind"),
+            "easyeffects_paused": bool(self.data.get("easyeffects_paused"))})
+
+    def persist(self) -> bool:
+        encoded = json.dumps(self.data, sort_keys=True)
+        if encoded == self.last_saved:
+            return True
+        try:
+            atomic_json_write(self.path, self.data)
+            self.last_saved = encoded
+            return True
+        except OSError as exc:
+            log(f"Cannot save audio restoration journal; routing deferred: {exc}")
+            return False
+
+    def observe(self, observed: bool | None, now: float) -> None:
+        if not wivrn_auto_audio_enabled():
+            observed = False
+        with self.evidence_lock:
+            self.evidence = observed
+            self.machine.observe(observed, now)
+            VR_AUDIO_STATE["connection"] = "unknown" if observed is None else ("connected" if observed else "disconnected")
+            VR_AUDIO_STATE["confirmation"] = self.machine.candidate
+            VR_AUDIO_STATE["active"] = self.machine.stable
+        self.wake.set()
+
+    def may_route(self, vr: bool) -> bool:
+        with self.evidence_lock:
+            return self.evidence is not None and self.machine.stable == vr and (not vr or self.evidence is True)
+
+    def process_state(self, now: float) -> None:
+        with self.evidence_lock:
+            observed, stable = self.evidence, self.machine.stable
+        changed = stable != self.data["in_vr"]
+        if changed:
+            log(f"WiVRn confirmed headset {'connected' if stable else 'disconnected'}")
+            self.data["in_vr"] = stable
+            self.data["overridden"] = []
+            if stable:
+                if not self.data["original"]:
+                    self.data["original"] = dict(self.data["desktop"])
+                self.data["last_applied"] = {}
+                self.data["easyeffects_was_running"] = _easyeffects_is_running()
+            self.next_scan = 0.0
+            self.preferences.next_check = 0.0
+            self.persist()
+        if self.pulse_changed.is_set() and now - self.last_scan >= 0.2:
+            self.pulse_changed.clear()
+            self.next_scan = 0.0
+        if now >= self.next_scan:
+            self.last_scan = now
+            self.next_scan = now + 2.0
+            self.reconcile(observed)
+
+    def step(self, observed: bool | None, now: float) -> None:
+        # Deterministic entry point for tests and one-shot diagnostics.
+        self.observe(observed, now)
+        self.process_state(now)
+
+    def reconcile(self, observed: bool | None) -> None:
+        if observed is None or (self.machine.stable and observed is False):
+            self.current = None
+            return
+        sources, sinks = _pactl_nodes("sources"), _pactl_nodes("sinks")
+        if not sources and not sinks:
+            return
+        defaults = {"source": _pactl_default("source"), "sink": _pactl_default("sink")}
+        all_nodes = {"source": sources, "sink": sinks}
+        original_source = self.data["original"].get("source") or self.data["desktop"].get("source", {})
+        self.capture_desktop_source = _resolve_audio_identity(original_source, sources) or _first_non_wivrn_audio_name(sources)
+        if not self.machine.stable:
+            self.current = None
+            # Only update baseline after originals have been restored.
+            if not self.data["original"] and self.machine.candidate is not True:
+                for kind, nodes in all_nodes.items():
+                    node = _node_by_name(nodes, defaults[kind])
+                    if node and not _is_wivrn_node(node):
+                        self.data["desktop"][kind] = _audio_identity(node)
+                        VR_AUDIO_STATE[f"last_desktop_{kind}"] = node["name"]
+            for kind, identity in list(self.data["original"].items()):
+                nodes = all_nodes[kind]
+                target = _resolve_audio_identity(identity, nodes)
+                if not target:
+                    # A temporary desktop fallback never replaces the saved original.
+                    target = _first_non_wivrn_audio_name(nodes)
+                if target and defaults[kind] != target and self.may_route(False):
+                    _set_default_audio(kind, target)
+                if target and _pactl_default(kind) == target and target == _resolve_audio_identity(identity, nodes):
+                    self.data["desktop"][kind] = identity
+                    del self.data["original"][kind]
+                    self.data["last_applied"].pop(kind, None)
+            self._route_discord(False, sources, sinks)
+            self.preferences.sync(False, lambda: self.may_route(False) and self.persist())
+            if self.data.get("easyeffects_paused"):
+                _restore_easyeffects_after_vr()
+                if _easyeffects_is_running():
+                    self.data["easyeffects_paused"] = False
+                    self.data["easyeffects_was_running"] = False
+            self.persist()
+            return
+        vr_source = next((n for n in sources if _is_wivrn_node(n)), None)
+        vr_sink = next((n for n in sinks if _is_wivrn_node(n)), None)
+        if not vr_source or not vr_sink:
+            self.current = None
+            return
+        if not self.data["original"]:
+            self.data["original"] = dict(self.data["desktop"])
+        for kind, nodes in all_nodes.items():
+            if kind not in self.data["original"]:
+                node = _node_by_name(nodes, defaults[kind])
+                if node and not _is_wivrn_node(node):
+                    self.data["original"][kind] = _audio_identity(node)
+        if not self.persist():
+            return
+        for kind, node in (("source", vr_source), ("sink", vr_sink)):
+            previous = self.data["last_applied"].get(kind)
+            if previous and defaults[kind] not in {previous, node["name"]}:
+                if kind not in self.data["overridden"]:
+                    self.data["overridden"].append(kind)
+                    log(f"Preserving deliberate manual {kind} change during VR")
+            if kind not in self.data["overridden"]:
+                if defaults[kind] != node["name"] and self.may_route(True):
+                    _set_default_audio(kind, node["name"])
+                if _pactl_default(kind) == node["name"]:
+                    self.data["last_applied"][kind] = node["name"]
+        self.current = {"source": vr_source["name"], "sink": vr_sink["name"],
+            "source_label": vr_source["label"], "sink_label": vr_sink["label"],
+            "device_id": PULSE_SOURCE_PREFIX + vr_source["name"]}
+        VR_AUDIO_STATE["easyeffects_was_running"] = bool(self.data.get("easyeffects_was_running"))
+        # Journal intent before pausing; preserve package choice across a daemon restart.
+        if easyeffects_vr_pause_enabled() and self.data.get("easyeffects_was_running"):
+            self.data["easyeffects_paused"] = True
+            if self.persist() and self.may_route(True):
+                _pause_easyeffects_for_vr()
+                self.data["easyeffects_kind"] = VR_AUDIO_STATE.get("easyeffects_kind")
+        self._route_discord(True, sources, sinks)
+        self.preferences.sync(True, lambda: self.may_route(True) and self.persist())
+        self.persist()
+
+    def _route_discord(self, vr: bool, sources: list[dict], sinks: list[dict]) -> None:
+        for kind, nodes, endpoint, command in (("sink-inputs", sinks, "sink", "move-sink-input"),
+                ("source-outputs", sources, "source", "move-source-output")):
+            result = _pactl(["--format=json", "list", kind], timeout=2.0)
+            if result is None or result.returncode:
+                continue
+            try:
+                streams = json.loads(result.stdout)
+            except ValueError:
+                continue
+            by_index = {str(n.get("index", "")): n for n in nodes}
+            for stream in streams:
+                identity = _discord_stream_identity(stream, kind)
+                if not identity:
+                    continue
+                current = by_index.get(str(stream.get(endpoint, "")))
+                if current is None:
+                    continue
+                saved = self.data["streams"].get(identity)
+                owned = self.data.setdefault("stream_vr_active", {}).get(identity, False)
+                if not vr:
+                    if not owned and not _is_wivrn_node(current):
+                        self.data["streams"][identity] = _audio_identity(current)
+                        continue
+                    original = _resolve_audio_identity(saved or {}, nodes)
+                    target = original or _resolve_audio_identity(self.data["desktop"].get(endpoint, {}), nodes)
+                    if not target:
+                        target = _first_non_wivrn_audio_name(nodes)
+                else:
+                    if not owned and not _is_wivrn_node(current):
+                        self.data["streams"][identity] = _audio_identity(current)
+                    target = next((n["name"] for n in nodes if _is_wivrn_node(n)), "")
+                if not target:
+                    continue
+                if target == current["name"]:
+                    if vr or target == _resolve_audio_identity(saved or {}, nodes):
+                        self.data["stream_vr_active"][identity] = vr
+                    continue
+                # Persist ownership intent before writes, so a crash after move
+                # cannot erase the device to which this stream must be restored.
+                self.data["stream_vr_active"][identity] = True
+                if not self.persist():
+                    return
+                if not self.may_route(vr):
+                    return
+                moved = _pactl([command, str(stream["index"]), target], timeout=1.0)
+                if moved is not None and moved.returncode == 0:
+                    actual = _pactl(["--format=json", "list", kind], timeout=1.0)
+                    try:
+                        verified = next((item for item in json.loads(actual.stdout) if item["index"] == stream["index"]), None)
+                        target_node = _node_by_name(nodes, target)
+                        if verified and str(verified.get(endpoint)) == str(target_node.get("index")):
+                            if vr or target == _resolve_audio_identity(saved or {}, nodes):
+                                self.data["stream_vr_active"][identity] = vr
+                    except (AttributeError, ValueError, TypeError):
+                        pass
+
+    def shutdown(self) -> None:
+        self.stop.set()
+        self.wake.set()
+        self.preferences.release()
+        if self.subscriber and self.subscriber.poll() is None:
+            with contextlib.suppress(Exception):
+                self.subscriber.terminate()
+
+    def pulse_events(self) -> None:
+        # New Discord streams (including an app launched during VR) route as
+        # soon as they appear. Periodic reconciliation still recovers missed events.
+        while not self.stop.is_set():
+            try:
+                env = {**os.environ, "LC_ALL": "C"}
+                self.subscriber = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, text=True, env=env)
+                for event in self.subscriber.stdout:
+                    if self.stop.is_set():
+                        break
+                    if any(f" on {kind} " in event for kind in ("server", "source", "sink", "sink-input", "source-output")):
+                        self.pulse_changed.set()
+                        self.wake.set()
+                self.subscriber.wait(timeout=1.0)
+            except Exception:
+                if self.subscriber and self.subscriber.poll() is None:
+                    with contextlib.suppress(Exception):
+                        self.subscriber.terminate()
+            self.stop.wait(2.0)
+
+    def run(self) -> None:
+        def watch() -> None:
+            while not self.stop.is_set():
+                try:
+                    self.observe(self.truth.read(), time.monotonic())
+                except Exception as exc:
+                    self.observe(None, time.monotonic())
+                    log(f"WiVRn observer retrying: {exc!r}")
+                self.stop.wait(0.5)
+        # Headset timing never waits for pactl, application RPC, or inference.
+        threading.Thread(target=watch, name="VerbatimHeadsetTruth", daemon=True).start()
+        threading.Thread(target=self.pulse_events, name="VerbatimPulseEvents", daemon=True).start()
+        while not self.stop.is_set():
+            try:
+                self.process_state(time.monotonic())
+            except Exception as exc:
+                log(f"Audio coordinator retrying after error: {exc!r}")
+            self.wake.wait(0.5)
+            self.wake.clear()
+
+
+AUDIO_COORDINATOR: AudioCoordinator | None = None
+
+
 def apply_wivrn_audio_if_available(*, force: bool = False) -> dict[str, str] | None:
-    with VR_AUDIO_LOCK:
-        return _apply_wivrn_audio_if_available_locked(force=force)
+    # Compatibility entry point. 'force' cannot bypass headset confirmation.
+    return AUDIO_COORDINATOR.current if AUDIO_COORDINATOR and VR_AUDIO_STATE.get("active") else None
 
-
-
-def _apply_wivrn_audio_if_available_locked(*, force: bool = False) -> dict[str, str] | None:
-    if not wivrn_auto_audio_enabled():
-        _restore_vr_audio_defaults()
-        return None
-
-    selected = os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
-
-    # Do not override a deliberate non-VR microphone choice. Empty means
-    # "System default", where seamless VR auto-switching is allowed.
-    if not force and selected not in {"", WIVRN_AUTO_DEVICE_ID} and not selected.startswith(PULSE_SOURCE_PREFIX):
-        _restore_vr_audio_defaults()
-        return None
-
-    source, sink = _find_wivrn_audio()
-
-    # Only auto-switch when WiVRn has both its input and output present.
-    # That is the signal that the headset is connected, not merely that some
-    # unrelated app or audio bridge exists.
-    if source is None or sink is None:
-        if not VR_AUDIO_STATE.get("active"):
-            _remember_desktop_audio_defaults()
-        _restore_vr_audio_defaults()
-        return None
-
-    current_source = _pactl_default("source")
-    current_sink = _pactl_default("sink")
-
-    known_sources = _pactl_nodes("sources")
-    known_sinks = _pactl_nodes("sinks")
-
-    _remember_desktop_audio_defaults(
-        current_source=current_source,
-        current_sink=current_sink,
-        sources=known_sources,
-        sinks=known_sinks,
-    )
-
-    if not VR_AUDIO_STATE.get("active"):
-        restore_source = (
-            current_source
-            if _is_non_wivrn_audio_name(current_source, known_sources)
-            else str(VR_AUDIO_STATE.get("last_desktop_source") or "")
-        )
-        restore_sink = (
-            current_sink
-            if _is_non_wivrn_audio_name(current_sink, known_sinks)
-            else str(VR_AUDIO_STATE.get("last_desktop_sink") or "")
-        )
-
-        VR_AUDIO_STATE.update({
-            "active": True,
-            "restore_source": restore_source,
-            "restore_sink": restore_sink,
-            "restore_deadline": 0.0,
-            "restore_attempts": 0,
-            "enforce_until": time.time() + 180.0,
-            "easyeffects_was_running": _easyeffects_is_running(),
-        })
-        log(
-            "WiVRn audio appeared; saving desktop defaults "
-            f"source={restore_source!r} sink={restore_sink!r} "
-            f"observed_source={current_source!r} observed_sink={current_sink!r} "
-            f"easyeffects_was_running={VR_AUDIO_STATE['easyeffects_was_running']!r}"
-        )
-
-    changed = False
-
-    if time.time() < float(VR_AUDIO_STATE.get("enforce_until") or 0.0):
-        if current_source != source["name"]:
-            _set_default_audio("source", source["name"])
-            changed = True
-
-        if current_sink != sink["name"]:
-            _set_default_audio("sink", sink["name"])
-            changed = True
-
-    if changed:
-        log(
-            "WiVRn audio routed "
-            f"source={source['name']!r} sink={sink['name']!r} "
-            f"previous_source={current_source!r} previous_sink={current_sink!r}"
-        )
-
-    _pause_easyeffects_for_vr()
-
-    return {
-        "source": source["name"],
-        "sink": sink["name"],
-        "source_label": source.get("label") or source["name"],
-        "sink_label": sink.get("label") or sink["name"],
-        "device_id": PULSE_SOURCE_PREFIX + source["name"],
-    }
 
 def start_background_vr_audio_monitor() -> None:
-    global BACKGROUND_VR_AUDIO_MONITOR_STARTED
-
+    global AUDIO_COORDINATOR, BACKGROUND_VR_AUDIO_MONITOR_STARTED
     with BACKGROUND_VR_AUDIO_MONITOR_LOCK:
         if BACKGROUND_VR_AUDIO_MONITOR_STARTED:
             return
+        AUDIO_COORDINATOR = AudioCoordinator()
         BACKGROUND_VR_AUDIO_MONITOR_STARTED = True
-
-    def run_audio_check(reason: str) -> None:
-        try:
-            active = apply_wivrn_audio_if_available()
-
-            if active is not None and reason != "watchdog":
-                log(
-                    "Background WiVRn audio check completed "
-                    f"reason={reason!r} source={active['source']!r} sink={active['sink']!r}"
-                )
-        except Exception as exc:
-            log(f"Background WiVRn audio check failed reason={reason!r}: {exc!r}")
-
-    def subscribe_worker() -> None:
-        log("Background WiVRn audio monitor started with pactl subscribe")
-        run_audio_check("startup")
-
-        while True:
-            if not command_exists("pactl"):
-                log("Background WiVRn audio monitor waiting: pactl is missing")
-                time.sleep(10.0)
-                continue
-
-            proc: subprocess.Popen[str] | None = None
-
-            try:
-                proc = subprocess.Popen(
-                    ["pactl", "subscribe"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1,
-                )
-
-                assert proc.stdout is not None
-
-                for raw in proc.stdout:
-                    line = raw.strip()
-                    lower = line.lower()
-
-                    if not line:
-                        continue
-
-                    if any(token in lower for token in ("sink", "source", "card", "server")):
-                        # Let PipeWire/Pulse finish publishing both sides of the
-                        # device before scanning sources/sinks.
-                        time.sleep(0.35)
-                        run_audio_check(f"pactl event: {line}")
-
-                rc = proc.wait()
-
-                err = ""
-                if proc.stderr is not None:
-                    with contextlib.suppress(Exception):
-                        err = proc.stderr.read().strip()
-
-                log(f"Background WiVRn pactl subscribe exited rc={rc} stderr={err!r}")
-            except Exception as exc:
-                log(f"Background WiVRn pactl subscribe failed: {exc!r}")
-
-                if proc is not None:
-                    with contextlib.suppress(Exception):
-                        proc.kill()
-
-            time.sleep(2.0)
-
-    def watchdog_worker() -> None:
-        # Fallback for missed events, PipeWire restarts, or desktop policy resets.
-        while True:
-            time.sleep(15.0)
-            run_audio_check("watchdog")
-
-    threading.Thread(
-        target=subscribe_worker,
-        daemon=True,
-        name="KDictateWiVRnAudioSubscribe",
-    ).start()
-
-    threading.Thread(
-        target=watchdog_worker,
-        daemon=True,
-        name="KDictateWiVRnAudioWatchdog",
-    ).start()
+    threading.Thread(target=AUDIO_COORDINATOR.run, name="VerbatimAudioCoordinator", daemon=True).start()
 
 
 def _portaudio_pulse_bridge_index() -> int | None:
@@ -891,11 +1332,16 @@ def resolve_microphone_device_for_keybind(selected_mic: str) -> tuple[int | str 
         return resolve_microphone_device(selected_mic)
 
     if selected_mic in {"", WIVRN_AUTO_DEVICE_ID}:
-        if selected_mic == WIVRN_AUTO_DEVICE_ID and VR_AUDIO_STATE.get("active"):
-            bridge_idx = _cached_portaudio_pulse_bridge_index()
-            if bridge_idx is not None:
-                return bridge_idx, f"WiVRn microphone via Pulse ({bridge_idx}, cached)"
-
+        os.environ.pop("PULSE_SOURCE", None)
+        # During the disconnect grace interval, capture from the cached desktop
+        # input without changing global routing before its 14-second confirmation.
+        if VR_AUDIO_STATE.get("connection") == "disconnected" and AUDIO_COORDINATOR:
+            fallback = getattr(AUDIO_COORDINATOR, "capture_desktop_source", "")
+            if fallback:
+                os.environ["PULSE_SOURCE"] = fallback
+        bridge_idx = _cached_portaudio_pulse_bridge_index()
+        if bridge_idx is not None:
+            return bridge_idx, "confirmed system audio via Pulse"
         return None, "system default fast path"
 
     return resolve_microphone_device(selected_mic)
@@ -904,6 +1350,7 @@ def resolve_microphone_device(selected_mic: str) -> tuple[int | str | None, str]
     selected_mic = (selected_mic or "").strip()
 
     if selected_mic in {"", WIVRN_AUTO_DEVICE_ID}:
+        os.environ.pop("PULSE_SOURCE", None)
         active = apply_wivrn_audio_if_available(force=(selected_mic == WIVRN_AUTO_DEVICE_ID))
 
         if active is not None:
@@ -916,13 +1363,13 @@ def resolve_microphone_device(selected_mic: str) -> tuple[int | str | None, str]
         source_name = selected_mic[len(PULSE_SOURCE_PREFIX):]
         source = next((node for node in _pactl_nodes("sources") if node["name"] == source_name), None)
 
-        if source is not None:
-            _set_default_audio("source", source_name)
-
-            if _is_wivrn_node(source):
-                sink = next((node for node in _pactl_nodes("sinks") if _is_wivrn_node(node)), None)
-                if sink is not None:
-                    _set_default_audio("sink", sink["name"])
+        if source is not None and _is_wivrn_node(source) and not VR_AUDIO_STATE.get("active"):
+            # Persistent WiVRn nodes do not imply a connected headset.
+            source = None
+            source_name = _pactl_default("source")
+        # PULSE_SOURCE selects this client's input without changing system defaults.
+        if source_name:
+            os.environ["PULSE_SOURCE"] = source_name
 
         bridge_idx = _portaudio_pulse_bridge_index()
         label = source.get("label") if source else source_name
@@ -1070,8 +1517,8 @@ WINDOW_W = 330
 WINDOW_H = 118
 LISTENING_PREVIEW_EXTRA_H = 144
 LISTENING_PREVIEW_WINDOW_H = WINDOW_H + LISTENING_PREVIEW_EXTRA_H
-SETTINGS_EXTRA_H = 184
-SETTINGS_MAX_EXTRA_H = 360
+SETTINGS_EXTRA_H = 224
+SETTINGS_MAX_EXTRA_H = 440
 SETTINGS_WINDOW_H = WINDOW_H + SETTINGS_EXTRA_H
 
 
@@ -1100,39 +1547,24 @@ def run(cmd: list[str], *, input_text: str | None = None, timeout: float = 4.0) 
 
 
 def command_exists(name: str) -> bool:
-    return subprocess.run(["sh", "-lc", f"command -v {name} >/dev/null 2>&1"], check=False).returncode == 0
+    return shutil.which(name) is not None
 
 def repair_gui_environment_for_user_service() -> None:
-    """Repair display environment when launched by systemd --user too early.
-
-    On some desktops, the user service can start before WAYLAND_DISPLAY or
-    DBUS_SESSION_BUS_ADDRESS are present in the service environment. The daemon
-    can still run, but GTK cannot create the overlay until these are available.
-    """
+    """Use the login session's imported environment, never guess another display."""
     os.environ.setdefault("XDG_RUNTIME_DIR", str(RUNTIME_DIR))
+    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS") and (RUNTIME_DIR / "bus").exists():
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={RUNTIME_DIR / 'bus'}"
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        try:
+            result = run(["systemctl", "--user", "show-environment"], timeout=1.0)
+            allowed = {"DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP"}
+            for line in result.stdout.splitlines():
+                key, separator, value = line.partition("=")
+                if separator and key in allowed:
+                    os.environ.setdefault(key, value)
+        except Exception:
+            pass
 
-    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
-        bus_path = RUNTIME_DIR / "bus"
-        if bus_path.exists():
-            os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
-
-    if not os.environ.get("WAYLAND_DISPLAY"):
-        for candidate in sorted(RUNTIME_DIR.glob("wayland-*")):
-            if candidate.name.endswith(".lock"):
-                continue
-            if candidate.is_socket():
-                os.environ["WAYLAND_DISPLAY"] = candidate.name
-                os.environ.setdefault("XDG_SESSION_TYPE", "wayland")
-                log(f"Detected Wayland display for user service: {candidate.name}")
-                break
-
-    if not os.environ.get("DISPLAY"):
-        for display_num in range(0, 4):
-            if Path(f"/tmp/.X11-unix/X{display_num}").exists():
-                os.environ["DISPLAY"] = f":{display_num}"
-                os.environ.setdefault("XDG_SESSION_TYPE", "x11")
-                log(f"Detected X11 display for user service: :{display_num}")
-                break
 
 _SENTENCE_BOUNDARY_STARTERS = (
     "This", "That", "It", "There", "These", "Those",
@@ -1438,6 +1870,421 @@ def apply_contextual_leading_space(text: str) -> str:
     return text
 
 
+def desktop_session_type() -> str:
+    session = os.environ.get("XDG_SESSION_TYPE", "").lower()
+    if session in {"wayland", "x11"}:
+        return session
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return "wayland"
+    return "x11" if os.environ.get("DISPLAY") else "unknown"
+
+
+_CONTEXT_PROBE_LOCK = threading.Lock()
+
+
+def bounded_prefix_space(text: str) -> bool:
+    if not _CONTEXT_PROBE_LOCK.acquire(blocking=False):
+        return False
+    reply = queue.Queue(maxsize=1)
+    def probe():
+        try:
+            reply.put(should_prefix_space_before_paste(text))
+        except Exception:
+            reply.put(False)
+        finally:
+            _CONTEXT_PROBE_LOCK.release()
+    threading.Thread(target=probe, name="VerbatimTextContext", daemon=True).start()
+    try:
+        return reply.get(timeout=0.18)
+    except queue.Empty:
+        return False
+
+
+class DesktopTarget:
+    def __init__(self) -> None:
+        self.window = ""
+        self.terminal = False
+        self.clipboard_backend = ""
+
+    def capture(self) -> None:
+        self.window = ""
+        self.terminal = False
+        if desktop_session_type() != "x11" or not command_exists("xdotool"):
+            return
+        try:
+            result = run(["xdotool", "getactivewindow"], timeout=0.35)
+            if result.returncode == 0 and result.stdout.strip().isdigit():
+                self.window = result.stdout.strip()
+                # Stable Mint/Ubuntu releases can ship an xdotool version
+                # predating getwindowclassname. WM_CLASS is available on X11.
+                if command_exists("xprop"):
+                    klass = run(["xprop", "-id", self.window, "WM_CLASS"], timeout=0.35)
+                else:
+                    klass = run(["xdotool", "getwindowclassname", self.window], timeout=0.35)
+                self.terminal = any(s in klass.stdout.lower() for s in
+                    ("terminal", "konsole", "alacritty", "kitty", "xterm", "tilix", "wezterm"))
+        except Exception:
+            pass
+
+    def ready(self) -> bool:
+        if not self.window or desktop_session_type() != "x11":
+            return True
+        try:
+            active = run(["xdotool", "getactivewindow"], timeout=0.4)
+            if active.stdout.strip() == self.window:
+                return True
+            title = run(["xdotool", "getwindowname", active.stdout.strip()], timeout=0.4)
+            # Restore only a focus change caused by our overlay, never a user switch.
+            if title.stdout.strip() in {APP_NAME, "Verbatim"}:
+                return run(["xdotool", "windowactivate", "--sync", self.window], timeout=0.6).returncode == 0
+            return False
+        except Exception:
+            return False
+
+
+DESKTOP_TARGET = DesktopTarget()
+
+
+def clipboard_backends() -> list[str]:
+    x11 = [name for name in ("xclip", "xsel") if os.environ.get("DISPLAY") and command_exists(name)]
+    wayland = ["wayland"] if os.environ.get("WAYLAND_DISPLAY") and command_exists("wl-copy") and command_exists("wl-paste") else []
+    return (x11 + wayland) if desktop_session_type() == "x11" else (wayland + x11)
+
+
+def clipboard_read(backend: str, timeout: float = 0.6) -> tuple[bool, str | None]:
+    commands = {"wayland": ["wl-paste", "--no-newline", "--type", "text"],
+                "xclip": ["xclip", "-selection", "clipboard", "-out"],
+                "xsel": ["xsel", "--clipboard", "--output"]}
+    try:
+        result = run(commands[backend], timeout=timeout)
+        return (True, result.stdout) if result.returncode == 0 else (False, None)
+    except Exception:
+        return False, None
+
+
+def clipboard_publish(backend: str, value: str) -> tuple[bool, subprocess.Popen | None, str]:
+    commands = {"wayland": ["wl-copy", "--foreground", "--type", "text/plain;charset=utf-8"],
+                "xclip": ["xclip", "-selection", "clipboard", "-in", "-quiet"],
+                "xsel": ["xsel", "--clipboard", "--input", "--nodetach"]}
+    process = None
+    confirmed = False
+    try:
+        process = subprocess.Popen(commands[backend], stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True,
+            start_new_session=True)
+        process.stdin.write(value)
+        process.stdin.close()
+        deadline = time.monotonic() + 0.75
+        while time.monotonic() < deadline:
+            if process.poll() is not None and process.returncode != 0:
+                return False, None, f"{backend} clipboard owner exited with status {process.returncode}"
+            ok, actual = clipboard_read(backend, timeout=0.15)
+            if ok and actual == value:
+                confirmed = True
+                return True, process if process.poll() is None else None, "clipboard verified"
+            time.sleep(0.025)
+        return False, None, f"{backend} clipboard readback did not match"
+    except Exception as exc:
+        return False, None, str(exc)
+    finally:
+        if process is not None:
+            if not confirmed and process.poll() is None:
+                with contextlib.suppress(Exception):
+                    process.terminate()
+                    process.wait(timeout=0.3)
+                if process.poll() is None:
+                    process.kill()
+            with contextlib.suppress(Exception):
+                process.stderr.close()
+
+
+def configure_native_overlay(window) -> None:
+    """Set X11 nonfocus hints before mapping, and request KDE's real blur."""
+    surface = window.get_surface()
+    if surface is not None and hasattr(surface, "set_focusable"):
+        with contextlib.suppress(Exception):
+            surface.set_focusable(False)
+    if desktop_session_type() != "x11":
+        return
+    try:
+        from gi.repository import GdkX11
+        surface = window.get_surface()
+        xid = GdkX11.X11Surface.get_xid(surface)
+        lib = ctypes.CDLL(ctypes.util.find_library("X11"))
+        lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        lib.XOpenDisplay.restype = ctypes.c_void_p
+        lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        lib.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        lib.XInternAtom.restype = ctypes.c_ulong
+        lib.XChangeProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+            ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        lib.XFlush.argtypes = [ctypes.c_void_p]
+        display = lib.XOpenDisplay(os.environ.get("DISPLAY", "").encode())
+        if not display:
+            return
+        try:
+            atom = lambda name: lib.XInternAtom(display, name.encode(), 0)
+            def property_values(name: str, type_name: str, values: list[int]) -> None:
+                array = (ctypes.c_ulong * max(1, len(values)))(*values)
+                lib.XChangeProperty(display, xid, atom(name), atom(type_name), 32, 0, array, len(values))
+            # ICCCM WM_HINTS: InputHint, input=false, initial state=normal.
+            property_values("WM_HINTS", "WM_HINTS", [1, 0, 1, 0, 0, 0, 0, 0, 0])
+            property_values("_NET_WM_WINDOW_TYPE", "ATOM", [atom("_NET_WM_WINDOW_TYPE_UTILITY")])
+            property_values("_NET_WM_STATE", "ATOM", [atom("_NET_WM_STATE_SKIP_TASKBAR"), atom("_NET_WM_STATE_SKIP_PAGER")])
+            if active_theme().startswith("glass-"):
+                property_values("_KDE_NET_WM_BLUR_BEHIND_REGION", "CARDINAL", [])
+            else:
+                lib.XDeleteProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong]
+                lib.XDeleteProperty(display, xid, atom("_KDE_NET_WM_BLUR_BEHIND_REGION"))
+            lib.XFlush(display)
+        finally:
+            lib.XCloseDisplay(display)
+    except Exception as exc:
+        log(f"Optional X11 overlay hints unavailable: {exc!r}")
+
+
+def position_native_overlay(window, x: int, y: int) -> None:
+    if desktop_session_type() != "x11" or not window.get_realized():
+        return
+    try:
+        from gi.repository import GdkX11
+        xid = GdkX11.X11Surface.get_xid(window.get_surface())
+        if command_exists("xdotool"):
+            run(["xdotool", "windowmove", str(xid), str(x), str(y)], timeout=0.25)
+    except Exception:
+        pass
+
+
+class GlassBackdrop:
+    """Native compositor blur first; real Gaussian-blurred pixels as fallback.
+
+    Fallback snapshots are frozen while the overlay is visible, preventing
+    recursive self-capture and avoiding continuous screen-recording overhead.
+    """
+    def __init__(self) -> None:
+        self.native = False
+        self.bridge = None
+        self.surface = None
+        self.pixels = None
+        self.bus = None
+        self.pipeline = None
+        self.session = None
+        self.remote_fd = None
+        self.portal_attempted = False
+        self.permission_pending = False
+        self.permission_finished = threading.Event()
+        self.permission_finished.set()
+        self.busy = False
+        self.status = "not initialized"
+        self.origin = (0, 0)
+        self.logical_size = None
+        self.lock = threading.RLock()
+        atexit.register(self.close)
+
+    def close(self) -> None:
+        try:
+            if self.pipeline is not None:
+                from gi.repository import Gst
+                self.pipeline.set_state(Gst.State.NULL)
+                self.pipeline = None
+            if self.session and self.bus:
+                from gi.repository import Gio
+                self.bus.call_sync("org.freedesktop.portal.Desktop", self.session,
+                    "org.freedesktop.portal.Session", "Close", None, None,
+                    Gio.DBusCallFlags.NONE, 500, None)
+                self.session = None
+        except Exception:
+            pass
+        if self.remote_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self.remote_fd)
+            self.remote_fd = None
+
+    def configure(self, window, width: int, height: int) -> bool:
+        enabled = active_theme().startswith("glass-")
+        if desktop_session_type() == "wayland":
+            try:
+                if self.bridge is None:
+                    path = APP_DIR / "native/libverbatim-blur.so"
+                    if not path.exists():
+                        path = Path(__file__).resolve().parents[1] / "native/libverbatim-blur.so"
+                    self.bridge = ctypes.CDLL(str(path))
+                    self.bridge.verbatim_blur.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+                    self.bridge.verbatim_blur.restype = ctypes.c_int
+                self.native = bool(self.bridge.verbatim_blur(hash(window), width, height, int(enabled))) and enabled
+            except (OSError, AttributeError):
+                self.native = False
+        else:
+            configure_native_overlay(window)
+            self.native = False
+            if enabled and command_exists("xprop"):
+                try:
+                    advertised = run(["xprop", "-root", "_NET_SUPPORTED"], timeout=0.25)
+                    self.native = "_KDE_NET_WM_BLUR_BEHIND_REGION" in advertised.stdout
+                except Exception:
+                    pass
+        if self.native:
+            self.status = "native compositor blur"
+        if not enabled:
+            self.close()
+            self.surface = self.pixels = None
+        return self.native
+
+    def _portal_request(self, method: str, signature: str, arguments: tuple) -> dict:
+        from gi.repository import Gio, GLib
+        token = "verbatim_" + uuid.uuid4().hex
+        options = dict(arguments[-1])
+        options["handle_token"] = GLib.Variant("s", token)
+        expected = "/org/freedesktop/portal/desktop/request/" + self.bus.get_unique_name()[1:].replace(".", "_") + "/" + token
+        response = queue.Queue(maxsize=1)
+        def replied(connection, sender, path, interface, signal_name, parameters):
+            if path == expected:
+                with contextlib.suppress(queue.Full):
+                    response.put_nowait(parameters.unpack())
+        subscription = self.bus.signal_subscribe("org.freedesktop.portal.Desktop",
+            "org.freedesktop.portal.Request", "Response", expected, None,
+            Gio.DBusSignalFlags.NONE, replied)
+        try:
+            self.bus.call_sync("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.ScreenCast", method,
+                GLib.Variant(signature, arguments[:-1] + (options,)), None,
+                Gio.DBusCallFlags.NONE, 3000, None)
+            # Permission dialogs are handled by the user's desktop, only when needed.
+            code, results = response.get(timeout=60.0)
+            if code:
+                raise PermissionError("Screen permission was not granted")
+            return results
+        except Exception:
+            # A timed-out dialog must close before any dictation paste proceeds.
+            with contextlib.suppress(Exception):
+                self.bus.call_sync("org.freedesktop.portal.Desktop", expected,
+                    "org.freedesktop.portal.Request", "Close", None, None,
+                    Gio.DBusCallFlags.NONE, 500, None)
+            raise
+        finally:
+            self.bus.signal_unsubscribe(subscription)
+
+    def _ensure_portal(self) -> None:
+        if self.pipeline is not None:
+            return
+        self.permission_pending = True
+        self.permission_finished.clear()
+        try:
+            self._open_portal()
+        finally:
+            self.permission_pending = False
+            self.permission_finished.set()
+
+    def _open_portal(self) -> None:
+        if self.pipeline is not None:
+            return
+        if self.portal_attempted:
+            raise RuntimeError("Screen permission unavailable; reselect a glass theme to retry")
+        self.portal_attempted = True
+        import gi
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gio, GLib, Gst
+        Gst.init(None)
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        created = self._portal_request("CreateSession", "(a{sv})", ({
+            "session_handle_token": GLib.Variant("s", "verbatim_" + uuid.uuid4().hex)},))
+        self.session = created["session_handle"]
+        options = {"types": GLib.Variant("u", 1), "multiple": GLib.Variant("b", False),
+                   "cursor_mode": GLib.Variant("u", 1)}
+        try:
+            version = self.bus.call_sync("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+                "org.freedesktop.DBus.Properties", "Get",
+                GLib.Variant("(ss)", ("org.freedesktop.portal.ScreenCast", "version")),
+                None, Gio.DBusCallFlags.NONE, 1000, None).unpack()[0]
+            if int(version) >= 4:
+                options["persist_mode"] = GLib.Variant("u", 2)
+                restore = os.environ.get("KDICTATE_GLASS_RESTORE_TOKEN", "")
+                if restore:
+                    options["restore_token"] = GLib.Variant("s", restore)
+        except Exception:
+            pass
+        self.status = "waiting for desktop screen permission"
+        self._portal_request("SelectSources", "(oa{sv})", (self.session, options))
+        started = self._portal_request("Start", "(osa{sv})", (self.session, "", {}))
+        streams = started.get("streams", [])
+        if not streams:
+            raise RuntimeError("The desktop returned no screen source")
+        node, properties = streams[0]
+        self.origin = tuple(properties.get("position", (0, 0)))
+        self.logical_size = properties.get("logical_size") or properties.get("size")
+        token = started.get("restore_token")
+        if token:
+            save_runtime_config({"KDICTATE_GLASS_RESTORE_TOKEN": str(token)})
+        reply, descriptors = self.bus.call_with_unix_fd_list_sync("org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop", "org.freedesktop.portal.ScreenCast", "OpenPipeWireRemote",
+            GLib.Variant("(oa{sv})", (self.session, {})), GLib.VariantType.new("(h)"),
+            Gio.DBusCallFlags.NONE, 3000, None, None)
+        self.remote_fd = descriptors.get(reply.unpack()[0])
+        self.pipeline = Gst.parse_launch(f"pipewiresrc fd={self.remote_fd} path={int(node)} do-timestamp=true "
+            "! videoconvert ! video/x-raw,format=RGB ! appsink name=backdrop emit-signals=false max-buffers=1 drop=true sync=false")
+        self.status = "local PipeWire backdrop capture"
+
+    def _portal_image(self):
+        from PIL import Image
+        from gi.repository import Gst
+        self._ensure_portal()
+        self.pipeline.set_state(Gst.State.PLAYING)
+        try:
+            sink = self.pipeline.get_by_name("backdrop")
+            # Drop a queued older frame; the overlay has been hidden before this call.
+            sink.emit("try-pull-sample", 0)
+            sample = sink.emit("try-pull-sample", int(1.5 * Gst.SECOND))
+            if sample is None:
+                raise RuntimeError("No screen frame was delivered")
+            structure = sample.get_caps().get_structure(0)
+            width, height = structure.get_value("width"), structure.get_value("height")
+            buffer = sample.get_buffer()
+            ok, mapping = buffer.map(Gst.MapFlags.READ)
+            if not ok:
+                raise RuntimeError("Cannot read the screen frame")
+            try:
+                stride = len(mapping.data) // height
+                return Image.frombytes("RGB", (width, height), bytes(mapping.data), "raw", "RGB", stride, 1)
+            finally:
+                buffer.unmap(mapping)
+        finally:
+            # Keep authorization/session, suspend frame processing until next opening.
+            self.pipeline.set_state(Gst.State.PAUSED)
+
+    def capture(self, x: int, y: int, width: int, height: int, scale: float = 1.0) -> bool:
+        try:
+            from PIL import ImageGrab, ImageFilter
+            import cairo
+            if desktop_session_type() == "x11":
+                image = ImageGrab.grab(xdisplay=os.environ.get("DISPLAY"))
+                self.status = "local X11 Gaussian backdrop blur"
+            else:
+                self._ensure_portal()
+                image = self._portal_image()
+                if self.logical_size:
+                    scale = image.width / max(1, self.logical_size[0])
+            ox, oy = self.origin
+            left, top = int((x - ox) * scale), int((y - oy) * scale)
+            if left < 0 or top < 0 or left + int(width * scale) > image.width:
+                raise RuntimeError("Choose the monitor containing the dictation card for glass capture")
+            # Blur a small padded crop, rather than an entire high-resolution desktop.
+            padding = 40
+            physical_padding = int(padding * scale)
+            crop = image.crop((left - physical_padding, top - physical_padding,
+                left + int(width * scale) + physical_padding, top + int(height * scale) + physical_padding))
+            crop = crop.resize((width + padding * 2, height + padding * 2))
+            crop = crop.filter(ImageFilter.GaussianBlur(radius=22)).crop((padding, padding, width + padding, height + padding))
+            pixels = bytearray(crop.convert("RGBA").tobytes("raw", "BGRA"))
+            surface = cairo.ImageSurface.create_for_data(pixels, cairo.FORMAT_ARGB32, width, height, width * 4)
+            with self.lock:
+                self.pixels, self.surface = pixels, surface
+            return True
+        except Exception as exc:
+            self.status = str(exc)
+            log(f"Glass backdrop: {exc}")
+            return False
+
+
 class InputInjector:
     """Persistent virtual keyboard used to send editing shortcuts on Wayland."""
 
@@ -1499,52 +2346,66 @@ class InputInjector:
 
     def _emit_raw_key_events(self, events: list[tuple[int, int]], *, delay: float = 0.022) -> bool:
         if self.ensure() and self._ui is not None:
-            try:
-                from evdev import ecodes
-
-                ready_delay = self._ready_at - time.time()
-                if ready_delay > 0:
-                    time.sleep(ready_delay)
-
-                with self._lock:
-                    ui = self._ui
+            from evdev import ecodes
+            pressed = set()
+            ready_delay = self._ready_at - time.time()
+            if ready_delay > 0:
+                time.sleep(ready_delay)
+            with self._lock:
+                try:
                     for code, value in events:
-                        ui.write(ecodes.EV_KEY, code, value)
-                        ui.syn()
+                        self._ui.write(ecodes.EV_KEY, code, value)
+                        if value:
+                            pressed.add(code)
+                        else:
+                            pressed.discard(code)
+                        self._ui.syn()
                         time.sleep(delay)
-
-                return True
-            except Exception as exc:
-                log(f"uinput key event injection failed: {exc!r}")
-
+                    return True
+                except Exception as exc:
+                    log(f"uinput injection interrupted: {exc!r}")
+                    # An injected prefix is ambiguous: retry could duplicate paste.
+                    return False
+                finally:
+                    for code in pressed:
+                        with contextlib.suppress(Exception):
+                            self._ui.write(ecodes.EV_KEY, code, 0)
+                    with contextlib.suppress(Exception):
+                        self._ui.syn()
         if command_exists("ydotool"):
             try:
-                proc = subprocess.run(
-                    ["ydotool", "key", *[f"{code}:{value}" for code, value in events]],
-                    env=self._ydotool_env(),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=2.0,
-                    check=False,
-                )
-                if proc.returncode == 0:
-                    return True
-                log(f"ydotool key event injection failed: {proc.stderr.strip()}")
+                result = subprocess.run(["ydotool", "key", *[f"{code}:{value}" for code, value in events]],
+                    env=self._ydotool_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, timeout=2.0, check=False)
+                return result.returncode == 0
             except Exception as exc:
-                log(f"ydotool key event injection exception: {exc!r}")
-
+                log(f"ydotool injection unavailable: {exc!r}")
         return False
 
-    def paste_shortcut(self) -> bool:
-        return self._emit_raw_key_events([
+    def paste_shortcut(self, *, terminal: bool = False) -> bool:
+        if desktop_session_type() == "x11" and command_exists("xdotool"):
+            try:
+                shortcut = "ctrl+shift+v" if terminal else "ctrl+v"
+                result = run(["xdotool", "key", "--clearmodifiers", shortcut], timeout=0.8)
+                # Once XTEST has been sent, do not inject a second paste on uncertainty.
+                return result.returncode == 0
+            except Exception:
+                return False
+        events = [
             (self.KEY_LEFTCTRL, 1),
             (self.KEY_V, 1),
             (self.KEY_V, 0),
             (self.KEY_LEFTCTRL, 0),
-        ], delay=0.030)
+        ]
+        if terminal:
+            events.insert(1, (self.KEY_LEFTSHIFT, 1))
+            events.insert(-1, (self.KEY_LEFTSHIFT, 0))
+        return self._emit_raw_key_events(events, delay=0.030)
 
     def copy_shortcut(self) -> bool:
+        if desktop_session_type() == "x11" and command_exists("xdotool"):
+            with contextlib.suppress(Exception):
+                return run(["xdotool", "key", "--clearmodifiers", "ctrl+c"], timeout=0.8).returncode == 0
         return self._emit_raw_key_events([
             (self.KEY_LEFTCTRL, 1),
             (self.KEY_C, 1),
@@ -1574,46 +2435,26 @@ class ClipboardPaster:
     def __init__(self, injector: InputInjector, pause_monitor: Callable[[float], None]) -> None:
         self.injector = injector
         self.pause_monitor = pause_monitor
+        self.delivery_lock = threading.RLock()
+        self.serial = 0
+        self.backend = ""
 
     def _read_clipboard_text(self, timeout: float = 0.8) -> tuple[bool, str | None]:
-        if not command_exists("wl-paste"):
-            return False, None
-
-        try:
-            proc = run(["wl-paste", "--no-newline"], timeout=timeout)
-            if proc.returncode == 0:
-                return True, proc.stdout
-        except Exception:
-            pass
-
+        backend = getattr(self, "backend", "")
+        candidates = [backend] if backend else clipboard_backends()
+        for candidate in candidates:
+            ok, value = clipboard_read(candidate, timeout)
+            if ok:
+                return True, value
         return False, None
 
     def _set_clipboard_text(self, value: str, label: str) -> tuple[bool, str, subprocess.Popen | None]:
-        try:
-            proc = subprocess.Popen(
-                ["wl-copy", "--type", "text/plain;charset=utf-8"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            assert proc.stdin is not None
-            proc.stdin.write(value)
-            proc.stdin.close()
-
-            try:
-                rc = proc.wait(timeout=0.7)
-                if rc != 0:
-                    err = proc.stderr.read().strip() if proc.stderr else ""
-                    return False, f"wl-copy {label} failed: {err}", None
-                return True, "clipboard set", None
-            except subprocess.TimeoutExpired:
-                # On Wayland, wl-copy often remains alive as the clipboard owner.
-                # That is success. The owner must stay alive until the paste happens.
-                log(f"wl-copy {label} is still running as clipboard owner; treating as success")
-                return True, "clipboard owner active", proc
-        except Exception as exc:
-            return False, f"wl-copy {label} failed: {exc}", None
+        for backend in ([self.backend] if getattr(self, "backend", "") else clipboard_backends()):
+            ok, owner, message = clipboard_publish(backend, value)
+            if ok:
+                self.backend = backend
+                return True, message, owner
+        return False, "No working clipboard backend for this desktop session", None
 
     def _target_has_active_selection(self) -> bool:
         sentinel = f"__KDICTATE_SELECTION_PROBE_{os.getpid()}_{time.time_ns()}__"
@@ -1695,92 +2536,48 @@ class ClipboardPaster:
         return self._probe_previous_character_for_spacing()
 
     def paste_text(self, text: str) -> tuple[bool, str]:
-        if FAST_PASTE:
+        # Serialized publication/injection prevents two sessions interleaving.
+        if not hasattr(self, "delivery_lock"):
+            self.delivery_lock = threading.RLock()
+            self.serial = 0
+        with self.delivery_lock:
             return self.paste_text_fast(text)
-    
-        if not command_exists("wl-copy"):
-            return False, "wl-copy is not installed. The installer should have installed wl-clipboard."
-    
-        old_ok, old_clip = self._read_clipboard_text(timeout=0.8)
-    
-        if self._should_prefix_space(text):
-            text = " " + text
-    
-        ok, msg, owner_proc = self._set_clipboard_text(text, "dictation")
-        if not ok:
-            if old_ok and old_clip is not None:
-                with contextlib.suppress(Exception):
-                    self._set_clipboard_text(old_clip, "restore after failed dictation")
-            return False, msg
-    
-        self.pause_monitor(1.5)
-        time.sleep(0.18)
-    
-        if not self.injector.paste_shortcut():
-            if old_ok and old_clip is not None:
-                with contextlib.suppress(Exception):
-                    self._set_clipboard_text(old_clip, "restore after failed paste")
-            return False, "Could not inject Ctrl+V through /dev/uinput or ydotool. Run kdictate doctor."
-    
-        if old_ok and old_clip is not None:
-            def restore() -> None:
-                time.sleep(1.4)
-                with contextlib.suppress(Exception):
-                    self._set_clipboard_text(old_clip, "restore")
-    
-            threading.Thread(target=restore, daemon=True).start()
-    
-        return True, "pasted"
 
     def paste_text_fast(self, text: str) -> tuple[bool, str]:
-        """Low-latency paste path for dictation.
-    
-        The careful paste path probes the target field to decide whether to add a
-        leading space. That is safer, but it can add noticeable delay after the UI
-        already says "Typing". This fast path prioritizes immediate paste.
-        """
-        if not command_exists("wl-copy"):
-            return False, "wl-copy is not installed. The installer should have installed wl-clipboard."
-    
-        old_ok = False
-        old_clip: str | None = None
-    
-        if FAST_PASTE_RESTORE_CLIPBOARD:
-            old_ok, old_clip = self._read_clipboard_text(timeout=FAST_PASTE_OLD_CLIPBOARD_TIMEOUT)
-    
-        if (
-            text
-            and not text[:1].isspace()
-            and text[:1] not in ".,!?;:%)]}"
-            and (
-                should_prefix_space_before_paste(text)
-                or (FAST_PASTE_CONTEXT_PROBE and self._probe_previous_character_for_spacing())
-            )
-        ):
+        if not clipboard_backends():
+            return False, "No usable clipboard. Install xclip for X11 or wl-clipboard for Wayland."
+        if not DESKTOP_TARGET.ready():
+            return False, "The focused window changed. Your transcript is available with kdictate last-transcript."
+        self.backend = ""
+        self.serial += 1
+        serial = self.serial
+        previous = {backend: clipboard_read(backend, 0.25) for backend in clipboard_backends()}
+        if text and not text[:1].isspace() and text[:1] not in ".,!?;:%)]}" and bounded_prefix_space(text):
             text = " " + text
-    
-        ok, msg, owner_proc = self._set_clipboard_text(text, "fast dictation")
+        ok, message, owner = self._set_clipboard_text(text, "dictation")
         if not ok:
-            return False, msg
-    
-        self.pause_monitor(1.5)
-        time.sleep(max(0.0, FAST_PASTE_PRE_PASTE_DELAY))
-    
-        if not self.injector.paste_shortcut():
-            if old_ok and old_clip is not None:
-                with contextlib.suppress(Exception):
-                    self._set_clipboard_text(old_clip, "restore after failed fast paste")
-            return False, "Could not inject Ctrl+V through /dev/uinput or ydotool. Run kdictate doctor."
-    
-        if old_ok and old_clip is not None:
+            return False, message
+        old_ok, old_clip = previous.get(self.backend, (False, None))
+        self.pause_monitor(2.0)
+        time.sleep(max(0.03, FAST_PASTE_PRE_PASTE_DELAY))
+        if not DESKTOP_TARGET.ready():
+            return False, "Focus changed before paste. Text is on the clipboard and in kdictate last-transcript."
+        if not self.injector.paste_shortcut(terminal=DESKTOP_TARGET.terminal):
+            # After ambiguous injection, keep the transcript; never retry blindly.
+            return False, "Paste could not be confirmed. Text is on the clipboard and in kdictate last-transcript."
+        if old_ok and old_clip is not None and FAST_PASTE_RESTORE_CLIPBOARD:
+            backend = self.backend
             def restore() -> None:
-                time.sleep(max(0.15, FAST_PASTE_RESTORE_DELAY))
-                with contextlib.suppress(Exception):
-                    self._set_clipboard_text(old_clip, "fast restore")
-    
-            threading.Thread(target=restore, daemon=True).start()
-    
-        return True, "fast pasted"
+                time.sleep(max(0.5, FAST_PASTE_RESTORE_DELAY))
+                with self.delivery_lock:
+                    if self.serial != serial or (owner is not None and owner.poll() is not None):
+                        return
+                    ok, actual = clipboard_read(backend, 0.25)
+                    if ok and actual == text:
+                        clipboard_publish(backend, old_clip)
+            threading.Thread(target=restore, name="VerbatimClipboardRestore", daemon=True).start()
+        return True, "paste shortcut delivered"
+
 
 class KeyboardMonitor:
     """Cancels dictation when the real user starts typing.
@@ -1908,6 +2705,8 @@ class ModelManager:
 
     @classmethod
     def clear(cls) -> None:
+        if not os.environ.get("KDICTATE_INFERENCE_FD"):
+            threading.Thread(target=INFERENCE.close, daemon=True).start()
         with cls._lock:
             cls._model = None
             cls._model_name = None
@@ -1949,13 +2748,12 @@ class ModelManager:
 
     @classmethod
     def is_loaded(cls) -> bool:
+        if not os.environ.get("KDICTATE_INFERENCE_FD"):
+            return INFERENCE.loaded
         return cls._model is not None and cls._model_name == MODEL_NAME
 
     @classmethod
     def warm_async(cls, *, reason: str = "warmup", delay: float = 0.0) -> None:
-        if BACKEND == "whisper.cpp":
-            return
-
         if cls.is_loaded() or cls._loading:
             return
 
@@ -1968,10 +2766,13 @@ class ModelManager:
 
             try:
                 log(f"Starting async model warmup reason={reason!r}")
-                cls.load()
+                cls._loading = True
+                INFERENCE.request(None)
                 log(f"Async model warmup complete reason={reason!r}")
             except Exception as exc:
                 log(f"Async model warmup failed reason={reason!r}: {exc!r}")
+            finally:
+                cls._loading = False
 
         threading.Thread(
             target=worker,
@@ -2072,403 +2873,460 @@ class AudioState:
     recent_avg_rms: list[tuple[float, float]] = dataclasses.field(default_factory=list)
 
 
+class InferenceService:
+    """A warm, killable worker. Native inference never runs on the GTK thread."""
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.process = None
+        self.responses = queue.Queue()
+        self.loaded = False
+        self.active_kind = ""
+
+    def close(self) -> None:
+        with self.lock:
+            process, self.process = self.process, None
+            self.loaded = False
+            if process is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=1.0)
+                for stream in (process.stdin, process.stdout):
+                    with contextlib.suppress(Exception):
+                        stream.close()
+
+    def _start(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            return
+        self.loaded = False
+        responses = queue.Queue()
+        self.responses = responses
+        # A socket isolates structured replies from libraries writing to stdout.
+        parent, child = socket.socketpair()
+        child.set_inheritable(True)
+        env = os.environ.copy()
+        env["KDICTATE_INFERENCE_FD"] = str(child.fileno())
+        log_file = open(LOG_FILE, "a", encoding="utf-8")
+        try:
+            self.process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_inference-worker"],
+                stdin=subprocess.PIPE, stdout=log_file, stderr=log_file,
+                text=True, env=env, pass_fds=(child.fileno(),), start_new_session=True)
+        except Exception:
+            parent.close()
+            raise
+        finally:
+            child.close()
+            log_file.close()
+        def read() -> None:
+            try:
+                with parent, parent.makefile("r", encoding="utf-8") as stream:
+                    for line in stream:
+                        responses.put(json.loads(line))
+            except Exception:
+                pass
+            finally:
+                responses.put({"error": "Inference worker exited"})
+        threading.Thread(target=read, name="VerbatimInferenceReplies", daemon=True).start()
+
+    def request(self, path: str | None, realtime: bool = False, audio_seconds: float = 0.0) -> str:
+        # Preview work never waits behind a final job and can be discarded safely.
+        if realtime:
+            if not self.loaded or not self.lock.acquire(blocking=False):
+                return ""
+        elif not self.lock.acquire(timeout=1.0):
+            # A loading model gets its bounded warmup budget; a preview gets one
+            # second of grace, then final transcription takes priority.
+            grace = 0.0 if self.active_kind == "preview" else float(os.environ.get("KDICTATE_INFERENCE_TIMEOUT", "180"))
+            if not self.lock.acquire(timeout=grace):
+                process = self.process
+                if process is not None:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                if not self.lock.acquire(timeout=4.0):
+                    raise RuntimeError("Inference worker could not release the final job; audio retained")
+        self.active_kind = "preview" if realtime else ("warmup" if path is None else "final")
+        try:
+            attempts = 1 if realtime else 2
+            for attempt in range(attempts):
+                self._start()
+                identity = uuid.uuid4().hex
+                request = {"id": identity, "path": path, "realtime": realtime,
+                    "model": MODEL_NAME, "backend": BACKEND, "device": DEVICE,
+                    "compute_type": COMPUTE_TYPE, "language": LANGUAGE,
+                    "cpp_bin": WHISPER_CPP_BIN, "cpp_model": WHISPER_CPP_MODEL}
+                try:
+                    self.process.stdin.write(json.dumps(request) + "\n")
+                    self.process.stdin.flush()
+                    budget = float(os.environ.get("KDICTATE_INFERENCE_TIMEOUT", "180"))
+                    budget = min(30.0, max(5.0, audio_seconds * 2.0)) if realtime else max(15.0, budget, audio_seconds * (8.0 if DEVICE == "cpu" else 3.0))
+                    # Loading a local model is included, but downloads are never an
+                    # unbounded operation in the visible dictation lifecycle.
+                    deadline = time.monotonic() + budget
+                    while True:
+                        reply = self.responses.get(timeout=max(0.01, deadline - time.monotonic()))
+                        if reply.get("id") not in {None, identity}:
+                            continue
+                        if reply.get("event") == "cpu-fallback":
+                            deadline = max(deadline, time.monotonic() + max(180.0, audio_seconds * 8.0))
+                            continue
+                        if reply.get("error"):
+                            raise RuntimeError(reply["error"])
+                        self.loaded = True
+                        return str(reply.get("text", ""))
+                except (queue.Empty, OSError, RuntimeError) as exc:
+                    self.close()
+                    if attempt + 1 >= attempts:
+                        raise RuntimeError("Transcription could not finish; captured audio was retained for recovery") from exc
+                    log(f"Restarting inference worker after a failed final job: {exc}")
+            return ""
+        finally:
+            self.active_kind = ""
+            self.lock.release()
+
+
+INFERENCE = InferenceService()
+atexit.register(INFERENCE.close)
+
+
+def inference_worker_main() -> int:
+    global MODEL_NAME, BACKEND, DEVICE, COMPUTE_TYPE, LANGUAGE, WHISPER_CPP_BIN, WHISPER_CPP_MODEL
+    fd = int(os.environ["KDICTATE_INFERENCE_FD"])
+    force_cpu = False
+    with socket.socket(fileno=fd) as replies:
+        for line in sys.stdin:
+            identity = None
+            try:
+                request = json.loads(line)
+                identity = request["id"]
+                MODEL_NAME, BACKEND = request["model"], request["backend"]
+                DEVICE, COMPUTE_TYPE, LANGUAGE = request["device"], request["compute_type"], request["language"]
+                WHISPER_CPP_BIN, WHISPER_CPP_MODEL = request["cpp_bin"], request["cpp_model"]
+                if force_cpu and BACKEND == "faster-whisper":
+                    DEVICE, COMPUTE_TYPE = "cpu", "int8"
+                path = request.get("path")
+                for attempt in range(2):
+                    try:
+                        if BACKEND == "whisper.cpp":
+                            if not Path(WHISPER_CPP_BIN).is_file():
+                                raise RuntimeError("whisper.cpp executable is missing")
+                            text = transcribe_with_whisper_cpp(path) if path else ""
+                        else:
+                            model = ModelManager.load()
+                            if path:
+                                segments, _info = model.transcribe(path, language=LANGUAGE, task="transcribe",
+                                    beam_size=1 if request["realtime"] else 5, vad_filter=False,
+                                    condition_on_previous_text=False, temperature=0.0,
+                                    no_speech_threshold=0.35, compression_ratio_threshold=2.4)
+                                text = " ".join(segment.text.strip() for segment in segments).strip()
+                            else:
+                                text = ""
+                        break
+                    except Exception as exc:
+                        gpu_error = any(word in str(exc).lower() for word in ("cuda", "cudnn", "cublas", "out of memory", "unsupported compute type"))
+                        if attempt or DEVICE != "cuda" or not gpu_error:
+                            raise
+                        force_cpu = True
+                        DEVICE, COMPUTE_TYPE = "cpu", "int8"
+                        ModelManager.clear()
+                        replies.sendall((json.dumps({"id": identity, "event": "cpu-fallback"}) + "\n").encode())
+                        log("GPU runtime unavailable; retrying captured audio on CPU")
+                reply = {"id": identity, "text": text}
+            except Exception as exc:
+                reply = {"id": identity, "error": str(exc)}
+            replies.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+    return 0
+
+
 class DictationEngine:
     def __init__(self, ui) -> None:
         self.ui = ui
         self.state = AudioState(frames=[])
         self.stream = None
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.session_id = 0
         self.recording = False
         self.cancelled = False
+        self.finalizing = False
         self.realtime_busy = False
         self.realtime_last_start = 0.0
         self.realtime_last_audio_seconds = 0.0
         self.realtime_preview_audio_seconds = 0.0
         self.realtime_last_good_text = ""
         self.realtime_last_good_audio_seconds = 0.0
+        self.start_requested_at = 0.0
+        self.last_audio_at = 0.0
+
+    def _post(self, session: int, kind: str, *args) -> None:
+        if session == self.session_id and not self.cancelled:
+            self.ui.invoke_for_session(session, kind, *args)
 
     def start_async(self) -> None:
-        threading.Thread(
-            target=self.start,
-            daemon=True,
-            name="KDictateAudioStart",
-        ).start()
-  
-    def start(self) -> None:
-        if self.recording:
-            self.cancel("restarted")
-        self.state = AudioState(frames=[])
-        self.cancelled = False
-        self.recording = True
-        self.realtime_busy = False
-        self.realtime_last_start = 0.0
-        self.realtime_last_audio_seconds = 0.0
-        self.realtime_preview_audio_seconds = 0.0
-        self.realtime_last_good_text = ""
-        self.realtime_last_good_audio_seconds = 0.0
-        now = time.time()
-        self.state.started_at = now
-        self.state.last_speech_at = now
+        session = self._begin()
+        threading.Thread(target=self._open_audio, args=(session,), daemon=True,
+                         name="VerbatimAudioStart").start()
 
+    def start(self) -> None:
+        self._open_audio(self._begin())
+
+    def _begin(self) -> int:
+        self.cancel("new session")
+        with self.lock:
+            self.session_id += 1
+            self.state = AudioState(frames=[])
+            self.cancelled = False
+            self.recording = True
+            self.finalizing = False
+            self.realtime_busy = False
+            self.realtime_last_start = 0.0
+            self.realtime_last_audio_seconds = 0.0
+            self.realtime_preview_audio_seconds = 0.0
+            self.realtime_last_good_text = ""
+            self.realtime_last_good_audio_seconds = 0.0
+            self.start_requested_at = time.monotonic()
+            self.last_audio_at = 0.0
+            return self.session_id
+
+    @staticmethod
+    def _close_stream(stream) -> None:
+        if stream is not None:
+            with contextlib.suppress(Exception):
+                stream.abort()
+            with contextlib.suppress(Exception):
+                stream.close()
+
+    def _open_audio(self, session: int) -> None:
+        stream = None
         try:
             import numpy as np
             import sounddevice as sd
-
-            selected_mic = os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
-            device_arg, resolved_mic_label = resolve_microphone_device_for_keybind(selected_mic)
-
-            try:
-                if device_arg is None:
-                    dev = sd.query_devices(kind="input")
-                else:
-                    dev = sd.query_devices(device=device_arg, kind="input")
-
-                samplerate = int(dev.get("default_samplerate") or 48000)
-                mic_label = str(dev.get("name", resolved_mic_label))
-            except Exception:
-                samplerate = 48000
-                mic_label = resolved_mic_label or "default"
-
-            self.state.samplerate = samplerate
-
-            def callback(indata, frames, time_info, status):
-                if status:
-                    log(f"Audio status: {status}")
-
+            device, label = resolve_microphone_device_for_keybind(os.environ.get("KDICTATE_MIC_DEVICE", "").strip())
+            dev = sd.query_devices(device=device, kind="input") if device is not None else sd.query_devices(kind="input")
+            samplerate = int(dev.get("default_samplerate") or 48000)
+            with self.lock:
+                if session != self.session_id or not self.recording:
+                    return
+                state = self.state
+                state.samplerate = samplerate
+            def callback(indata, count, time_info, status):
+                if session != self.session_id or not self.recording:
+                    return
                 mono = indata[:, 0].astype(np.float32).copy()
-                rms = float(np.sqrt(np.mean(np.square(mono))) + 1e-9)
-
+                rms = float(np.sqrt(np.mean(mono * mono)))
+                now = time.monotonic()
                 with self.lock:
-                    self.state.frames.append(mono)
-                    self.state.latest_rms = rms
-
-                    # Smooth the mic level before VAD decisions.
-                    self.state.rms_window.append(rms)
-                    if len(self.state.rms_window) > AUDIO_RMS_AVERAGE_WINDOW:
-                        self.state.rms_window = self.state.rms_window[-AUDIO_RMS_AVERAGE_WINDOW:]
-
-                    avg_rms = float(np.mean(self.state.rms_window)) if self.state.rms_window else rms
-                    self.state.latest_avg_rms = avg_rms
-
-                    # Track the quietest averaged mic level heard after the keybind.
-                    if avg_rms > 1e-7:
-                        if self.state.lowest_avg_rms <= 0.0:
-                            self.state.lowest_avg_rms = avg_rms
-                        else:
-                            self.state.lowest_avg_rms = min(self.state.lowest_avg_rms, avg_rms)
-
-            self.stream = sd.InputStream(
-                samplerate=samplerate,
-                channels=1,
-                dtype="float32",
-                blocksize=0,
-                device=device_arg,
-                callback=callback,
-            )
-            self.stream.start()
-            log(
-                f"Recording started samplerate={samplerate} "
-                f"microphone={mic_label!r} realtime={realtime_transcription_enabled()}"
-            )
+                    if session != self.session_id or not self.recording:
+                        return
+                    if not state.started_at:
+                        state.started_at = now
+                        state.last_speech_at = now
+                    state.frames.append(mono)
+                    state.latest_rms = rms
+                    state.rms_window = (state.rms_window + [rms])[-AUDIO_RMS_AVERAGE_WINDOW:]
+                    state.latest_avg_rms = float(np.mean(state.rms_window))
+                    self.last_audio_at = now
+                if status:
+                    log(f"Audio callback status: {status}")
+            stream = sd.InputStream(samplerate=samplerate, channels=1, dtype="float32",
+                blocksize=0, device=device, callback=callback)
+            with self.lock:
+                if session != self.session_id or not self.recording:
+                    self._close_stream(stream)
+                    return
+                self.stream = stream
+            stream.start()
+            if session != self.session_id or not self.recording:
+                self._close_stream(stream)
+                return
+            log(f"Recording session={session} rate={samplerate} microphone={label!r}")
+            threading.Thread(target=self._speech_worker, args=(session, state), daemon=True,
+                             name="VerbatimSpeechDetector").start()
         except Exception as exc:
-            self.recording = False
-            self.ui.invoke_error(f"Microphone failed: {exc}")
-            log(f"Microphone failed: {exc!r}\n{traceback.format_exc()}")
+            self._close_stream(stream)
+            if session == self.session_id:
+                self.recording = False
+                self._post(session, "error", f"Microphone failed: {exc}")
 
     def cancel(self, reason: str) -> None:
-        self.cancelled = True
-        self.recording = False
-        with contextlib.suppress(Exception):
-            if self.stream:
-                self.stream.stop()
-                self.stream.close()
-        self.stream = None
-        log(f"Dictation cancelled: {reason}")
+        with self.lock:
+            self.cancelled = True
+            self.recording = False
+            self.finalizing = False
+            self.session_id += 1
+            stream, self.stream = self.stream, None
+        if stream is not None:
+            threading.Thread(target=self._close_stream, args=(stream,), daemon=True).start()
+
+    def _speech_worker(self, session: int, state: AudioState) -> None:
+        import numpy as np
+        try:
+            from faster_whisper.vad import get_speech_timestamps, VadOptions
+            options = VadOptions(threshold=0.45, min_speech_duration_ms=64,
+                min_silence_duration_ms=150, speech_pad_ms=0)
+        except Exception:
+            get_speech_timestamps = None
+        previous_samples = 0
+        floor = 0.001
+        while session == self.session_id and self.recording:
+            time.sleep(0.12)
+            with self.lock:
+                recent = []
+                total = sum(len(f) for f in state.frames)
+                remaining = int(state.samplerate * 1.5)
+                for frame in reversed(state.frames):
+                    recent.append(frame)
+                    remaining -= len(frame)
+                    if remaining <= 0:
+                        break
+                rms = state.latest_avg_rms
+            if total == previous_samples or not recent:
+                continue
+            previous_samples = total
+            audio = np.concatenate(list(reversed(recent)))
+            speech_end = None
+            if get_speech_timestamps is not None:
+                try:
+                    count = max(1, int(len(audio) * 16000 / state.samplerate))
+                    resampled = np.interp(np.arange(count) * state.samplerate / 16000,
+                        np.arange(len(audio)), audio).astype(np.float32)
+                    segments = get_speech_timestamps(resampled, options, sampling_rate=16000)
+                    if segments:
+                        speech_end = (total - len(audio)) / state.samplerate + segments[-1]["end"] / 16000
+                except Exception as exc:
+                    log(f"Local speech detector falling back to energy: {exc}")
+                    get_speech_timestamps = None
+            else:
+                # No startup calibration: early speech cannot poison the floor.
+                if rms >= max(0.0018, floor * 2.2):
+                    speech_end = total / state.samplerate
+                elif rms > 1e-7:
+                    floor += (rms - floor) * (0.04 if rms < floor else 0.01)
+            with self.lock:
+                if session != self.session_id or not self.recording:
+                    return
+                if speech_end is not None:
+                    state.speech_seen = True
+                    state.last_speech_at = max(state.last_speech_at, state.started_at + speech_end)
+                state.noise_floor = floor
 
     def tick(self) -> None:
         if not self.recording:
             return
-        now = time.time()
-        age = now - self.state.started_at
-        with self.lock:
-            rms = self.state.latest_rms
-            avg_rms = self.state.latest_avg_rms or rms
-            lowest_avg_rms = self.state.lowest_avg_rms
-
-        self.ui.set_level(avg_rms)
-
-        if age < 0.45:
-            if avg_rms > 1e-6:
-                self.state.noise.append(avg_rms)
+        now = time.monotonic()
+        state = self.state
+        self.ui.set_level(state.latest_avg_rms)
+        if not state.started_at:
+            if now - self.start_requested_at > 5.0:
+                session = self.session_id
+                with self.lock:
+                    self.recording = False
+                    stream, self.stream = self.stream, None
+                threading.Thread(target=self._close_stream, args=(stream,), daemon=True).start()
+                self._post(session, "error", "Microphone did not deliver audio. Check the selected input.")
             return
-
-        # Keep learning the audio floor until speech is actually detected.
-        if age < AUDIO_NOISE_CALIBRATION_SECONDS and not self.state.speech_seen:
-            if avg_rms > 1e-6:
-                self.state.noise.append(avg_rms)
-
-        self.state.recent_avg_rms.append((now, avg_rms))
-        cutoff = now - max(2.0, AUDIO_ADAPTIVE_NOISE_SECONDS)
-        self.state.recent_avg_rms = [
-            (sample_at, level)
-            for sample_at, level in self.state.recent_avg_rms
-            if sample_at >= cutoff and level > 1e-7
-        ]
-
-        try:
-            import numpy as np
-            learned_floor = float(np.percentile(self.state.noise, 70)) if self.state.noise else 0.003
-        except Exception:
-            learned_floor = 0.003
-
-        # lowest averaged volume heard by the mic after the keybind started.
-        observed_floor = float(lowest_avg_rms or 0.0)
-        previous_adaptive_floor = float(self.state.adaptive_noise_floor or 0.0)
-        provisional_floor = max(learned_floor, observed_floor, previous_adaptive_floor)
-        provisional_threshold = max(
-            AUDIO_MIN_SPEECH_THRESHOLD,
-            provisional_floor * AUDIO_SPEECH_THRESHOLD_MULTIPLIER,
-            observed_floor * AUDIO_LOWEST_FLOOR_HEADROOM,
-        )
-
-        try:
-            import numpy as np
-            learn_ceiling = max(
-                provisional_threshold * AUDIO_NOISE_LEARN_MAX_SPEECH_RATIO,
-                provisional_floor * AUDIO_SPEECH_THRESHOLD_MULTIPLIER,
-            )
-            floor_candidates = [
-                level
-                for _sample_at, level in self.state.recent_avg_rms
-                if level <= learn_ceiling
-            ]
-
-            if len(floor_candidates) >= 5:
-                adaptive_target = float(
-                    np.percentile(
-                        floor_candidates,
-                        max(1.0, min(50.0, AUDIO_ADAPTIVE_NOISE_PERCENTILE)),
-                    )
-                )
-            else:
-                adaptive_target = provisional_floor
-        except Exception:
-            adaptive_target = provisional_floor
-
-        last_adapt_at = float(self.state.last_noise_adapt_at or now)
-        adapt_dt = max(0.001, min(1.0, now - last_adapt_at))
-        self.state.last_noise_adapt_at = now
-
-        if previous_adaptive_floor <= 0.0:
-            adaptive_floor = adaptive_target
-        else:
-            adapt_seconds = (
-                AUDIO_ADAPTIVE_NOISE_RISE_SECONDS
-                if adaptive_target > previous_adaptive_floor
-                else AUDIO_ADAPTIVE_NOISE_FALL_SECONDS
-            )
-            adapt_alpha = min(1.0, adapt_dt / max(0.25, adapt_seconds))
-            adaptive_floor = previous_adaptive_floor + (
-                adaptive_target - previous_adaptive_floor
-            ) * adapt_alpha
-
-        self.state.adaptive_noise_floor = max(0.0, adaptive_floor)
-
-        noise_floor = max(learned_floor, observed_floor, self.state.adaptive_noise_floor)
-        self.state.noise_floor = noise_floor
-
-        threshold = max(
-            AUDIO_MIN_SPEECH_THRESHOLD,
-            noise_floor * AUDIO_SPEECH_THRESHOLD_MULTIPLIER,
-            observed_floor * AUDIO_LOWEST_FLOOR_HEADROOM,
-        )
-
-        if avg_rms > threshold:
-            self.state.speech_seen = True
-            self.state.last_speech_at = now
-
-            if realtime_transcription_enabled():
-                self.ui.set_status("listening", "Listening live", "Transcribing as you speak.")
-            else:
-                self.ui.set_status("listening", "Listening", "Keep talking, or pause to finish.")
-
+        age = now - state.started_at
+        if self.last_audio_at and now - self.last_audio_at > 3.0:
+            self.finish()  # preserve the usable part after a device interruption
+            return
+        if state.speech_seen:
+            self.ui.set_status("listening", "Listening live" if realtime_transcription_enabled() else "Listening",
+                "Transcribing as you speak." if realtime_transcription_enabled() else "Pause to finish.")
         if realtime_transcription_enabled():
             self._maybe_realtime_transcribe(now)
-
-        silence_to_finish = active_silence_to_finish_seconds()
-
-        if self.state.speech_seen and (now - self.state.last_speech_at) >= silence_to_finish and age >= 1.1:
+        if state.speech_seen and now - state.last_speech_at >= active_silence_to_finish_seconds() and age >= 0.7:
             self.finish()
-        elif age >= MAX_RECORD_SECONDS:
-            self.finish()
-        elif not self.state.speech_seen and age >= 21.0:
-            self.cancel("no speech detected")
-            self.ui.close_smoothly()
+        elif age >= MAX_RECORD_SECONDS or (not state.speech_seen and age >= 21.0):
+            self.finish()  # uncertainty is resolved by final transcription, not discard
 
     def finish(self) -> None:
-        if not self.recording:
-            return
-        self.recording = False
-        with contextlib.suppress(Exception):
-            if self.stream:
-                self.stream.stop()
-                self.stream.close()
-        self.stream = None
-
         with self.lock:
-            frames = list(self.state.frames)
-            samplerate = self.state.samplerate
-            last_speech_elapsed = max(0.0, self.state.last_speech_at - self.state.started_at)
-
-        if self.cancelled:
-            return
-        if not frames:
-            self.cancel("no audio frames")
-            self.ui.close_smoothly()
-            return
-
-        preview_text = ""
-        if realtime_transcription_enabled():
-            preview_text = str(getattr(self.ui, "realtime_preview", "") or "").strip()
-
-        if preview_text and not looks_like_realtime_loop(preview_text):
-            preview_audio_seconds = max(0.0, float(self.realtime_preview_audio_seconds or 0.0))
-            speech_tail_gap = max(0.0, last_speech_elapsed - preview_audio_seconds)
-
-            allowed_preview_lag = 0.90
-
-            if speech_tail_gap <= allowed_preview_lag:
-                quick_text = normalize_transcript_text(preview_text, final=True)
-                if quick_text:
-                    log(
-                        "Using current realtime preview for final paste "
-                        f"preview_audio={preview_audio_seconds:.2f}s "
-                        f"last_speech={last_speech_elapsed:.2f}s "
-                        f"allowed_lag={allowed_preview_lag:.2f}s"
-                    )
-                    self.ui.invoke_transcribed(quick_text)
-                    return
-
+            if not self.recording or self.finalizing:
+                return
+            self.recording = False
+            self.finalizing = True
+            session = self.session_id
+            stream, self.stream = self.stream, None
+            frames, samplerate = list(self.state.frames), self.state.samplerate
+        threading.Thread(target=self._close_stream, args=(stream,), daemon=True).start()
         self.ui.set_status("transcribing", "Transcribing", f"Whisper {MODEL_NAME} via {BACKEND}")
-        threading.Thread(target=self._transcribe_worker, args=(frames, samplerate), daemon=True).start()
+        threading.Thread(target=self._transcribe_worker, args=(frames, samplerate, session), daemon=True,
+                         name="VerbatimFinalTranscription").start()
 
-    def _transcribe_file(self, wav_path: str, *, realtime: bool = False) -> str:
-        if BACKEND == "whisper.cpp":
-            return transcribe_with_whisper_cpp(wav_path)
-
-        model = ModelManager.load()
-        segments, info = model.transcribe(
-            wav_path,
-            language=LANGUAGE,
-            task="transcribe",
-            beam_size=1 if realtime else 5,
-            vad_filter=False if realtime else True,
-            vad_parameters={"min_silence_duration_ms": 850 if realtime else 450},
-            condition_on_previous_text=False if realtime else True,
-            temperature=0.0,
-            no_speech_threshold=0.35,
-            compression_ratio_threshold=2.4,
-        )
-
-        return " ".join(seg.text.strip() for seg in segments).strip()
-
-    def _write_wav_and_transcribe(self, frames, samplerate: int, *, realtime: bool) -> str:
+    def _write_wav_and_transcribe(self, frames, samplerate: int, *, realtime: bool, session: int) -> str:
         import numpy as np
         import soundfile as sf
-
-        audio = np.concatenate(frames).astype(np.float32)
-        min_seconds = 0.85 if realtime else 0.30
-
-        if audio.size < samplerate * min_seconds:
+        if not frames:
             return ""
-
-        fd, wav_path = tempfile.mkstemp(prefix="kdictate-live-" if realtime else "kdictate-", suffix=".wav")
+        audio = np.concatenate(frames).astype(np.float32)
+        if audio.size < samplerate * (0.65 if realtime else 0.15):
+            return ""
+        if float(np.max(np.abs(audio))) < 0.0001:
+            return ""
+        directory = RUNTIME_DIR if realtime else APP_DIR / "recovery"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, path = tempfile.mkstemp(prefix=f"verbatim-{session}-", suffix=".wav", dir=directory)
         os.close(fd)
-
+        keep = False
         try:
-            sf.write(wav_path, audio, samplerate)
-            return self._transcribe_file(wav_path, realtime=realtime)
+            sf.write(path, audio, samplerate)
+            if session != self.session_id or self.cancelled:
+                return ""
+            return INFERENCE.request(path, realtime, len(audio) / samplerate)
+        except Exception:
+            keep = not realtime
+            if keep:
+                log(f"Captured audio retained at {path}")
+            raise
         finally:
-            with contextlib.suppress(Exception):
-                os.unlink(wav_path)
+            if not keep:
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
 
     def _maybe_realtime_transcribe(self, now: float) -> None:
-        if self.realtime_busy or self.cancelled:
+        if self.realtime_busy or self.cancelled or now - self.realtime_last_start < REALTIME_MIN_INTERVAL_SECONDS:
             return
-
-        if now - self.realtime_last_start < REALTIME_MIN_INTERVAL_SECONDS:
-            return
-
         with self.lock:
-            frames = list(self.state.frames)
-            samplerate = self.state.samplerate
-
-        if not frames or samplerate <= 0:
+            frames, samplerate = list(self.state.frames), self.state.samplerate
+        seconds = sum(len(f) for f in frames) / samplerate
+        if seconds < REALTIME_FIRST_CHUNK_SECONDS or seconds - self.realtime_last_audio_seconds < REALTIME_MIN_ADVANCE_SECONDS:
             return
-
-        audio_seconds = sum(len(frame) for frame in frames) / float(samplerate)
-
-        if (
-            audio_seconds < REALTIME_FIRST_CHUNK_SECONDS
-            or audio_seconds - self.realtime_last_audio_seconds < REALTIME_MIN_ADVANCE_SECONDS
-        ):
-            return
-
         self.realtime_busy = True
-        self.realtime_last_start = now
-        self.realtime_last_audio_seconds = audio_seconds
+        self.realtime_last_start, self.realtime_last_audio_seconds = now, seconds
+        threading.Thread(target=self._realtime_worker, args=(frames, samplerate, self.session_id), daemon=True).start()
 
-        threading.Thread(target=self._realtime_worker, args=(frames, samplerate), daemon=True).start()
-
-    def _realtime_worker(self, frames, samplerate: int) -> None:
+    def _realtime_worker(self, frames, samplerate: int, session: int) -> None:
         try:
-            audio_seconds = sum(len(frame) for frame in frames) / float(samplerate) if samplerate > 0 else 0.0
-            text = self._write_wav_and_transcribe(frames, samplerate, realtime=True)
+            text = self._write_wav_and_transcribe(frames, samplerate, realtime=True, session=session)
             text = normalize_transcript_text(text, final=False)
-
-            if not text:
-                return
-
-            if looks_like_realtime_loop(text):
-                log(
-                    "Rejected loop-like realtime preview "
-                    f"audio={audio_seconds:.2f}s chars={len(text)} text={text[:180]!r}"
-                )
-                return
-
-            previous = self.realtime_last_good_text or str(getattr(self.ui, "realtime_preview", "") or "")
-            if previous:
-                if len(previous) > 45 and len(text) > len(previous) * _REALTIME_MAX_TEXT_GROWTH_RATIO:
-                    log(
-                        "Rejected oversized realtime preview jump "
-                        f"old_len={len(previous)} new_len={len(text)} "
-                        f"audio={audio_seconds:.2f}s"
-                    )
-                    return
-
-            if text and self.recording and not self.cancelled and realtime_transcription_enabled():
-                self.realtime_last_good_text = text
-                self.realtime_last_good_audio_seconds = audio_seconds
-                self.ui.invoke_realtime_text(text, audio_seconds)
+            if text and not looks_like_realtime_loop(text) and self.recording and session == self.session_id:
+                seconds = sum(len(f) for f in frames) / samplerate
+                self.realtime_last_good_text, self.realtime_last_good_audio_seconds = text, seconds
+                self._post(session, "realtime", text, seconds)
         except Exception as exc:
-            log(f"Realtime transcription preview failed: {exc!r}")
+            log(f"Live preview skipped: {exc}")
         finally:
-            self.realtime_busy = False
+            if session == self.session_id:
+                self.realtime_busy = False
 
-    def _transcribe_worker(self, frames, samplerate: int) -> None:
+    def _transcribe_worker(self, frames, samplerate: int, session: int) -> None:
         try:
-            text = self._write_wav_and_transcribe(frames, samplerate, realtime=False)
-
-            if not text:
-                self.ui.invoke_cancel("no speech recognized")
-                return
-
+            text = self._write_wav_and_transcribe(frames, samplerate, realtime=False, session=session)
             text = normalize_transcript_text(text, final=True)
-            log(f"Transcribed {len(text)} chars: {text[:240]!r}")
-            self.ui.invoke_transcribed(text)
+            if session != self.session_id or self.cancelled:
+                return
+            if text and not looks_like_realtime_loop(text):
+                atomic_json_write(APP_DIR / "last-transcript.json", {"text": text, "time": time.time()})
+                self._post(session, "transcribed", text)
+            else:
+                self._post(session, "cancel", "no speech recognized")
         except Exception as exc:
-            log(f"Transcription failed: {exc!r}\n{traceback.format_exc()}")
-            self.ui.invoke_error(str(exc))
+            self._post(session, "error", str(exc))
+        finally:
+            if session == self.session_id:
+                self.finalizing = False
 
 
 class SocketServer:
@@ -2628,6 +3486,7 @@ def daemon_main() -> int:
     class Overlay:
         def __init__(self, gtk_app) -> None:
             self.gtk_app = gtk_app
+            self.glass = GlassBackdrop()
             self.window = Gtk.ApplicationWindow(application=gtk_app, title=APP_NAME)
             self.window.set_default_size(WINDOW_W, WINDOW_H)
             self.window.set_decorated(False)
@@ -2672,7 +3531,7 @@ def daemon_main() -> int:
             self.open_target = 0.0
             self.last_frame = time.time()
             self.engine = DictationEngine(self)
-            self.monitor = KeyboardMonitor(lambda: GLib.idle_add(self.invoke_cancel, "manual typing"))
+            self.monitor = KeyboardMonitor(lambda: None if self.glass.permission_pending else GLib.idle_add(self.invoke_cancel, "manual typing"))
             self.monitor.start()
             self.paster = ClipboardPaster(injector, self.monitor.pause_for)
             self.layer_enabled = False
@@ -2682,7 +3541,7 @@ def daemon_main() -> int:
             self.settings_extra = float(SETTINGS_EXTRA_H)
             self.settings_extra_target = float(SETTINGS_EXTRA_H)
             self.open_dropdown: str | None = None
-            self.dropdown_anim = {"mic": 0.0, "quality": 0.0, "realtime": 0.0}
+            self.dropdown_anim = {"mic": 0.0, "quality": 0.0, "realtime": 0.0, "theme": 0.0}
             self.preview_anim = 0.0
             self.preview_draw_chars = 0.0
             self.preview_scroll = 0.0
@@ -2723,7 +3582,8 @@ def daemon_main() -> int:
 
             self.window.connect("close-request", self.on_close_request)
 
-            if LayerShell is not None:
+            self.window.connect("realize", configure_native_overlay)
+            if LayerShell is not None and LayerShell.is_supported():
                 try:
                     LayerShell.init_for_window(self.window)
                     LayerShell.set_namespace(self.window, "kdictate")
@@ -2780,6 +3640,8 @@ def daemon_main() -> int:
             if self.dragging_window:
                 self.move_overlay(self.drag_origin_x + int(offset_x), self.drag_origin_y + int(offset_y))
             self.dragging_window = False
+            if active_theme().startswith("glass-") and not self.glass.native:
+                self.present_with_glass()
 
         def on_scroll(self, controller, dx, dy):
             if not (self.engine.recording and realtime_transcription_enabled() and self.preview_anim > 0.05):
@@ -2794,8 +3656,8 @@ def daemon_main() -> int:
             return True
 
         def move_overlay(self, x: int, y: int) -> None:
-            self.window_x = int(max(0, x))
-            self.window_y = int(max(0, y))
+            self.window_x = int(x)
+            self.window_y = int(y)
 
             if self.layer_enabled and LayerShell is not None:
                 with contextlib.suppress(Exception):
@@ -2803,9 +3665,11 @@ def daemon_main() -> int:
                     LayerShell.set_margin(self.window, LayerShell.Edge.TOP, self.window_y)
             else:
                 with contextlib.suppress(Exception):
-                    self.window.move(self.window_x, self.window_y)
+                    position_native_overlay(self.window, self.window_x, self.window_y)
 
         def poll_vr_audio(self):
+            if not self.visible:
+                return True
             if self.audio_poll_busy:
                 return True
 
@@ -2832,6 +3696,7 @@ def daemon_main() -> int:
             return False
 
         def rebuild_settings_options_cache(self) -> None:
+            self.settings_options_cache["theme"] = list(THEME_LABELS.items())
             self.settings_options_cache["mic"] = [(dev["id"], dev["label"]) for dev in self.microphones]
             self.settings_options_cache["quality"] = [
                 ("speed", QUALITY_LABELS["speed"]),
@@ -2884,6 +3749,8 @@ def daemon_main() -> int:
             return options
 
         def selected_setting_value(self, key: str) -> str:
+            if key == "theme":
+                return active_theme()
             if key == "mic":
                 return os.environ.get("KDICTATE_MIC_DEVICE", "").strip()
             if key == "quality":
@@ -2893,6 +3760,8 @@ def daemon_main() -> int:
             return ""
 
         def setting_row_value(self, key: str) -> str:
+            if key == "theme":
+                return THEME_LABELS[active_theme()]
             if key == "mic":
                 return self.selected_mic_label()
             if key == "quality":
@@ -2910,6 +3779,7 @@ def daemon_main() -> int:
                 ("mic", "Microphone"),
                 ("quality", "Quality"),
                 ("realtime", "Realtime transcription"),
+                ("theme", "Appearance"),
             ]:
                 items.append({"kind": "row", "key": key, "label": label, "y": y, "h": 38.0})
                 y += 44.0
@@ -2949,6 +3819,9 @@ def daemon_main() -> int:
             self.area.queue_draw()
 
         def apply_setting_choice(self, key: str, value: str) -> None:
+            if key == "theme" and value in THEME_LABELS:
+                save_runtime_config({"KDICTATE_THEME": value})
+                self.update_glass()
             if key == "mic":
                 set_microphone_device(value)
             elif key == "quality":
@@ -2989,8 +3862,69 @@ def daemon_main() -> int:
             self.fade_target = 1.0
             self.open_target = 1.0
             self.visible = True
-            self.window.present()
+            self.present_with_glass()
             self.area.queue_draw()
+
+        def update_glass(self) -> None:
+            self.glass.portal_attempted = False
+            if self.window.get_realized():
+                self.glass.configure(self.window, WINDOW_W, self.current_window_h)
+            if self.visible:
+                self.present_with_glass()
+
+        def present_with_glass(self) -> None:
+            self.window.realize()
+            configure_native_overlay(self.window)
+            position_native_overlay(self.window, self.window_x, self.window_y)
+            enabled = active_theme().startswith("glass-")
+            native = self.glass.configure(self.window, WINDOW_W, self.current_window_h)
+            if not enabled or native:
+                self.window.set_visible(True)
+                return
+            if self.glass.busy:
+                return
+            self.glass.busy = True
+            generation = getattr(self, "glass_generation", 0) + 1
+            self.glass_generation = generation
+            x, y = self.window_x, self.window_y
+            scale = float(self.window.get_scale_factor())
+            # Authorization never holds up listening or leaves the card invisible.
+            needs_portal = desktop_session_type() == "wayland" and self.glass.pipeline is None
+            if needs_portal:
+                self.window.set_visible(True)
+            else:
+                self.window.hide()
+            def capture():
+                ok = False
+                try:
+                    if needs_portal:
+                        self.glass._ensure_portal()
+                        hidden = threading.Event()
+                        def hide_ready():
+                            if generation == self.glass_generation and self.visible:
+                                self.window.hide()
+                            hidden.set()
+                            return False
+                        GLib.idle_add(hide_ready)
+                        if not hidden.wait(1.0):
+                            raise RuntimeError("Backdrop capture deferred while the desktop is busy")
+                    time.sleep(0.08)
+                    ok = self.glass.capture(x, y, WINDOW_W, WINDOW_H + SETTINGS_MAX_EXTRA_H, scale)
+                except Exception as exc:
+                    self.glass.status = str(exc)
+                    log(f"Glass authorization: {exc}")
+                def present():
+                    self.glass.busy = False
+                    if not self.visible or generation != self.glass_generation:
+                        return False
+                    if not ok and self.mode == "settings":
+                        self.subtitle = "Glass: screen access needed. Reselect Appearance to retry."
+                    self.window.set_visible(True)
+                    position_native_overlay(self.window, self.window_x, self.window_y)
+                    self.area.queue_draw()
+                    return False
+                GLib.idle_add(present)
+            threading.Thread(target=capture, name="VerbatimGlassBackdrop", daemon=True).start()
 
         def set_window_height(self, height: int) -> None:
             if self.current_window_h == height:
@@ -2999,6 +3933,8 @@ def daemon_main() -> int:
             self.current_window_h = height
             self.area.set_content_height(height)
             self.window.set_default_size(WINDOW_W, height)
+            if self.glass.native:
+                self.glass.configure(self.window, WINDOW_W, height)
 
             with contextlib.suppress(Exception):
                 self.window.set_size_request(WINDOW_W, height)
@@ -3078,7 +4014,8 @@ def daemon_main() -> int:
             with contextlib.suppress(Exception):
                 self.window.set_opacity(max(0.0, min(1.0, self.fade_alpha)))
 
-            self.area.queue_draw()
+            if self.visible:
+                self.area.queue_draw()
             return True
 
         def position(self):
@@ -3118,6 +4055,7 @@ def daemon_main() -> int:
                 self.invoke_cancel("toggle")
                 return
 
+            DESKTOP_TARGET.capture()
             self.settings_open = False
             self.open_dropdown = None
             self.realtime_preview = ""
@@ -3176,11 +4114,11 @@ def daemon_main() -> int:
             self.last_frame = time.time()
             self.visible = True
             self.monitor.arm(ignore_for=0.8)
-            self.window.present()
+            self.present_with_glass()
             self.area.queue_draw()
 
             # Fallback only. Normal startup should already have the model hot.
-            if KEEP_MODEL_WARM and BACKEND != "whisper.cpp" and not ModelManager.is_loaded():
+            if KEEP_MODEL_WARM and not ModelManager.is_loaded():
                 ModelManager.warm_async(reason="keybind-fallback")
 
             if FAST_KEYBIND_START:
@@ -3190,6 +4128,7 @@ def daemon_main() -> int:
 
         def close_smoothly(self):
             self.monitor.disarm()
+            self.glass_generation = getattr(self, "glass_generation", 0) + 1
             self.settings_open = False
             self.open_dropdown = None
             self.fade_target = 0.0
@@ -3204,6 +4143,19 @@ def daemon_main() -> int:
             self.title = title
             self.subtitle = subtitle
             GLib.idle_add(self.area.queue_draw)
+
+        def invoke_for_session(self, session: int, kind: str, *args):
+            def apply():
+                if session != self.engine.session_id or self.engine.cancelled:
+                    return False
+                callbacks = {"transcribed": self._on_transcribed,
+                    "realtime": self._on_realtime_text, "error": self.show_error,
+                    "cancel": self._cancel_on_ui}
+                callback = callbacks.get(kind)
+                if callback:
+                    callback(*args)
+                return False
+            GLib.idle_add(apply)
 
         def invoke_transcribed(self, text: str):
             GLib.idle_add(self._on_transcribed, text)
@@ -3278,13 +4230,36 @@ def daemon_main() -> int:
 
             self.set_status("typing", "Typing", text[:68] + ("..." if len(text) > 68 else ""))
 
+            session = self.engine.session_id
+            self.glass_generation = getattr(self, "glass_generation", 0) + 1
+            # A normal GTK fallback window must be out of the way before injection.
+            if not self.layer_enabled:
+                self.window.hide()
             def paste_worker() -> None:
+                if session != self.engine.session_id or self.engine.cancelled:
+                    return
+                if self.glass.permission_pending:
+                    # The first non-native Wayland glass authorization may take
+                    # keyboard focus. Keep captured speech, wait for the dialog,
+                    # and never paste the transcript into the permission prompt.
+                    if not self.glass.permission_finished.wait(90.0):
+                        self.invoke_for_session(session, "error", "Desktop permission is still open. Your text is saved in kdictate last-transcript.")
+                        return
+                    if session != self.engine.session_id or self.engine.cancelled:
+                        return
+                    time.sleep(0.18)
                 ok, msg = self.paster.paste_text(text)
 
+                if session != self.engine.session_id or self.engine.cancelled:
+                    return
                 if not ok:
-                    GLib.idle_add(self.show_error, msg)
+                    self.invoke_for_session(session, "error", msg)
                 else:
-                    GLib.idle_add(self.close_smoothly)
+                    def close_current():
+                        if session == self.engine.session_id and not self.engine.cancelled:
+                            self.close_smoothly()
+                        return False
+                    GLib.idle_add(close_current)
 
             threading.Thread(target=paste_worker, daemon=True).start()
             return False
@@ -3295,9 +4270,11 @@ def daemon_main() -> int:
             self.set_status("error", "Needs attention", msg[:96])
             self.fade_target = 1.0
             self.visible = True
-            self.window.present()
+            self.window.set_visible(True)
+            session = self.engine.session_id
             def later():
-                self.close_smoothly()
+                if session == self.engine.session_id and self.mode == "error":
+                    self.close_smoothly()
                 return False
             GLib.timeout_add(7000, later)
             return False
@@ -3376,7 +4353,7 @@ def daemon_main() -> int:
             cos_a = math.cos(angle)
             sin_a = math.sin(angle)
 
-            cr.set_source_rgba(1, 1, 1, 0.46 * a)
+            cr.set_source_rgba(*theme_palette()["text"], 0.46 * a)
             cr.set_line_width(1.7)
 
             for idx, (px, py) in enumerate(pts):
@@ -3393,20 +4370,20 @@ def daemon_main() -> int:
             open_amount = max(0.0, min(1.0, self.dropdown_anim.get(key, 0.0)))
 
             self.draw_round_rect(cr, 24, y, WINDOW_W - 48, 38, 13)
-            cr.set_source_rgba(1, 1, 1, (0.070 + 0.030 * open_amount) * a)
+            cr.set_source_rgba(*theme_palette()["text"], (0.070 + 0.030 * open_amount) * a)
             cr.fill()
 
             if open_amount > 0.02:
-                cr.set_source_rgba(0.72, 0.80, 1.00, 0.065 * open_amount * a)
+                cr.set_source_rgba(*theme_palette()["accent"], 0.065 * open_amount * a)
                 self.draw_round_rect(cr, 24, y, WINDOW_W - 48, 38, 13)
                 cr.fill()
 
-            cr.set_source_rgba(1, 1, 1, 0.92 * a)
+            cr.set_source_rgba(*theme_palette()["text"], 0.92 * a)
             cr.set_font_size(12.4)
             cr.move_to(39, y + 16)
             cr.show_text(label)
 
-            cr.set_source_rgba(1, 1, 1, 0.58 * a)
+            cr.set_source_rgba(*theme_palette()["text"], (0.70 if theme_palette()["light"] else 0.58) * a)
             cr.set_font_size(11.0)
             shown = self.ellipsize_text(cr, value, WINDOW_W - 104)
             cr.move_to(39, y + 31)
@@ -3416,15 +4393,15 @@ def daemon_main() -> int:
 
         def draw_settings_option(self, cr, y: float, label: str, selected: bool, a: float) -> None:
             self.draw_round_rect(cr, 34, y, WINDOW_W - 68, 26, 10)
-            cr.set_source_rgba(1, 1, 1, (0.060 if not selected else 0.105) * a)
+            cr.set_source_rgba(*theme_palette()["text"], (0.060 if not selected else 0.105) * a)
             cr.fill()
 
             if selected:
-                cr.set_source_rgba(0.72, 0.80, 1.00, 0.20 * a)
+                cr.set_source_rgba(*theme_palette()["accent"], 0.20 * a)
                 cr.arc(47, y + 13, 3.2, 0, 2 * math.pi)
                 cr.fill()
 
-            cr.set_source_rgba(1, 1, 1, (0.62 if not selected else 0.91) * a)
+            cr.set_source_rgba(*theme_palette()["text"], (0.62 if not selected else 0.91) * a)
             cr.set_font_size(10.8)
             cr.move_to(58, y + 17)
             cr.show_text(self.ellipsize_text(cr, label, WINDOW_W - 108))
@@ -3442,11 +4419,11 @@ def daemon_main() -> int:
             cr.rectangle(14, 102, width - 28, panel_h + 18)
             cr.clip()
 
-            cr.set_source_rgba(1, 1, 1, 0.066 * a)
+            cr.set_source_rgba(*theme_palette()["text"], 0.066 * a)
             self.draw_round_rect(cr, 20, panel_y + 18, width - 40, panel_h - 20, 18)
             cr.fill()
 
-            cr.set_source_rgba(1, 1, 1, 0.118 * a)
+            cr.set_source_rgba(*theme_palette()["text"], 0.118 * a)
             self.draw_round_rect(cr, 20.5, panel_y + 18.5, width - 41, panel_h - 21, 18)
             cr.set_line_width(1)
             cr.stroke()
@@ -3486,7 +4463,7 @@ def daemon_main() -> int:
                 newest = 1.0 if idx >= len(lines) - 1 else 0.76
                 line_alpha = min(top_fade, bottom_fade) * newest * a
 
-                cr.set_source_rgba(1, 1, 1, line_alpha)
+                cr.set_source_rgba(*theme_palette()["text"], line_alpha)
                 cr.move_to(viewport_x, yy + 15)
                 cr.show_text(line)
 
@@ -3497,7 +4474,7 @@ def daemon_main() -> int:
                     last_line_y = viewport_y + (len(lines) - 1) * line_h - self.preview_scroll
                     if viewport_y - line_h < last_line_y < viewport_y + viewport_h + line_h:
                         caret_x = viewport_x + min(viewport_w - 6, self._text_width(cr, last_line) + 4)
-                        cr.set_source_rgba(1, 1, 1, 0.82 * a)
+                        cr.set_source_rgba(*theme_palette()["text"], 0.82 * a)
                         cr.set_line_width(2)
                         cr.move_to(caret_x, last_line_y + 1)
                         cr.line_to(caret_x, last_line_y + 18)
@@ -3531,24 +4508,42 @@ def daemon_main() -> int:
             self.draw_round_rect(cr, 10, 14, width - 20, effective_h - 20, 24)
             cr.fill()
 
-            # One unified solid dark card. No separate transparent-looking islands.
-            cr.set_source_rgba(0.045, 0.047, 0.060, 0.995 * a)
+            palette = theme_palette()
+            glass = palette["glass"]
             self.draw_round_rect(cr, 8, 7, width - 16, effective_h - 17, 24)
-            cr.fill()
+            cr.save()
+            cr.clip()
+            has_backdrop = glass and self.glass.surface is not None and not self.glass.native
+            if has_backdrop:
+                cr.set_source_surface(self.glass.surface, 0, 0)
+                cr.paint_with_alpha(a)
+            # Native blur uses live translucency; fallback contains actually blurred
+            # background pixels, frozen for the short life of this card.
+            tint_alpha = 0.78 if glass and (self.glass.native or has_backdrop) else 0.995
+            cr.set_source_rgba(*palette["surface"], tint_alpha * a)
+            cr.paint()
+            if glass:
+                sheen = cairo.LinearGradient(8, 7, width, effective_h)
+                sheen.add_color_stop_rgba(0, 1, 1, 1, (0.24 if palette["light"] else 0.11) * a)
+                sheen.add_color_stop_rgba(0.48, 1, 1, 1, 0.018 * a)
+                sheen.add_color_stop_rgba(1, *palette["accent"], 0.065 * a)
+                cr.set_source(sheen)
+                cr.paint()
+            cr.restore()
 
             # Subtle border/highlight.
-            cr.set_source_rgba(1, 1, 1, 0.105 * a)
+            cr.set_source_rgba(*theme_palette()["text"], 0.105 * a)
             self.draw_round_rect(cr, 8.5, 7.5, width - 17, effective_h - 18, 24)
             cr.set_line_width(1)
             cr.stroke()
 
             # Settings gear normally; back arrow while already inside settings.
             control_x = width - 58
-            cr.set_source_rgba(1, 1, 1, 0.105 * a)
+            cr.set_source_rgba(*theme_palette()["text"], 0.105 * a)
             cr.arc(control_x, 27, 13, 0, 2 * math.pi)
             cr.fill()
 
-            cr.set_source_rgba(1, 1, 1, 0.76 * a)
+            cr.set_source_rgba(*theme_palette()["text"], 0.76 * a)
             cr.set_line_width(1.8)
 
             if self.settings_open:
@@ -3578,11 +4573,11 @@ def daemon_main() -> int:
 
             # Close button in the far right corner.
             close_x = width - 27
-            cr.set_source_rgba(1, 1, 1, 0.105 * a)
+            cr.set_source_rgba(*theme_palette()["text"], 0.105 * a)
             cr.arc(close_x, 27, 13, 0, 2 * math.pi)
             cr.fill()
 
-            cr.set_source_rgba(1, 1, 1, 0.78 * a)
+            cr.set_source_rgba(*theme_palette()["text"], 0.78 * a)
             cr.set_line_width(2)
             cr.move_to(close_x - 5, 22)
             cr.line_to(close_x + 5, 32)
@@ -3643,13 +4638,13 @@ def daemon_main() -> int:
 
             # Text.
             cr.select_font_face("Inter, Cantarell, Sans", 0, 0)
-            cr.set_source_rgba(1, 1, 1, 0.95 * a)
+            cr.set_source_rgba(*theme_palette()["text"], 0.95 * a)
             cr.set_font_size(18)
             cr.move_to(96, 47)
             cr.show_text(self.title)
 
             if self.subtitle:
-                cr.set_source_rgba(1, 1, 1, 0.69 * a)
+                cr.set_source_rgba(*theme_palette()["text"], 0.69 * a)
                 cr.set_font_size(12.8)
                 cr.move_to(96, 70)
                 cr.show_text(self.ellipsize_text(cr, self.subtitle, width - 164))
@@ -3662,7 +4657,7 @@ def daemon_main() -> int:
                 cr.set_line_width(4)
                 cr.set_line_cap(cairo.LINE_CAP_ROUND)
 
-                cr.set_source_rgba(1, 1, 1, 0.17 * a)
+                cr.set_source_rgba(*theme_palette()["text"], 0.17 * a)
                 cr.move_to(x0, y0)
                 cr.line_to(x1, y0)
                 cr.stroke()
@@ -3686,6 +4681,7 @@ def daemon_main() -> int:
                     "mic": self.selected_setting_value("mic"),
                     "quality": self.selected_setting_value("quality"),
                     "realtime": self.selected_setting_value("realtime"),
+                    "theme": self.selected_setting_value("theme"),
                 }
 
                 for item in self.settings_layout()[0]:
@@ -3806,7 +4802,11 @@ def daemon_main() -> int:
             ModelManager.warm_async()
             return "warming"
         if msg == "doctor":
-            return doctor_text()
+            report = doctor_text()
+            overlay = overlay_ref.get("overlay")
+            if overlay:
+                report += "\nGlass backend: " + overlay.glass.status
+            return report
         if msg == "quit":
             def quit_it():
                 app.quit()
@@ -3901,7 +4901,7 @@ def doctor_text() -> str:
     if BACKEND == "whisper.cpp":
         lines.append(f"whisper.cpp bin: {WHISPER_CPP_BIN}")
         lines.append(f"whisper.cpp model: {WHISPER_CPP_MODEL}")
-    for cmd in ["wl-copy", "wl-paste", "pactl", "easyeffects", "flatpak", "nvidia-smi"]:
+    for cmd in ["wl-copy", "wl-paste", "xclip", "xsel", "xdotool", "pactl", "easyeffects", "flatpak", "nvidia-smi"]:
         lines.append(f"{cmd}: {'ok' if command_exists(cmd) else 'missing'}")
     try:
         import evdev  # noqa: F401
@@ -3915,15 +4915,15 @@ def doctor_text() -> str:
         lines.append("/dev/uinput: ok")
     except Exception as exc:
         lines.append(f"/dev/uinput: not writable ({exc})")
-    try:
-        run(["wl-copy"], input_text="", timeout=1.0)
-        lines.append("Wayland clipboard: ok")
-    except subprocess.TimeoutExpired:
-        # wl-copy may stay alive as the clipboard owner on Wayland.
-        # That is normal and usable, not a failure.
-        lines.append("Wayland clipboard: ok (wl-copy stayed alive as clipboard owner)")
-    except Exception as exc:
-        lines.append(f"Wayland clipboard: failed ({exc})")
+    backends = clipboard_backends()
+    lines.append(f"Clipboard backends: {', '.join(backends) or 'none'}")
+    lines.append(f"Theme: {active_theme()}")
+    lines.append(f"Native blur bridge: {'installed' if (APP_DIR / 'native/libverbatim-blur.so').exists() else 'not installed'}")
+    truth = WiVRnTruth().read()
+    lines.append(f"WiVRn headset connection: {truth if truth is not None else 'unknown'}")
+    if AUDIO_COORDINATOR:
+        lines.append(f"Audio confirmed VR: {AUDIO_COORDINATOR.machine.stable}")
+        lines.append(f"Discord: {AUDIO_COORDINATOR.preferences.status}")
     try:
         subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3)
     except Exception:
@@ -3943,7 +4943,7 @@ def doctor_text() -> str:
                 f"output={sink.get('label', sink['name'])}"
             )
         else:
-            lines.append("WiVRn audio: not connected")
+            lines.append("WiVRn audio endpoints: absent")
     except Exception as exc:
         lines.append(f"WiVRn audio: check failed ({exc})")
 
@@ -3975,6 +4975,17 @@ def cli_main(argv: list[str]) -> int:
     _ensure_dirs()
     cmd = argv[1] if len(argv) > 1 else "toggle"
 
+    if cmd == "_inference-worker":
+        return inference_worker_main()
+
+    if cmd == "last-transcript":
+        try:
+            print(json.loads((APP_DIR / "last-transcript.json").read_text())["text"])
+            return 0
+        except (OSError, ValueError, KeyError):
+            print("No completed transcript available.", file=sys.stderr)
+            return 1
+
     if cmd == "daemon":
         return daemon_main()
 
@@ -3996,7 +5007,7 @@ def cli_main(argv: list[str]) -> int:
         return 1
 
     if cmd == "doctor":
-        print(doctor_text())
+        print(send_socket("doctor") if daemon_is_running() else doctor_text())
         return 0
 
     if cmd == "gpu-status":
@@ -4008,7 +5019,7 @@ def cli_main(argv: list[str]) -> int:
             print(send_socket("quit"))
         return 0
 
-    print("Usage: kdictate [toggle|start|cancel|daemon|status|doctor|gpu-status|warmup|warmup-foreground|quit]", file=sys.stderr)
+    print("Usage: kdictate [toggle|start|cancel|daemon|status|doctor|gpu-status|last-transcript|warmup|warmup-foreground|quit]", file=sys.stderr)
     return 2
 
 
