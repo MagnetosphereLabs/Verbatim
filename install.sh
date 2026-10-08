@@ -1,407 +1,307 @@
-#!/usr/bin/env python3
-from __future__ import annotations
+#!/usr/bin/env bash
+set -euo pipefail
+# Support the public curl | bash entry point as well as an extracted checkout.
+# stdin has no script path: never mistake the caller's working directory for
+# the requested update, even when it contains an older complete checkout.
+INSTALL_SOURCE="${BASH_SOURCE[0]:-}"
+ROOT=''
+if [ -n "$INSTALL_SOURCE" ] && [ -f "$INSTALL_SOURCE" ]; then
+  ROOT="$(cd -- "$(dirname -- "$INSTALL_SOURCE")" && pwd)"
+fi
+REQUIRED_FILES=(
+  install.sh requirements.txt app/kdictate.py bin/kdictate
+  scripts/platform.sh scripts/verbatim-session scripts/verbatim-wayvr
+  scripts/register_desktop_shortcut.py scripts/register_cosmic_shortcut.py
+  scripts/install_wayvr_integration.sh systemd/kdictate.service
+  native/build.sh native/blur.c native/ext-background-effect-v1.xml native/kde-blur.xml
+)
+complete_bundle() {
+  local directory="$1" file
+  [ -n "$directory" ] || return 1
+  for file in "${REQUIRED_FILES[@]}"; do
+    [ -s "$directory/$file" ] || return 1
+  done
+}
+bootstrap_verbatim() (
+  local dependency bootstrap_directory
+  for dependency in curl tar mktemp; do
+    command -v "$dependency" >/dev/null || { echo "Install $dependency, then retry the Verbatim install command." >&2; exit 1; }
+  done
+  bootstrap_directory="$(mktemp -d "${TMPDIR:-/tmp}/verbatim-install.XXXXXX")"
+  trap 'rm -rf -- "$bootstrap_directory"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  echo 'Downloading the complete Verbatim update from GitHub...'
+  # A single repository archive keeps every companion file at the same revision.
+  # Complete staging happens before the installed daemon or files are touched.
+  curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 --max-time 300 \
+    'https://github.com/MagnetosphereLabs/Verbatim/archive/refs/heads/main.tar.gz' \
+    --output "$bootstrap_directory/repository.tar.gz"
+  tar --extract --gzip --file "$bootstrap_directory/repository.tar.gz" \
+    --directory "$bootstrap_directory" --strip-components=1 --no-same-owner --no-same-permissions
+  if ! complete_bundle "$bootstrap_directory"; then
+    echo 'The downloaded repository is missing required Verbatim files. Your existing installation has not been changed.' >&2
+    exit 1
+  fi
+  # Do not feed the still-arriving outer script into a child command's stdin.
+  # Installer prompts explicitly use /dev/tty, so interactive setup still works.
+  bash "$bootstrap_directory/install.sh" "$@" </dev/null
+)
+if ! complete_bundle "$ROOT"; then
+  bootstrap_verbatim "$@"
+  exit $?
+fi
 
-import ast
-import os
-import shlex
-import shutil
-import tempfile
-import subprocess
-import sys
+. "$ROOT/scripts/platform.sh"
+FAMILY="$(verbatim_family)" || { echo 'Supported package families: Ubuntu/Mint/Pop (APT), Fedora (DNF), Arch/CachyOS (pacman).' >&2; exit 1; }
+if [ "${1:-}" = '--print-package-plan' ]; then
+  echo "Package family: $FAMILY"
+  verbatim_packages "$FAMILY" base
+  verbatim_packages "$FAMILY" vulkan
+  exit 0
+fi
+if [ "$(id -u)" -eq 0 ]; then
+  echo 'Run this installer as your desktop user, without sudo. It requests sudo for system packages and device access.' >&2
+  exit 1
+fi
+# These variables belong to the caller's Python environment. Changes here are
+# confined to this installer process and do not deactivate or modify Conda.
+unset PYTHONHOME PYTHONPATH
+APP="${KDICTATE_APPDIR:-$HOME/.local/share/kdictate-cosmic}"
+BIN="$HOME/.local/bin"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
+SERVICE_DIR="$CONFIG_DIR/systemd/user"
+mkdir -p "$APP" "$BIN" "$SERVICE_DIR" "$CONFIG_DIR/autostart"
+exec > >(tee -a "$APP/install.log") 2>&1
+printf 'Installing Verbatim with %s packages into %s\n' "$FAMILY" "$APP"
+command -v sudo >/dev/null || { echo 'sudo is required for system dependency setup.' >&2; exit 1; }
+sudo -v
+packages() {
+  case "$FAMILY" in
+    apt) sudo apt-get install -y "$@" ;;
+    dnf) sudo dnf install -y "$@" ;;
+    pacman) sudo pacman -S --needed --noconfirm "$@" ;;
+  esac
+}
+if [ "$FAMILY" = apt ]; then sudo apt-get update; fi
+read -r -a BASE_PACKAGES <<< "$(verbatim_packages "$FAMILY" base)"
+packages "${BASE_PACKAGES[@]}"
+# Keep the existing desktop's portal implementation. Install the matching one
+# only if missing; do not replace PipeWire/PulseAudio or the user's audio policy.
+DESKTOP="${XDG_CURRENT_DESKTOP:-${DESKTOP_SESSION:-}}"
+DESKTOP="${DESKTOP^^}"
+case "$DESKTOP" in
+  *GNOME*|*UBUNTU*) PORTAL='gnome' ;;
+  *KDE*|*PLASMA*) PORTAL='kde' ;;
+  *COSMIC*) PORTAL='cosmic' ;;
+  *) PORTAL='gtk' ;;
+esac
+if [ "$PORTAL" != cosmic ]; then
+  if ! packages "xdg-desktop-portal-$PORTAL"; then
+    echo "Desktop portal package unavailable; retaining the installed portal backend."
+  fi
+fi
+PYTHON="$(verbatim_python)"
+printf 'Using Python: %s (Verbatim keeps its own virtual environment)\n' "$PYTHON"
+"$PYTHON" -c 'import gi,cairo; gi.require_version("Gtk","4.0"); gi.require_version("Atspi","2.0"); from gi.repository import Gtk,Atspi' || {
+  echo 'The selected Python must match the distribution GTK and accessibility packages. VERBATIM_PYTHON, if set, must select that interpreter.' >&2; exit 1;
+}
+# Preserve model/appearance/mic preferences when updating. Never source config
+# as shell code; paths and tokens can contain spaces or shell punctuation.
+OLD_PROFILE="$("$PYTHON" - "$APP/config.env" <<'PY'
 from pathlib import Path
-
-NAME = "Verbatim - Voice Dictation"
-OLD_NAME = "KDictate - Whisper Dictation"
-DEFAULT_COMMAND = shlex.join([str(Path.home() / ".local/bin/kdictate"), "toggle"])
-BINDING = "<Super>v"
-
-
-def run(cmd: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=check,
-        timeout=3.0,
-    )
-
-
-def command_exists(name: str) -> bool:
-    return shutil.which(name) is not None
-
-
-def parse_gvariant_list(value: str) -> list[str]:
-    value = value.strip()
-    if value in {"@as []", "[]", ""}:
-        return []
-    try:
-        parsed = ast.literal_eval(value)
-        if isinstance(parsed, list):
-            return [str(x) for x in parsed]
-    except Exception:
-        pass
-    return []
-
-
-def gsettings_get(schema: str, key: str) -> str:
-    proc = run(["gsettings", "get", schema, key])
-    return proc.stdout.strip() if proc.returncode == 0 else ""
-
-
-def gsettings_set(schema: str, key: str, value: str) -> bool:
-    proc = run(["gsettings", "set", schema, key, value])
-    if proc.returncode != 0:
-        print(proc.stderr.strip(), file=sys.stderr)
-        return False
-    return True
-
-
-def gsettings_reloc_get(schema: str, path: str, key: str) -> str:
-    proc = run(["gsettings", "get", f"{schema}:{path}", key])
-    return proc.stdout.strip() if proc.returncode == 0 else ""
-
-
-def gsettings_reloc_set(schema: str, path: str, key: str, value: str) -> bool:
-    proc = run(["gsettings", "set", f"{schema}:{path}", key, value])
-    if proc.returncode != 0:
-        print(proc.stderr.strip(), file=sys.stderr)
-        return False
-    return True
-
-
-def gvariant_string(value: str) -> str:
-    return repr(value)
-
-
-def gvariant_strv(values: list[str]) -> str:
-    return "[" + ", ".join(repr(v) for v in values) + "]"
-
-
-def owns_super_v(value: str) -> bool:
-    values = parse_gvariant_list(value)
-    if not values:
-        values = [value.strip().strip("'\"")]
-    return any(item.lower().replace(" ", "").replace("<mod4>", "<super>") == "<super>v"
-               for item in values)
-
-
-def builtin_super_v_conflict(namespace: str) -> str:
-    # Inspect installed schemas instead of assuming this desktop version uses
-    # particular keys. GNOME commonly reserves Super+V for notifications.
-    schemas = run(["gsettings", "list-schemas"])
-    if schemas.returncode:
-        return ""
-    for schema in schemas.stdout.splitlines():
-        if not schema.startswith(namespace) or not any(token in schema for token in ("keybindings", "media-keys")):
-            continue
-        values = run(["gsettings", "list-recursively", schema])
-        if values.returncode:
-            continue
-        for line in values.stdout.splitlines():
-            parts = line.split(None, 2)
-            if len(parts) == 3 and owns_super_v(parts[2]):
-                return f"{parts[0]} {parts[1]}"
-    return ""
-
-
-def desktop_tokens() -> set[str]:
-    raw = " ".join(
-        [
-            os.environ.get("XDG_CURRENT_DESKTOP", ""),
-            os.environ.get("DESKTOP_SESSION", ""),
-            os.environ.get("XDG_SESSION_DESKTOP", ""),
-        ]
-    )
-    return {p.strip().upper() for p in raw.replace(":", " ").split() if p.strip()}
-
-
-def register_cosmic(command: str, remove: bool) -> bool:
-    script = Path(__file__).with_name("register_cosmic_shortcut.py")
-    if not script.exists():
-        return False
-
-    if remove:
-        proc = run([sys.executable, str(script), "--remove"])
-    else:
-        proc = run([sys.executable, str(script), command])
-
-    if proc.stdout.strip():
-        print(proc.stdout.strip())
-    if proc.stderr.strip():
-        print(proc.stderr.strip(), file=sys.stderr)
-
-    return proc.returncode == 0
-
-
-def gnome_slot_matches(path: str) -> bool:
-    schema = "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding"
-    name = gsettings_reloc_get(schema, path, "name").strip("'")
-    command = gsettings_reloc_get(schema, path, "command").strip("'")
-    low = f"{name} {command}".lower()
-    return "verbatim" in low or "kdictate" in low
-
-
-def register_gnome(command: str, remove: bool) -> bool:
-    if not command_exists("gsettings"):
-        return False
-
-    list_schema = "org.gnome.settings-daemon.plugins.media-keys"
-    item_schema = "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding"
-    list_key = "custom-keybindings"
-
-    current = parse_gvariant_list(gsettings_get(list_schema, list_key))
-    changed = False
-
-    matched = [p for p in current if gnome_slot_matches(p)]
-
-    if remove:
-        new_list = [p for p in current if p not in matched]
-        if new_list != current:
-            gsettings_set(list_schema, list_key, gvariant_strv(new_list))
-            changed = True
-        if changed:
-            print("Removed GNOME shortcut entry for Verbatim")
-        return True
-
-    for other in current:
-        if other not in matched and owns_super_v(gsettings_reloc_get(item_schema, other, "binding")):
-            print("Super+V already belongs to another GNOME custom action; choose a free shortcut in Keyboard settings.")
-            return False
-    conflict = builtin_super_v_conflict("org.gnome.")
-    if conflict:
-        print(f"Super+V already belongs to {conflict}; choose a free shortcut in Keyboard settings.")
-        return False
-
-    if matched:
-        path = matched[0]
-        new_list = current
-    else:
-        used = set(current)
-        path = ""
-        for idx in range(0, 80):
-            candidate = f"/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom{idx}/"
-            if candidate not in used:
-                path = candidate
-                break
-        if not path:
-            print("Could not find a free GNOME custom shortcut slot", file=sys.stderr)
-            return False
-        new_list = current + [path]
-
-    results = [gsettings_reloc_set(item_schema, path, "name", gvariant_string(NAME)),
-        gsettings_reloc_set(item_schema, path, "command", gvariant_string(command)),
-        gsettings_reloc_set(item_schema, path, "binding", gvariant_string(BINDING))]
-    if not all(results) or not gsettings_set(list_schema, list_key, gvariant_strv(new_list)):
-        return False
-
-    print(f"Registered GNOME shortcut: Super+V -> {command}")
-    return True
-
-
-def dconf_read(path: str) -> str:
-    proc = run(["dconf", "read", path])
-    return proc.stdout.strip() if proc.returncode == 0 else ""
-
-
-def dconf_write(path: str, value: str) -> bool:
-    proc = run(["dconf", "write", path, value])
-    if proc.returncode != 0:
-        print(proc.stderr.strip(), file=sys.stderr)
-        return False
-    return True
-
-
-def dconf_string(value: str) -> str:
-    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
-    return "'" + escaped + "'"
-
-
-def cinnamon_slot_matches(slot: str) -> bool:
-    base = f"/org/cinnamon/desktop/keybindings/custom-keybindings/{slot}"
-    name = dconf_read(f"{base}/name").strip("'")
-    command = dconf_read(f"{base}/command").strip("'")
-    low = f"{name} {command}".lower()
-    return "verbatim" in low or "kdictate" in low
-
-
-def register_cinnamon(command: str, remove: bool) -> bool:
-    if not command_exists("dconf"):
-        return False
-
-    list_path = "/org/cinnamon/desktop/keybindings/custom-list"
-    current = parse_gvariant_list(dconf_read(list_path))
-
-    matched = [slot for slot in current if cinnamon_slot_matches(slot)]
-
-    if remove:
-        new_list = [slot for slot in current if slot not in matched]
-        if new_list != current:
-            dconf_write(list_path, gvariant_strv(new_list))
-            print("Removed Cinnamon shortcut entry for Verbatim")
-        return True
-
-    for other in current:
-        if other not in matched and owns_super_v(dconf_read(f"/org/cinnamon/desktop/keybindings/custom-keybindings/{other}/binding")):
-            print("Super+V already belongs to another Cinnamon action; choose a free shortcut in Keyboard settings.")
-            return False
-    if command_exists("gsettings"):
-        conflict = builtin_super_v_conflict("org.cinnamon.")
-        if conflict:
-            print(f"Super+V already belongs to {conflict}; choose a free shortcut in Keyboard settings.")
-            return False
-
-    if matched:
-        slot = matched[0]
-        new_list = current
-    else:
-        used = set(current)
-        slot = ""
-        for idx in range(0, 80):
-            candidate = f"custom{idx}"
-            if candidate not in used:
-                slot = candidate
-                break
-        if not slot:
-            print("Could not find a free Cinnamon custom shortcut slot", file=sys.stderr)
-            return False
-        new_list = current + [slot]
-
-    base = f"/org/cinnamon/desktop/keybindings/custom-keybindings/{slot}"
-    if not all([dconf_write(f"{base}/name", dconf_string(NAME)),
-        dconf_write(f"{base}/command", dconf_string(command)),
-        dconf_write(f"{base}/binding", gvariant_strv([BINDING]))]):
-        return False
-
-    # An unchanged custom-list emits no notification. In particular, updating
-    # an installed command/binding must remove and re-add our slot so Cinnamon
-    # reloads the live grab immediately, without restarting the desktop.
-    without_ours = [item for item in new_list if item != slot]
-    if slot in current and not dconf_write(list_path, gvariant_strv(without_ours)):
-        return False
-    if not dconf_write(list_path, gvariant_strv(new_list)):
-        dconf_write(list_path, gvariant_strv(current))
-        return False
-
-    print(f"Registered Cinnamon shortcut: Super+V -> {command}")
-    return True
-
-
-def register_xfce(command: str, remove: bool) -> bool:
-    if not command_exists("xfconf-query"):
-        return False
-    path = "/commands/custom/<Super>v"
-    existing = run(["xfconf-query", "-c", "xfce4-keyboard-shortcuts", "-p", path])
-    ours = "kdictate" in existing.stdout.lower() or "verbatim" in existing.stdout.lower()
-    if remove:
-        return not ours or run(["xfconf-query", "-c", "xfce4-keyboard-shortcuts", "-p", path, "-r"]).returncode == 0
-    if existing.returncode == 0 and existing.stdout.strip() and not ours:
-        print("Super+V already belongs to another Xfce action; choose a free shortcut in Keyboard settings.")
-        return False
-    args = ["xfconf-query", "-c", "xfce4-keyboard-shortcuts", "-p", path, "-s", command]
-    if existing.returncode:
-        args += ["-n", "-t", "string"]
-    return run(args).returncode == 0
-
-
-def register_kde(command: str, remove: bool) -> bool:
-    # Plasma's desktop-file components launch commands without a resident Qt
-    # process. Register over D-Bus rather than rewriting kglobalshortcutsrc while
-    # its daemon owns it. Includes both Plasma 5 and Plasma 6.
-    try:
-        from gi.repository import Gio, GLib
-        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-        def call(method, value, signature=None):
-            return bus.call_sync("org.kde.kglobalaccel", "/kglobalaccel",
-                "org.kde.KGlobalAccel", method, value,
-                GLib.VariantType.new(signature) if signature else None,
-                Gio.DBusCallFlags.NONE, 2000, None)
-        component = "verbatim-dictation.desktop"
-        path = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "kglobalaccel" / component
-        if remove:
-            call("unregister", GLib.Variant("(ss)", (component, "_launch")))
-            path.unlink(missing_ok=True)
-            return True
-        # Qt::META | Qt::Key_V. Do not displace another application's shortcut.
-        available = call("isGlobalShortcutAvailable", GLib.Variant("(is)", (0x10000056, component)), "(b)").unpack()[0]
-        if not available:
-            print("Super+V is already assigned in Plasma. Choose a free shortcut in System Settings.")
-            return False
-        executable = shlex.split(command)
-        if not executable:
-            return False
-        def desktop_arg(value):
-            return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`").replace("$", "\\$").replace("%", "%%") + '"'
-        path.parent.mkdir(parents=True, exist_ok=True)
-        content = "[Desktop Entry]\nType=Application\nName=" + NAME + "\nExec=" + " ".join(desktop_arg(x) for x in executable) + "\nX-KDE-GlobalAccel-CommandShortcut=true\nX-KDE-Shortcuts=Meta+V\nStartupNotify=false\nNoDisplay=true\n"
-        fd, temporary = tempfile.mkstemp(dir=path.parent)
-        with os.fdopen(fd, "w") as stream:
-            stream.write(content)
-        os.replace(temporary, path)
-        action = [component, "_launch", NAME, NAME]
-        call("doRegister", GLib.Variant("(as)", (action,)))
-        call("getComponent", GLib.Variant("(s)", (component,)), "(o)")
-        print(f"Registered Plasma shortcut: Super+V -> {command}")
-        return True
-    except Exception as exc:
-        print(f"Plasma shortcut registration unavailable: {exc}", file=sys.stderr)
-        return False
-
-
-def main() -> int:
-    remove = len(sys.argv) > 1 and sys.argv[1] == "--remove"
-    command = " ".join(sys.argv[1:]).strip() if not remove else ""
-    command = command or DEFAULT_COMMAND
-
-    tokens = desktop_tokens()
-    attempted: list[str] = []
-    ok = False
-
-    # Preserve COSMIC behavior exactly when COSMIC is detected.
-    if "COSMIC" in tokens:
-        attempted.append("COSMIC")
-        ok = register_cosmic(command, remove) or ok
-
-    # Ubuntu default GNOME.
-    if "GNOME" in tokens or "UBUNTU" in tokens:
-        attempted.append("GNOME")
-        ok = register_gnome(command, remove) or ok
-
-    # Linux Mint Cinnamon.
-    if "CINNAMON" in tokens or "X-CINNAMON" in tokens:
-        attempted.append("Cinnamon")
-        ok = register_cinnamon(command, remove) or ok
-
-    if "KDE" in tokens or "PLASMA" in tokens:
-        attempted.append("Plasma")
-        ok = register_kde(command, remove) or ok
-    if "XFCE" in tokens:
-        attempted.append("Xfce")
-        ok = register_xfce(command, remove) or ok
-
-    # If the environment is unclear, inspect installed schemas before writing.
-    if not attempted and command_exists("gsettings"):
-        schemas = set(run(["gsettings", "list-schemas"]).stdout.splitlines())
-        if "org.gnome.settings-daemon.plugins.media-keys" in schemas:
-            ok = register_gnome(command, remove)
-        elif "org.cinnamon.desktop.keybindings" in schemas:
-            ok = register_cinnamon(command, remove)
-
-    if ok:
-        return 0
-
-    if remove:
-        print("No supported desktop shortcut entry was removed.")
-        return 0
-
-    print()
-    print("Could not auto-register Super+V on this desktop.")
-    print("Create a custom keyboard shortcut manually:")
-    print(f"  Name:    {NAME}")
-    print(f"  Command: {command}")
-    print("  Shortcut: Super+V")
-    return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+import sys
+p=Path(sys.argv[1]); data={}
+if p.exists():
+ for line in p.read_text().splitlines():
+  key,sep,value=line.partition('=')
+  if sep: data[key.strip()]=value.strip().strip('\"\'')
+profile=data.get('KDICTATE_PROFILE','')
+print(profile if profile in {'speed','balanced','quality'} else '')
+PY
+)"
+CHOICE="${VERBATIM_MODEL_CHOICE:-$OLD_PROFILE}"
+if [ -z "$CHOICE" ]; then
+  echo 'Model: 1 Speed (base.en), 2 Balanced (small.en, default), 3 Quality (large-v3).'
+  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    printf 'Selection [2]: ' >/dev/tty
+    read -r CHOICE </dev/tty || true
+  fi
+fi
+case "${CHOICE:-2}" in
+  1|speed) MODEL=base.en; PROFILE=speed ;;
+  3|quality) MODEL=large-v3; PROFILE=quality ;;
+  2|balanced) MODEL=small.en; PROFILE=balanced ;;
+  *) echo 'Invalid model selection.' >&2; exit 1 ;;
+esac
+CPU_THREADS="$(nproc 2>/dev/null || echo 1)"
+PERCENT="${VERBATIM_BUILD_CPU_PERCENT:-50}"
+[[ "$PERCENT" =~ ^[0-9]+$ ]] && [ "$PERCENT" -ge 1 ] && [ "$PERCENT" -le 100 ] || { echo 'Build CPU percent must be 1–100.' >&2; exit 1; }
+BUILD_JOBS=$((CPU_THREADS * PERCENT / 100)); [ "$BUILD_JOBS" -gt 0 ] || BUILD_JOBS=1
+export CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS"
+build() { nice -n 10 "$@"; }
+# Dependencies and Python are validated before interrupting an existing daemon.
+# Keep the restoration journal and lock inode intact for VR session recovery.
+if command -v systemctl >/dev/null; then systemctl --user stop kdictate.service || true; fi
+if [ -x "$BIN/kdictate" ]; then "$BIN/kdictate" quit >/dev/null 2>&1 || true; fi
+# Copy only application-owned trees. Config, models, recovery files, and journal
+# remain intact. Installing this bundle never fetches an unpatched app from main.
+for tree in app scripts systemd native; do
+  mkdir -p "$APP/$tree"
+  cp -a "$ROOT/$tree/." "$APP/$tree/"
+done
+cp "$ROOT/requirements.txt" "$APP/requirements.txt"
+install -m 0755 "$ROOT/bin/kdictate" "$BIN/kdictate"
+install -m 0755 "$ROOT/scripts/verbatim-wayvr" "$BIN/verbatim-wayvr"
+install -m 0755 "$ROOT/scripts/verbatim-session" "$BIN/verbatim-session"
+install -m 0644 "$ROOT/systemd/kdictate.service" "$SERVICE_DIR/kdictate.service"
+# Small local blur bridge: native COSMIC/GNOME protocol and KDE's blur protocol.
+if ! bash "$APP/native/build.sh"; then
+  echo 'Native blur bridge failed to build; real local screen blur remains available. See install.log.'
+fi
+# Layer shell avoids input focus changes on COSMIC/KDE. Mint X11 uses native
+# nonfocus hints. GNOME uses a nonfocusable regular window and hides before paste.
+if [ "$FAMILY" = apt ]; then
+  if apt-cache show libgtk4-layer-shell0 >/dev/null 2>&1; then
+    packages libgtk4-layer-shell0 gir1.2-gtk4layershell-1.0 || true
+  fi
+  if [[ "$DESKTOP" == *COSMIC* || "$DESKTOP" == *KDE* || "$DESKTOP" == *PLASMA* ]] && ! ldconfig -p 2>/dev/null | grep -q 'libgtk4-layer-shell'; then
+    read -r -a LAYER_PACKAGES <<< "$(verbatim_packages "$FAMILY" layer)"
+    packages "${LAYER_PACKAGES[@]}"
+    LAYER_BUILD="$(mktemp -d)"
+    if git clone --depth=1 https://github.com/wmww/gtk4-layer-shell.git "$LAYER_BUILD/source" &&
+       meson setup "$LAYER_BUILD/build" "$LAYER_BUILD/source" --prefix="$APP/native/layer" --libdir=lib -Dexamples=false -Ddocs=false -Dtests=false &&
+       build ninja -C "$LAYER_BUILD/build" -j"$BUILD_JOBS" && ninja -C "$LAYER_BUILD/build" install; then
+      echo 'Local GTK4 layer-shell support installed.'
+    else
+      echo 'Layer-shell build unavailable; continuing with the GTK window backend.'
+    fi
+    rm -rf -- "$LAYER_BUILD"
+  fi
+fi
+GPU=cpu
+if command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1; then GPU=nvidia; fi
+BACKEND=faster-whisper; DEVICE=cpu; COMPUTE=int8; CPP_BIN=''; CPP_MODEL=''
+if [ "$GPU" = nvidia ]; then
+  DEVICE=cuda; COMPUTE=float16
+else
+  read -r -a VULKAN_PACKAGES <<< "$(verbatim_packages "$FAMILY" vulkan)"
+  if packages "${VULKAN_PACKAGES[@]}"; then
+    # Software Vulkan adapters (llvmpipe/lavapipe) are not hardware acceleration.
+    if timeout 10 vulkaninfo --summary 2>/dev/null | sed -n '/deviceType.*DISCRETE_GPU\|deviceType.*INTEGRATED_GPU/p' | head -1 | grep -q .; then GPU=vulkan; fi
+  fi
+  if [ "$GPU" = vulkan ]; then
+    BACKEND=whisper.cpp
+    CPP_DIR="$APP/whisper.cpp"
+    if [ ! -d "$CPP_DIR/.git" ]; then git clone --depth=1 https://github.com/ggml-org/whisper.cpp.git "$CPP_DIR"; fi
+    if cmake -S "$CPP_DIR" -B "$CPP_DIR/build" -G Ninja -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release && build cmake --build "$CPP_DIR/build" -j"$BUILD_JOBS"; then
+      CPP_BIN="$CPP_DIR/build/bin/whisper-cli"
+      CPP_MODEL="$APP/models/ggml-$MODEL.bin"
+      mkdir -p "$APP/models"
+      if [ ! -s "$CPP_MODEL" ]; then "$CPP_DIR/models/download-ggml-model.sh" "$MODEL" "$APP/models"; fi
+    else
+      echo 'Vulkan build failed; using faster-whisper CPU instead.'
+      BACKEND=faster-whisper; CPP_BIN=''; CPP_MODEL=''
+    fi
+  fi
+fi
+if [ -e "$APP/venv/pyvenv.cfg" ] && ! verbatim_venv_matches "$PYTHON" "$APP/venv"; then
+  echo "Rebuilding Verbatim's virtual environment for the selected Python; preferences and models are retained."
+  "$PYTHON" -m venv --clear --system-site-packages "$APP/venv"
+else
+  "$PYTHON" -m venv --system-site-packages "$APP/venv"
+fi
+"$APP/venv/bin/python" -m pip install --upgrade pip wheel setuptools
+CORE_REQUIREMENTS="$(mktemp)"
+trap 'rm -f -- "$CORE_REQUIREMENTS"' EXIT
+sed '/^faster-whisper/d' "$APP/requirements.txt" >"$CORE_REQUIREMENTS"
+"$APP/venv/bin/python" -m pip install -r "$CORE_REQUIREMENTS"
+if ! "$APP/venv/bin/python" -m pip install 'faster-whisper>=1.1.1,<2'; then
+  echo 'No compatible faster-whisper runtime; enabling native whisper.cpp CPU fallback.'
+  if [ "$BACKEND" != whisper.cpp ]; then
+    CPP_DIR="$APP/whisper.cpp"
+    if [ ! -d "$CPP_DIR/.git" ]; then git clone --depth=1 https://github.com/ggml-org/whisper.cpp.git "$CPP_DIR"; fi
+    cmake -S "$CPP_DIR" -B "$CPP_DIR/build-cpu" -G Ninja -DGGML_VULKAN=OFF -DCMAKE_BUILD_TYPE=Release
+    build cmake --build "$CPP_DIR/build-cpu" -j"$BUILD_JOBS"
+    BACKEND=whisper.cpp; DEVICE=cpu; COMPUTE=int8
+    CPP_BIN="$CPP_DIR/build-cpu/bin/whisper-cli"; CPP_MODEL="$APP/models/ggml-$MODEL.bin"
+    mkdir -p "$APP/models"
+    if [ ! -s "$CPP_MODEL" ]; then "$CPP_DIR/models/download-ggml-model.sh" "$MODEL" "$APP/models"; fi
+  fi
+fi
+if [ "$GPU" = nvidia ] && [ "$BACKEND" = faster-whisper ]; then
+  "$APP/venv/bin/python" -m pip install 'nvidia-cublas-cu12>=12.4,<13' 'nvidia-cudnn-cu12>=9,<10'
+fi
+"$PYTHON" - "$APP/config.env" "$BACKEND" "$MODEL" "$PROFILE" "$DEVICE" "$COMPUTE" "$CPP_BIN" "$CPP_MODEL" <<'PY'
+from pathlib import Path
+import os,sys,tempfile
+path=Path(sys.argv[1]); keys=['KDICTATE_BACKEND','KDICTATE_MODEL','KDICTATE_PROFILE','KDICTATE_DEVICE','KDICTATE_COMPUTE_TYPE','KDICTATE_WHISPER_CPP_BIN','KDICTATE_WHISPER_CPP_MODEL']
+updates=dict(zip(keys,sys.argv[2:])); data={}
+if path.exists():
+ for line in path.read_text().splitlines():
+  key,sep,value=line.partition('=')
+  if sep and not key.lstrip().startswith('#'): data[key.strip()]=value.strip()
+data.update(updates)
+for key,value in {'KDICTATE_THEME':'glass-dark','KDICTATE_MIC_DEVICE':'','KDICTATE_WIVRN_AUTO_AUDIO':'1','KDICTATE_WIVRN_PAUSE_EASYEFFECTS':'1','KDICTATE_REALTIME_TRANSCRIPTION':'1','KDICTATE_REALTIME_SILENCE_TO_FINISH_SECONDS':'2.85'}.items(): data.setdefault(key,value)
+fd,tmp=tempfile.mkstemp(prefix='config-',dir=path.parent)
+with os.fdopen(fd,'w') as f:
+ f.write(''.join(f'{k}={v}\n' for k,v in data.items())); f.flush(); os.fsync(f.fileno())
+os.replace(tmp,path)
+PY
+# Seat-scoped access instead of changing permissions on every input device or
+# adding the user to a group with unrestricted access to all input hardware.
+sudo modprobe uinput
+printf 'uinput\n' | sudo tee /etc/modules-load.d/verbatim-uinput.conf >/dev/null
+sudo tee /etc/udev/rules.d/70-verbatim-input.rules >/dev/null <<'RULES'
+KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}=="1", TAG+="uaccess"
+RULES
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=misc --sysname-match=uinput
+sudo udevadm trigger --subsystem-match=input
+sudo setfacl -m "u:$(id -u):rw" /dev/uinput || true
+for dev in /dev/input/event*; do
+  [ -e "$dev" ] || continue
+  if udevadm info --query=property --name="$dev" | grep -qx 'ID_INPUT_KEYBOARD=1'; then sudo setfacl -m "u:$(id -u):r" "$dev" || true; fi
+done
+# Desktop autostart imports the exact environment at every login. systemd keeps
+# the model warm and follows graphical-session lifetime on supporting desktops.
+"$PYTHON" - "$CONFIG_DIR/autostart/kdictate-cosmic.desktop" "$BIN/verbatim-session" <<'PY'
+from pathlib import Path
+import sys
+command='"'+sys.argv[2].replace('\\','\\\\').replace('"','\\"').replace('`','\\`').replace('$','\\$')+'"'
+Path(sys.argv[1]).write_text('[Desktop Entry]\nType=Application\nName=Verbatim\nExec='+command+'\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n')
+PY
+SHORTCUT_COMMAND="$("$PYTHON" - "$BIN/kdictate" <<'PY'
+import shlex,sys
+print(shlex.join([sys.argv[1],'toggle']))
+PY
+)"
+SHORTCUT_READY=0
+if "$APP/venv/bin/python" "$APP/scripts/register_desktop_shortcut.py" "$SHORTCUT_COMMAND"; then
+  SHORTCUT_READY=1
+else
+  echo 'Shortcut setup needs attention; see the message above.'
+fi
+if command -v wayvr >/dev/null || command -v wayvrctl >/dev/null || [ -d "$CONFIG_DIR/wayvr" ]; then
+  bash "$APP/scripts/install_wayvr_integration.sh" || echo 'WayVR custom UI was not changed; review install.log.'
+fi
+"$BIN/verbatim-session"
+READY=0
+for attempt in {1..40}; do
+  if "$BIN/kdictate" status >/dev/null 2>&1; then READY=1; break; fi
+  sleep 0.5
+done
+if [ "$READY" != 1 ]; then
+  echo "Daemon startup failed. See $APP/kdictate.log and journalctl --user -u kdictate.service." >&2
+  exit 1
+fi
+"$BIN/kdictate" doctor
+"$BIN/kdictate" warmup
+if [ "$SHORTCUT_READY" = 1 ]; then
+  printf '\nInstalled. Press Super+V in a text field, speak, then pause.\n'
+else
+  printf '\nInstalled. Assign a free keyboard shortcut to: %s\n' "$SHORTCUT_COMMAND"
+fi
+printf 'Theme defaults to Glass dark; Appearance offers four themes.\nRecovery command: kdictate last-transcript\n'
+printf 'Verbatim has been restarted with this update. No reboot or logout is required.\n'
