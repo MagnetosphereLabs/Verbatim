@@ -21,6 +21,6 @@ esac
 
 # Optional confirmation feedback when wayvrctl exists.
 # This is non-critical: dictation must still work without wayvrctl.
-if command -v wayvrctl >/dev/null 2>&1; then
-  wayvrctl haptics -i 0.35 -d 0.08 -f 0.1 0 >/dev/null 2>&1 || true
+if [[ "$CMD" == toggle || "$CMD" == start ]] && command -v wayvrctl >/dev/null 2>&1; then
+  timeout 2 wayvrctl haptics -i 0.35 -d 0.08 -f 0.1 0 >/dev/null 2>&1 || true
 fi
