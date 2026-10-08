@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 APP="${KDICTATE_APPDIR:-$HOME/.local/share/kdictate-cosmic}"
+unset PYTHONHOME PYTHONPATH
 PY="$APP/venv/bin/python"
 if [ ! -x "$PY" ]; then
   echo 'Verbatim is not installed. Extract the complete bundle and run bash install.sh.' >&2
