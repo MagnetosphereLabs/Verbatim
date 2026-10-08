@@ -304,3 +304,4 @@ else
   printf '\nInstalled. Assign a free keyboard shortcut to: %s\n' "$SHORTCUT_COMMAND"
 fi
 printf 'Theme defaults to Glass dark; Appearance offers four themes.\nRecovery command: kdictate last-transcript\n'
+printf 'Verbatim has been restarted with this update. No reboot or logout is required.\n'
