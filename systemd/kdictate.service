@@ -1,16 +1,19 @@
 [Unit]
 Description=Verbatim Local AI Dictation Daemon
 Documentation=https://github.com/MagnetosphereLabs/Verbatim
-After=graphical-session.target pipewire.service pipewire-pulse.service
+After=graphical-session.target pipewire.service pipewire-pulse.service pulseaudio.service
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/kdictate daemon
-Restart=always
+Restart=on-failure
 RestartSec=2
-KillMode=mixed
+KillMode=control-group
+TimeoutStopSec=5
 Environment=KDICTATE_APPDIR=%h/.local/share/kdictate-cosmic
 Environment=PYTHONUNBUFFERED=1
+UMask=0077
 
 [Install]
 WantedBy=graphical-session.target
