@@ -1,563 +1,250 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-VERBATIM_REPO_OWNER="${VERBATIM_REPO_OWNER:-MagnetosphereLabs}"
-VERBATIM_REPO_NAME="${VERBATIM_REPO_NAME:-Verbatim}"
-VERBATIM_BRANCH="${VERBATIM_BRANCH:-main}"
-
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [ ! -f "$ROOT/app/kdictate.py" ] || [ ! -f "$ROOT/scripts/platform.sh" ]; then
+  echo 'Extract the complete Verbatim bundle, then run bash install.sh inside it.' >&2
+  exit 1
+fi
+. "$ROOT/scripts/platform.sh"
+FAMILY="$(verbatim_family)" || { echo 'Supported package families: Ubuntu/Mint/Pop (APT), Fedora (DNF), Arch/CachyOS (pacman).' >&2; exit 1; }
+if [ "${1:-}" = '--print-package-plan' ]; then
+  echo "Package family: $FAMILY"
+  verbatim_packages "$FAMILY" base
+  verbatim_packages "$FAMILY" vulkan
+  exit 0
+fi
 if [ "$(id -u)" -eq 0 ]; then
-  echo "Do not run this installer with sudo."
-  echo
-  echo "Use:"
-  echo "  curl -fsSL https://raw.githubusercontent.com/${VERBATIM_REPO_OWNER}/${VERBATIM_REPO_NAME}/${VERBATIM_BRANCH}/install.sh | bash"
-  echo
-  echo "Reason: Verbatim installs a user service, user shortcut, and files under the desktop user's home directory."
-  echo "The installer will ask for sudo internally when system packages or input-device permissions are needed."
+  echo 'Run this installer as your desktop user, without sudo. It requests sudo for system packages and device access.' >&2
   exit 1
 fi
-
-SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
-
-if [ -f "$SCRIPT_SOURCE" ]; then
-  ROOT="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
-else
-  ROOT="$(pwd)"
-fi
-
-if [ ! -d "$ROOT/app" ] || [ ! -d "$ROOT/bin" ] || [ ! -d "$ROOT/scripts" ] || [ ! -f "$ROOT/requirements.txt" ]; then
-  if [ "${VERBATIM_BOOTSTRAPPED:-0}" != "1" ]; then
-    echo "Verbatim bootstrap installer"
-    echo "Fetching ${VERBATIM_REPO_OWNER}/${VERBATIM_REPO_NAME}@${VERBATIM_BRANCH}..."
-
-    TMPDIR_INSTALL="$(mktemp -d "${TMPDIR:-/tmp}/verbatim-install.XXXXXXXX")"
-
-    cleanup() {
-      rm -rf "$TMPDIR_INSTALL"
-    }
-    trap cleanup EXIT
-
-    ARCHIVE_URL="https://github.com/${VERBATIM_REPO_OWNER}/${VERBATIM_REPO_NAME}/archive/refs/heads/${VERBATIM_BRANCH}.tar.gz"
-
-    curl -fsSL "$ARCHIVE_URL" -o "$TMPDIR_INSTALL/verbatim.tar.gz"
-    tar -xzf "$TMPDIR_INSTALL/verbatim.tar.gz" -C "$TMPDIR_INSTALL"
-
-    FETCHED_ROOT="$(find "$TMPDIR_INSTALL" -mindepth 1 -maxdepth 1 -type d -name "${VERBATIM_REPO_NAME}-*" | head -n1)"
-
-    if [ -z "$FETCHED_ROOT" ] || [ ! -f "$FETCHED_ROOT/install.sh" ]; then
-      echo "Could not locate fetched Verbatim installer." >&2
-      exit 1
-    fi
-
-    export VERBATIM_BOOTSTRAPPED=1
-    exec bash "$FETCHED_ROOT/install.sh" "$@"
-  fi
-
-  echo "Installer is missing required project files: app/, bin/, scripts/, requirements.txt" >&2
-  exit 1
-fi
-
-APP="$HOME/.local/share/kdictate-cosmic"
+APP="${KDICTATE_APPDIR:-$HOME/.local/share/kdictate-cosmic}"
 BIN="$HOME/.local/bin"
-LOG="$APP/install.log"
-SERVICE_DIR="$HOME/.config/systemd/user"
-AUTOSTART_DIR="$HOME/.config/autostart"
-DESKTOP_FILE="$AUTOSTART_DIR/kdictate-cosmic.desktop"
-SERVICE_FILE="$SERVICE_DIR/kdictate.service"
-
-mkdir -p "$APP" "$BIN" "$SERVICE_DIR" "$AUTOSTART_DIR"
-exec > >(tee -a "$LOG") 2>&1
-
-echo "Verbatim installer"
-echo "Target app dir: $APP"
-echo "Install log: $LOG"
-echo
-
-rm -f "$HOME/scan-whisper-dictation.sh"
-
-if [ "${XDG_SESSION_TYPE:-}" != "wayland" ]; then
-  echo "Notice: XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-unknown}. This package is built for COSMIC on Wayland."
-  echo "It can still install, but test it inside your COSMIC Wayland session."
-fi
-
-if ! command -v sudo >/dev/null 2>&1; then
-  echo "sudo is required for OS packages and input-device access setup." >&2
-  exit 1
-fi
-
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
+SERVICE_DIR="$CONFIG_DIR/systemd/user"
+mkdir -p "$APP" "$BIN" "$SERVICE_DIR" "$CONFIG_DIR/autostart"
+exec > >(tee -a "$APP/install.log") 2>&1
+printf 'Installing Verbatim with %s packages into %s\n' "$FAMILY" "$APP"
+command -v sudo >/dev/null || { echo 'sudo is required for system dependency setup.' >&2; exit 1; }
 sudo -v
-
-# Keep source builds from saturating the machine.
-# VERBATIM_BUILD_CPU_PERCENT=50 means use about 50% of logical CPU cores.
-# Example: 16 threads -> 8 build jobs.
-VERBATIM_BUILD_CPU_PERCENT="${VERBATIM_BUILD_CPU_PERCENT:-50}"
-CPU_THREADS="$(nproc 2>/dev/null || echo 1)"
-BUILD_JOBS="$(( CPU_THREADS * VERBATIM_BUILD_CPU_PERCENT / 100 ))"
-
-if [ "$BUILD_JOBS" -lt 1 ]; then
-  BUILD_JOBS=1
-fi
-
-echo "Build throttle: ${BUILD_JOBS}/${CPU_THREADS} parallel jobs (~${VERBATIM_BUILD_CPU_PERCENT}% CPU target)"
-
-export CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS"
-export MAKEFLAGS="-j${BUILD_JOBS}"
-export NINJAFLAGS="-j${BUILD_JOBS}"
-
-run_build() {
-  local cpu_last="$((BUILD_JOBS - 1))"
-
-  if command -v taskset >/dev/null 2>&1; then
-    if command -v ionice >/dev/null 2>&1; then
-      taskset -c "0-${cpu_last}" ionice -c 3 nice -n 10 "$@"
-    else
-      taskset -c "0-${cpu_last}" nice -n 10 "$@"
-    fi
-  else
-    if command -v ionice >/dev/null 2>&1; then
-      ionice -c 3 nice -n 10 "$@"
-    else
-      nice -n 10 "$@"
-    fi
-  fi
+packages() {
+  case "$FAMILY" in
+    apt) sudo apt-get install -y "$@" ;;
+    dnf) sudo dnf install -y "$@" ;;
+    pacman) sudo pacman -S --needed --noconfirm "$@" ;;
+  esac
 }
-
-echo
-echo "Detecting GPU backend..."
-GPU_BACKEND="cpu"
-GPU_NAME="unknown"
-
-if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-  GPU_BACKEND="nvidia"
-  GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1 || true)"
-elif command -v vulkaninfo >/dev/null 2>&1; then
-  GPU_LINE="$(vulkaninfo --summary 2>/dev/null | grep -m1 'deviceName' || true)"
-  if [ -n "$GPU_LINE" ]; then
-    GPU_BACKEND="vulkan"
-    GPU_NAME="$(printf '%s\n' "$GPU_LINE" | sed 's/.*= *//')"
-  fi
-else
-  # vulkan-tools will be installed below; after apt install we check again.
-  GPU_BACKEND="maybe-vulkan"
-fi
-
-echo "Detected GPU path: $GPU_BACKEND (${GPU_NAME:-unknown})"
-echo
-echo "Choose Whisper model:"
-echo "  1) Speed     base.en   ~142 MiB disk, ~388 MB memory"
-echo "  2) Balanced  small.en  ~466 MiB disk, ~852 MB memory [default]"
-echo "  3) Quality   large-v3  ~2.9 GiB disk, ~3.9 GB memory"
-
-MODEL_CHOICE="${VERBATIM_MODEL_CHOICE:-}"
-
-if [ -z "$MODEL_CHOICE" ]; then
-  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
-    printf "Selection [2]: " > /dev/tty
-    read -r MODEL_CHOICE < /dev/tty || true
-  else
-    echo "No interactive terminal detected; using Balanced [2]."
-    MODEL_CHOICE="2"
-  fi
-fi
-
-MODEL_CHOICE="${MODEL_CHOICE:-2}"
-
-case "$MODEL_CHOICE" in
-  1|speed|Speed|SPEED)
-    KDICTATE_MODEL="base.en"
-    KDICTATE_PROFILE="speed"
-    ;;
-  3|quality|Quality|QUALITY)
-    KDICTATE_MODEL="large-v3"
-    KDICTATE_PROFILE="quality"
-    ;;
-  2|balanced|Balanced|BALANCED|"")
-    KDICTATE_MODEL="small.en"
-    KDICTATE_PROFILE="balanced"
-    ;;
-  *)
-    echo "Unknown model selection '$MODEL_CHOICE'; using Balanced [2]."
-    KDICTATE_MODEL="small.en"
-    KDICTATE_PROFILE="balanced"
-    ;;
+# Stop the old daemon before replacing code. Keep the restoration journal and
+# lock inode intact, allowing an interrupted VR session to recover after update.
+if command -v systemctl >/dev/null; then systemctl --user stop kdictate.service || true; fi
+if [ -x "$BIN/kdictate" ]; then "$BIN/kdictate" quit >/dev/null 2>&1 || true; fi
+if [ "$FAMILY" = apt ]; then sudo apt-get update; fi
+read -r -a BASE_PACKAGES <<< "$(verbatim_packages "$FAMILY" base)"
+packages "${BASE_PACKAGES[@]}"
+# Keep the existing desktop's portal implementation. Install the matching one
+# only if missing; do not replace PipeWire/PulseAudio or the user's audio policy.
+DESKTOP="${XDG_CURRENT_DESKTOP:-${DESKTOP_SESSION:-}}"
+DESKTOP="${DESKTOP^^}"
+case "$DESKTOP" in
+  *GNOME*|*UBUNTU*) PORTAL='gnome' ;;
+  *KDE*|*PLASMA*) PORTAL='kde' ;;
+  *COSMIC*) PORTAL='cosmic' ;;
+  *) PORTAL='gtk' ;;
 esac
-
-echo "Selected: $KDICTATE_PROFILE ($KDICTATE_MODEL)"
-echo
-
-if ! grep -R "^[^#].* universe" /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources >/dev/null 2>&1; then
-  echo "Enabling Ubuntu universe repository for Vulkan/SPIR-V packages..."
-  sudo apt-get update
-  sudo apt-get install -y software-properties-common
-  sudo add-apt-repository -y universe || true
-fi
-
-echo "Installing OS packages..."
-sudo apt-get update
-sudo apt-get install -y \
-  acl \
-  build-essential \
-  libc6-dev \
-  curl \
-  ffmpeg \
-  git \
-  glslc \
-  spirv-headers \
-  spirv-tools \
-  vulkan-tools \
-  libvulkan1 \
-  libvulkan-dev \
-  gir1.2-atspi-2.0 \
-  gir1.2-gtk-4.0 \
-  libasound2-dev \
-  libgtk-4-1 \
-  libgtk-4-dev \
-  libportaudio2 \
-  libsndfile1 \
-  pkg-config \
-  valac \
-  portaudio19-dev \
-  pulseaudio-utils \
-  python3-cairo \
-  python3-dev \
-  python3-gi \
-  python3-gi-cairo \
-  python3-pip \
-  python3-venv \
-  wl-clipboard \
-  xdg-desktop-portal \
-  xdg-desktop-portal-gtk
-
-
-if [ "$GPU_BACKEND" = "maybe-vulkan" ] && command -v vulkaninfo >/dev/null 2>&1; then
-  GPU_LINE="$(vulkaninfo --summary 2>/dev/null | grep -m1 'deviceName' || true)"
-  if [ -n "$GPU_LINE" ]; then
-    GPU_BACKEND="vulkan"
-    GPU_NAME="$(printf '%s\n' "$GPU_LINE" | sed 's/.*= *//')"
-  else
-    GPU_BACKEND="cpu"
+if [ "$PORTAL" != cosmic ]; then
+  if ! packages "xdg-desktop-portal-$PORTAL"; then
+    echo "Desktop portal package unavailable; retaining the installed portal backend."
   fi
 fi
-
-# gtk4-layer-shell makes the overlay behave like a Wayland shell surface. On
-# current Pop/COSMIC builds it may already be present or available as a package;
-# if not, build the small upstream library from source.
-if ! ldconfig -p 2>/dev/null | grep -q 'libgtk4-layer-shell.so'; then
-  echo "Installing gtk4-layer-shell package if available..."
-  if apt-cache show libgtk4-layer-shell0 >/dev/null 2>&1; then
-    sudo apt-get install -y libgtk4-layer-shell0 gir1.2-gtk4layershell-1.0 || true
+PYTHON="${VERBATIM_PYTHON:-$(command -v python3)}"
+"$PYTHON" -c 'import gi,cairo; gi.require_version("Gtk","4.0"); from gi.repository import Gtk' || {
+  echo 'The selected Python must match the distribution PyGObject/GTK packages. Set VERBATIM_PYTHON to the system Python.' >&2; exit 1;
+}
+# Preserve model/appearance/mic preferences when updating. Never source config
+# as shell code; paths and tokens can contain spaces or shell punctuation.
+OLD_PROFILE="$("$PYTHON" - "$APP/config.env" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); data={}
+if p.exists():
+ for line in p.read_text().splitlines():
+  key,sep,value=line.partition('=')
+  if sep: data[key.strip()]=value.strip().strip('\"\'')
+profile=data.get('KDICTATE_PROFILE','')
+print(profile if profile in {'speed','balanced','quality'} else '')
+PY
+)"
+CHOICE="${VERBATIM_MODEL_CHOICE:-$OLD_PROFILE}"
+if [ -z "$CHOICE" ]; then
+  echo 'Model: 1 Speed (base.en), 2 Balanced (small.en, default), 3 Quality (large-v3).'
+  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    printf 'Selection [2]: ' >/dev/tty
+    read -r CHOICE </dev/tty || true
   fi
 fi
-
-if ! ldconfig -p 2>/dev/null | grep -q 'libgtk4-layer-shell.so'; then
-  echo "Building gtk4-layer-shell from source..."
-  sudo apt-get install -y \
-    meson \
-    ninja-build \
-    gobject-introspection \
-    libgirepository1.0-dev \
-    libwayland-dev \
-    wayland-protocols \
-    libc6-dev
-
-  # Some restored/custom systems can have build-essential installed while the
-  # libc development headers are missing or damaged. sys/cdefs.h comes from
-  # libc6-dev, so reinstall it before compiling optional layer-shell support.
-  sudo apt-get install -y --reinstall libc6-dev || true
-
-  TMP="$(mktemp -d)"
-  git clone --depth=1 https://github.com/wmww/gtk4-layer-shell.git "$TMP/gtk4-layer-shell"
-
-  if meson setup "$TMP/gtk4-layer-shell/build" "$TMP/gtk4-layer-shell" --prefix=/usr --buildtype=release \
-    && run_build ninja -C "$TMP/gtk4-layer-shell/build" -j"$BUILD_JOBS" \
-    && sudo ninja -C "$TMP/gtk4-layer-shell/build" install; then
-    sudo ldconfig
-    echo "gtk4-layer-shell installed."
-  else
-    echo
-    echo "Warning: gtk4-layer-shell could not be built on this system."
-    echo "Verbatim will continue with the normal GTK Wayland window fallback."
-    echo "The overlay may be positioned less perfectly, but dictation can still work."
-    echo
-  fi
-
-  rm -rf "$TMP"
-fi
-
-
-echo
-echo "Configuring transcription backend..."
-
-KDICTATE_BACKEND="faster-whisper"
-KDICTATE_DEVICE="cuda"
-KDICTATE_COMPUTE_TYPE="float16"
-KDICTATE_WHISPER_CPP_BIN=""
-KDICTATE_WHISPER_CPP_MODEL=""
-
-if [ "$GPU_BACKEND" = "nvidia" ]; then
-  echo "Using NVIDIA faster-whisper CUDA backend."
-else
-  echo "Using whisper.cpp backend for ${GPU_BACKEND}."
-  KDICTATE_BACKEND="whisper.cpp"
-  KDICTATE_DEVICE="cpu"
-  KDICTATE_COMPUTE_TYPE="int8"
-
-  sudo apt-get install -y cmake ninja-build glslc spirv-headers spirv-tools
-
-  WHISPER_CPP_DIR="$APP/whisper.cpp"
-  if [ ! -d "$WHISPER_CPP_DIR/.git" ]; then
-    rm -rf "$WHISPER_CPP_DIR"
-    git clone --depth=1 https://github.com/ggml-org/whisper.cpp.git "$WHISPER_CPP_DIR"
-  else
-    git -C "$WHISPER_CPP_DIR" pull --ff-only || true
-  fi
-
-  BUILD_DIR="$WHISPER_CPP_DIR/build"
-  
-  if [ "$GPU_BACKEND" = "vulkan" ]; then
-    echo "Building whisper.cpp with Vulkan."
-  
-    if cmake -S "$WHISPER_CPP_DIR" -B "$BUILD_DIR" -G Ninja \
-        -DGGML_VULKAN=ON \
-        -DCMAKE_BUILD_TYPE=Release \
-      && run_build cmake --build "$BUILD_DIR" -j"$BUILD_JOBS"; then
-      echo "whisper.cpp Vulkan build complete."
-    else
-      echo
-      echo "Warning: whisper.cpp Vulkan build failed on this system."
-      echo "Falling back to CPU whisper.cpp build so installation can still complete."
-      echo "GPU acceleration can be retried later after Vulkan/SPIR-V packages are corrected."
-      echo
-  
-      GPU_BACKEND="cpu"
-      rm -rf "$BUILD_DIR"
-  
-      cmake -S "$WHISPER_CPP_DIR" -B "$BUILD_DIR" -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release
-  
-      run_build cmake --build "$BUILD_DIR" -j"$BUILD_JOBS"
-    fi
-  else
-    echo "Building whisper.cpp CPU fallback."
-  
-    cmake -S "$WHISPER_CPP_DIR" -B "$BUILD_DIR" -G Ninja \
-      -DCMAKE_BUILD_TYPE=Release
-  
-    run_build cmake --build "$BUILD_DIR" -j"$BUILD_JOBS"
-  fi
-
-  mkdir -p "$APP/models"
-  if [ ! -f "$APP/models/ggml-$KDICTATE_MODEL.bin" ]; then
-    "$WHISPER_CPP_DIR/models/download-ggml-model.sh" "$KDICTATE_MODEL" "$APP/models"
-  fi
-
-  KDICTATE_WHISPER_CPP_BIN="$WHISPER_CPP_DIR/build/bin/whisper-cli"
-  KDICTATE_WHISPER_CPP_MODEL="$APP/models/ggml-$KDICTATE_MODEL.bin"
-fi
-
-mkdir -p "$APP"
-cat > "$APP/config.env" <<CONFIG
-KDICTATE_BACKEND=$KDICTATE_BACKEND
-KDICTATE_MODEL=$KDICTATE_MODEL
-KDICTATE_PROFILE=$KDICTATE_PROFILE
-KDICTATE_DEVICE=$KDICTATE_DEVICE
-KDICTATE_COMPUTE_TYPE=$KDICTATE_COMPUTE_TYPE
-KDICTATE_WHISPER_CPP_BIN=$KDICTATE_WHISPER_CPP_BIN
-KDICTATE_WHISPER_CPP_MODEL=$KDICTATE_WHISPER_CPP_MODEL
-KDICTATE_MIC_DEVICE=
-KDICTATE_WIVRN_AUTO_AUDIO=1
-KDICTATE_WIVRN_PAUSE_EASYEFFECTS=1
-KDICTATE_REALTIME_TRANSCRIPTION=1
-KDICTATE_REALTIME_SILENCE_TO_FINISH_SECONDS=2.85
-CONFIG
-
-echo "Backend config written to $APP/config.env"
-cat "$APP/config.env"
-echo
-echo "Copying Verbatim files..."
-rm -rf "$APP/app" "$APP/scripts" "$APP/systemd" "$APP/docs"
-mkdir -p "$APP"
-
-cp -a "$ROOT/app" "$APP/app"
-cp -a "$ROOT/scripts" "$APP/scripts"
-chmod +x "$APP/scripts/"*.sh "$APP/scripts/"*.py "$APP/scripts/verbatim-wayvr" 2>/dev/null || true
-cp -a "$ROOT/systemd" "$APP/systemd"
+case "${CHOICE:-2}" in
+  1|speed) MODEL=base.en; PROFILE=speed ;;
+  3|quality) MODEL=large-v3; PROFILE=quality ;;
+  2|balanced) MODEL=small.en; PROFILE=balanced ;;
+  *) echo 'Invalid model selection.' >&2; exit 1 ;;
+esac
+CPU_THREADS="$(nproc 2>/dev/null || echo 1)"
+PERCENT="${VERBATIM_BUILD_CPU_PERCENT:-50}"
+[[ "$PERCENT" =~ ^[0-9]+$ ]] && [ "$PERCENT" -ge 1 ] && [ "$PERCENT" -le 100 ] || { echo 'Build CPU percent must be 1–100.' >&2; exit 1; }
+BUILD_JOBS=$((CPU_THREADS * PERCENT / 100)); [ "$BUILD_JOBS" -gt 0 ] || BUILD_JOBS=1
+export CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS"
+build() { nice -n 10 "$@"; }
+# Copy only application-owned trees. Config, models, recovery files, and journal
+# remain intact. Installing this bundle never fetches an unpatched app from main.
+for tree in app scripts systemd native; do
+  mkdir -p "$APP/$tree"
+  cp -a "$ROOT/$tree/." "$APP/$tree/"
+done
 cp "$ROOT/requirements.txt" "$APP/requirements.txt"
 install -m 0755 "$ROOT/bin/kdictate" "$BIN/kdictate"
-
-if [ -f "$ROOT/scripts/verbatim-wayvr" ]; then
-  install -m 0755 "$ROOT/scripts/verbatim-wayvr" "$BIN/verbatim-wayvr"
+install -m 0755 "$ROOT/scripts/verbatim-wayvr" "$BIN/verbatim-wayvr"
+install -m 0755 "$ROOT/scripts/verbatim-session" "$BIN/verbatim-session"
+install -m 0644 "$ROOT/systemd/kdictate.service" "$SERVICE_DIR/kdictate.service"
+# Small local blur bridge: native COSMIC/GNOME protocol and KDE's blur protocol.
+if ! bash "$APP/native/build.sh"; then
+  echo 'Native blur bridge failed to build; real local screen blur remains available. See install.log.'
 fi
-
-# Optional repo files.
-if [ -d "$ROOT/docs" ]; then
-  cp -a "$ROOT/docs" "$APP/docs"
+# Layer shell avoids input focus changes on COSMIC/KDE. Mint X11 uses native
+# nonfocus hints. GNOME uses a nonfocusable regular window and hides before paste.
+if [ "$FAMILY" = apt ]; then
+  if apt-cache show libgtk4-layer-shell0 >/dev/null 2>&1; then
+    packages libgtk4-layer-shell0 gir1.2-gtk4layershell-1.0 || true
+  fi
+  if [[ "$DESKTOP" == *COSMIC* || "$DESKTOP" == *KDE* || "$DESKTOP" == *PLASMA* ]] && ! ldconfig -p 2>/dev/null | grep -q 'libgtk4-layer-shell'; then
+    read -r -a LAYER_PACKAGES <<< "$(verbatim_packages "$FAMILY" layer)"
+    packages "${LAYER_PACKAGES[@]}"
+    LAYER_BUILD="$(mktemp -d)"
+    if git clone --depth=1 https://github.com/wmww/gtk4-layer-shell.git "$LAYER_BUILD/source" &&
+       meson setup "$LAYER_BUILD/build" "$LAYER_BUILD/source" --prefix="$APP/native/layer" --libdir=lib -Dexamples=false -Ddocs=false -Dtests=false &&
+       build ninja -C "$LAYER_BUILD/build" -j"$BUILD_JOBS" && ninja -C "$LAYER_BUILD/build" install; then
+      echo 'Local GTK4 layer-shell support installed.'
+    else
+      echo 'Layer-shell build unavailable; continuing with the GTK window backend.'
+    fi
+    rm -rf -- "$LAYER_BUILD"
+  fi
+fi
+GPU=cpu
+if command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1; then GPU=nvidia; fi
+BACKEND=faster-whisper; DEVICE=cpu; COMPUTE=int8; CPP_BIN=''; CPP_MODEL=''
+if [ "$GPU" = nvidia ]; then
+  DEVICE=cuda; COMPUTE=float16
 else
-  mkdir -p "$APP/docs"
+  read -r -a VULKAN_PACKAGES <<< "$(verbatim_packages "$FAMILY" vulkan)"
+  if packages "${VULKAN_PACKAGES[@]}"; then
+    # Software Vulkan adapters (llvmpipe/lavapipe) are not hardware acceleration.
+    if timeout 10 vulkaninfo --summary 2>/dev/null | sed -n '/deviceType.*DISCRETE_GPU\|deviceType.*INTEGRATED_GPU/p' | head -1 | grep -q .; then GPU=vulkan; fi
+  fi
+  if [ "$GPU" = vulkan ]; then
+    BACKEND=whisper.cpp
+    CPP_DIR="$APP/whisper.cpp"
+    if [ ! -d "$CPP_DIR/.git" ]; then git clone --depth=1 https://github.com/ggml-org/whisper.cpp.git "$CPP_DIR"; fi
+    if cmake -S "$CPP_DIR" -B "$CPP_DIR/build" -G Ninja -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release && build cmake --build "$CPP_DIR/build" -j"$BUILD_JOBS"; then
+      CPP_BIN="$CPP_DIR/build/bin/whisper-cli"
+      CPP_MODEL="$APP/models/ggml-$MODEL.bin"
+      mkdir -p "$APP/models"
+      if [ ! -s "$CPP_MODEL" ]; then "$CPP_DIR/models/download-ggml-model.sh" "$MODEL" "$APP/models"; fi
+    else
+      echo 'Vulkan build failed; using faster-whisper CPU instead.'
+      BACKEND=faster-whisper; CPP_BIN=''; CPP_MODEL=''
+    fi
+  fi
 fi
-
-if [ -f "$ROOT/README.md" ]; then
-  cp "$ROOT/README.md" "$APP/README.md"
-fi
-
-echo "Creating Python environment..."
-/usr/bin/python3 -m venv --system-site-packages "$APP/venv"
+"$PYTHON" -m venv --system-site-packages "$APP/venv"
 "$APP/venv/bin/python" -m pip install --upgrade pip wheel setuptools
-"$APP/venv/bin/pip" install -r "$APP/requirements.txt"
-
-echo "Configuring local input injection and manual-typing detection..."
-sudo modprobe uinput || true
-echo uinput | sudo tee /etc/modules-load.d/kdictate-uinput.conf >/dev/null
-sudo tee /etc/udev/rules.d/80-kdictate-uinput.rules >/dev/null <<'RULES'
-KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
-KERNEL=="event*", SUBSYSTEM=="input", GROUP="input", MODE="0640"
+CORE_REQUIREMENTS="$(mktemp)"
+trap 'rm -f -- "$CORE_REQUIREMENTS"' EXIT
+sed '/^faster-whisper/d' "$APP/requirements.txt" >"$CORE_REQUIREMENTS"
+"$APP/venv/bin/python" -m pip install -r "$CORE_REQUIREMENTS"
+if ! "$APP/venv/bin/python" -m pip install 'faster-whisper>=1.1.1,<2'; then
+  echo 'No compatible faster-whisper runtime; enabling native whisper.cpp CPU fallback.'
+  if [ "$BACKEND" != whisper.cpp ]; then
+    CPP_DIR="$APP/whisper.cpp"
+    if [ ! -d "$CPP_DIR/.git" ]; then git clone --depth=1 https://github.com/ggml-org/whisper.cpp.git "$CPP_DIR"; fi
+    cmake -S "$CPP_DIR" -B "$CPP_DIR/build-cpu" -G Ninja -DGGML_VULKAN=OFF -DCMAKE_BUILD_TYPE=Release
+    build cmake --build "$CPP_DIR/build-cpu" -j"$BUILD_JOBS"
+    BACKEND=whisper.cpp; DEVICE=cpu; COMPUTE=int8
+    CPP_BIN="$CPP_DIR/build-cpu/bin/whisper-cli"; CPP_MODEL="$APP/models/ggml-$MODEL.bin"
+    mkdir -p "$APP/models"
+    if [ ! -s "$CPP_MODEL" ]; then "$CPP_DIR/models/download-ggml-model.sh" "$MODEL" "$APP/models"; fi
+  fi
+fi
+if [ "$GPU" = nvidia ] && [ "$BACKEND" = faster-whisper ]; then
+  "$APP/venv/bin/python" -m pip install 'nvidia-cublas-cu12>=12.4,<13' 'nvidia-cudnn-cu12>=9,<10'
+fi
+"$PYTHON" - "$APP/config.env" "$BACKEND" "$MODEL" "$PROFILE" "$DEVICE" "$COMPUTE" "$CPP_BIN" "$CPP_MODEL" <<'PY'
+from pathlib import Path
+import os,sys,tempfile
+path=Path(sys.argv[1]); keys=['KDICTATE_BACKEND','KDICTATE_MODEL','KDICTATE_PROFILE','KDICTATE_DEVICE','KDICTATE_COMPUTE_TYPE','KDICTATE_WHISPER_CPP_BIN','KDICTATE_WHISPER_CPP_MODEL']
+updates=dict(zip(keys,sys.argv[2:])); data={}
+if path.exists():
+ for line in path.read_text().splitlines():
+  key,sep,value=line.partition('=')
+  if sep and not key.lstrip().startswith('#'): data[key.strip()]=value.strip()
+data.update(updates)
+for key,value in {'KDICTATE_THEME':'glass-dark','KDICTATE_MIC_DEVICE':'','KDICTATE_WIVRN_AUTO_AUDIO':'1','KDICTATE_WIVRN_PAUSE_EASYEFFECTS':'1','KDICTATE_REALTIME_TRANSCRIPTION':'1','KDICTATE_REALTIME_SILENCE_TO_FINISH_SECONDS':'2.85'}.items(): data.setdefault(key,value)
+fd,tmp=tempfile.mkstemp(prefix='config-',dir=path.parent)
+with os.fdopen(fd,'w') as f:
+ f.write(''.join(f'{k}={v}\n' for k,v in data.items())); f.flush(); os.fsync(f.fileno())
+os.replace(tmp,path)
+PY
+# Seat-scoped access instead of changing permissions on every input device or
+# adding the user to a group with unrestricted access to all input hardware.
+sudo modprobe uinput
+printf 'uinput\n' | sudo tee /etc/modules-load.d/verbatim-uinput.conf >/dev/null
+sudo tee /etc/udev/rules.d/70-verbatim-input.rules >/dev/null <<'RULES'
+KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}=="1", TAG+="uaccess"
 RULES
-sudo usermod -aG input "$USER" || true
-sudo udevadm control --reload-rules || true
-sudo udevadm trigger || true
-sudo setfacl -m "u:$USER:rw" /dev/uinput 2>/dev/null || true
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=misc --sysname-match=uinput
+sudo udevadm trigger --subsystem-match=input
+sudo setfacl -m "u:$(id -u):rw" /dev/uinput || true
 for dev in /dev/input/event*; do
   [ -e "$dev" ] || continue
-  sudo setfacl -m "u:$USER:r" "$dev" 2>/dev/null || true
+  if udevadm info --query=property --name="$dev" | grep -qx 'ID_INPUT_KEYBOARD=1'; then sudo setfacl -m "u:$(id -u):r" "$dev" || true; fi
 done
-
-if command -v systemctl >/dev/null 2>&1; then
-  echo "Installing user service..."
-  install -m 0644 "$ROOT/systemd/kdictate.service" "$SERVICE_FILE"
-  systemctl --user daemon-reload || true
-  systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DISPLAY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR PATH || true
-  systemctl --user enable kdictate.service || true
-  systemctl --user start kdictate.service || true
-fi
-
-rm -f "$DESKTOP_FILE"
-
-echo "Registering Super+V desktop shortcut..."
-if [ -f "$APP/scripts/register_desktop_shortcut.py" ]; then
-  "$APP/venv/bin/python" "$APP/scripts/register_desktop_shortcut.py" "$HOME/.local/bin/kdictate toggle" || true
+# Desktop autostart imports the exact environment at every login. systemd keeps
+# the model warm and follows graphical-session lifetime on supporting desktops.
+"$PYTHON" - "$CONFIG_DIR/autostart/kdictate-cosmic.desktop" "$BIN/verbatim-session" <<'PY'
+from pathlib import Path
+import sys
+command='"'+sys.argv[2].replace('\\','\\\\').replace('"','\\"').replace('`','\\`').replace('$','\\$')+'"'
+Path(sys.argv[1]).write_text('[Desktop Entry]\nType=Application\nName=Verbatim\nExec='+command+'\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n')
+PY
+SHORTCUT_COMMAND="$("$PYTHON" - "$BIN/kdictate" <<'PY'
+import shlex,sys
+print(shlex.join([sys.argv[1],'toggle']))
+PY
+)"
+SHORTCUT_READY=0
+if "$APP/venv/bin/python" "$APP/scripts/register_desktop_shortcut.py" "$SHORTCUT_COMMAND"; then
+  SHORTCUT_READY=1
 else
-  "$APP/venv/bin/python" "$APP/scripts/register_cosmic_shortcut.py" "$HOME/.local/bin/kdictate toggle" || true
+  echo 'Shortcut setup needs attention; see the message above.'
 fi
-
-echo "Installing WayVR integration if possible..."
-if [ -f "$APP/scripts/install_wayvr_integration.sh" ]; then
-  chmod +x "$APP/scripts/install_wayvr_integration.sh" || true
-
-  if command -v wayvr >/dev/null 2>&1 || command -v wayvrctl >/dev/null 2>&1 || pgrep -f 'WayVR.AppImage|/wayvr|wayvr' >/dev/null 2>&1 || [ -d "$HOME/.config/wayvr" ]; then
-    bash "$APP/scripts/install_wayvr_integration.sh" || true
-  else
-    echo "WayVR not detected. Skipping WayVR watch/keyboard integration."
-    echo "After installing or launching WayVR once, run:"
-    echo "  bash $APP/scripts/install_wayvr_integration.sh"
-  fi
+if command -v wayvr >/dev/null || command -v wayvrctl >/dev/null || [ -d "$CONFIG_DIR/wayvr" ]; then
+  bash "$APP/scripts/install_wayvr_integration.sh" || echo 'WayVR custom UI was not changed; review install.log.'
+fi
+"$BIN/verbatim-session"
+READY=0
+for attempt in {1..40}; do
+  if "$BIN/kdictate" status >/dev/null 2>&1; then READY=1; break; fi
+  sleep 0.5
+done
+if [ "$READY" != 1 ]; then
+  echo "Daemon startup failed. See $APP/kdictate.log and journalctl --user -u kdictate.service." >&2
+  exit 1
+fi
+"$BIN/kdictate" doctor
+"$BIN/kdictate" warmup
+if [ "$SHORTCUT_READY" = 1 ]; then
+  printf '\nInstalled. Press Super+V in a text field, speak, then pause.\n'
 else
-  echo "WayVR integration script missing from installed app files."
+  printf '\nInstalled. Assign a free keyboard shortcut to: %s\n' "$SHORTCUT_COMMAND"
 fi
-
-wait_for_daemon() {
-  local label="$1"
-  local deadline=$((SECONDS + 25))
-
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    if "$BIN/kdictate" status >/dev/null 2>&1; then
-      echo "Daemon is running ($label)."
-      return 0
-    fi
-    sleep 0.5
-  done
-
-  return 1
-}
-
-echo "Restarting daemon..."
-
-# Ask a running daemon to exit.
-"$BIN/kdictate" quit >/dev/null 2>&1 || true
-sleep 0.5
-
-# Stop systemd service if present.
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl --user stop kdictate.service >/dev/null 2>&1 || true
-fi
-
-# Kill legacy/stray daemons from older installer versions.
-pkill -f "$APP/app/kdictate.py daemon" >/dev/null 2>&1 || true
-pkill -f '/kdictate-cosmic/app/kdictate.py daemon' >/dev/null 2>&1 || true
-
-# Remove stale runtime files after old daemons are gone.
-rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/kdictate.sock"
-rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/kdictate.daemon.lock"
-
-sleep 0.5
-
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl --user daemon-reload || true
-  systemctl --user import-environment \
-    WAYLAND_DISPLAY \
-    XDG_CURRENT_DESKTOP \
-    XDG_SESSION_TYPE \
-    DISPLAY \
-    DBUS_SESSION_BUS_ADDRESS \
-    XDG_RUNTIME_DIR \
-    PATH || true
-
-  systemctl --user enable kdictate.service >/dev/null 2>&1 || true
-  systemctl --user start kdictate.service || true
-fi
-
-if ! wait_for_daemon "systemd user service"; then
-  echo "Systemd user service did not come up; trying direct user daemon fallback..."
-
-  nohup "$BIN/kdictate" daemon >> "$APP/kdictate.log" 2>&1 &
-  sleep 1
-
-  if ! wait_for_daemon "direct fallback"; then
-    echo
-    echo "ERROR: Verbatim installed, but the daemon did not start."
-    echo
-    echo "Run these commands and include the output in a bug report:"
-    echo "  kdictate status"
-    echo "  systemctl --user status kdictate.service --no-pager -l"
-    echo "  journalctl --user -u kdictate.service -n 120 --no-pager"
-    echo "  tail -160 $APP/kdictate.log"
-    echo
-    exit 1
-  fi
-fi
-
-echo "Running doctor..."
-"$BIN/kdictate" doctor || true
-
-echo
-echo "Warming Whisper $KDICTATE_MODEL with backend $KDICTATE_BACKEND."
-if ! "$BIN/kdictate" warmup; then
-  echo
-  echo "Warning: warmup failed, but the daemon is running."
-  echo "The first dictation may take longer while the backend initializes."
-fi
-
-echo
-echo "Verifying manual launch..."
-if "$BIN/kdictate" start >/dev/null 2>&1; then
-  echo "Manual launch test: ok"
-  "$BIN/kdictate" cancel >/dev/null 2>&1 || true
-else
-  echo
-  echo "Warning: daemon is running, but manual launch did not return ok."
-  echo "Check logs: $APP/kdictate.log"
-fi
-
-echo
-echo "Install complete."
-echo "Use: press Super+V in a text field, speak, then pause."
-echo "Manual test command: kdictate start"
-echo "Status command: kdictate status"
-echo "Logs: $APP/kdictate.log"
-echo
-echo "If Super+V does not work immediately, run:"
-echo "  kdictate start"
-echo
-echo "If kdictate start works but Super+V does not, COSMIC accepted the shortcut file but has not activated it yet."
-echo "Log out and back in once, or open COSMIC Settings > Input devices > Keyboard > Keyboard shortcuts and confirm Super+V."
-echo
-echo "Important: if doctor reports /dev/uinput or /dev/input permission problems, log out and back in once."
-echo "That refreshes the new input group membership."
+printf 'Theme defaults to Glass dark; Appearance offers four themes.\nRecovery command: kdictate last-transcript\n'
