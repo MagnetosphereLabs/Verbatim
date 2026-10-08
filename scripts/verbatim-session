@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+KDICTATE_BIN="${KDICTATE_BIN:-$HOME/.local/bin/kdictate}"
+if command -v systemctl >/dev/null 2>&1; then
+  session_vars=()
+  for key in DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR PATH; do
+    if [ -n "${!key:-}" ]; then session_vars+=("$key"); fi
+  done
+  # Remove the previous login's display fields before importing this login.
+  systemctl --user unset-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_SESSION_TYPE || true
+  if [ "${#session_vars[@]}" -gt 0 ]; then systemctl --user import-environment "${session_vars[@]}" || true; fi
+  systemctl --user daemon-reload || true
+  systemctl --user enable kdictate.service || true
+  if systemctl --user restart kdictate.service; then exit 0; fi
+fi
+# No user-systemd session: same single-instance daemon, exact desktop environment.
+nohup "$KDICTATE_BIN" daemon >/dev/null 2>&1 &
