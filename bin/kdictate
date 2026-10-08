@@ -1,53 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 APP="${KDICTATE_APPDIR:-$HOME/.local/share/kdictate-cosmic}"
-if [ -f "$APP/config.env" ]; then
-  set -a
-  . "$APP/config.env"
-  set +a
-fi
-
-APP="${KDICTATE_APPDIR:-$HOME/.local/share/kdictate-cosmic}"
-VENV="$APP/venv"
-CUDA_LIB_PATH="$(find "$VENV/lib" -type d \( -path "*/nvidia/cublas/lib" -o -path "*/nvidia/cudnn/lib" -o -path "*/nvidia/cuda_nvrtc/lib" \) -print 2>/dev/null | paste -sd: - || true)"
-if [ -n "$CUDA_LIB_PATH" ]; then
-  export LD_LIBRARY_PATH="$CUDA_LIB_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-fi
-
-export GI_TYPELIB_PATH="/usr/local/lib/x86_64-linux-gnu/girepository-1.0:/usr/local/lib/girepository-1.0:/usr/lib/x86_64-linux-gnu/girepository-1.0:${GI_TYPELIB_PATH:-}"
-export LD_LIBRARY_PATH="/usr/local/lib/x86_64-linux-gnu:/usr/local/lib:${LD_LIBRARY_PATH:-}"
-
-APP="${KDICTATE_APPDIR:-$HOME/.local/share/kdictate-cosmic}"
 PY="$APP/venv/bin/python"
-
 if [ ! -x "$PY" ]; then
-  echo "KDictate is not installed yet. Run ./install.sh from the extracted package." >&2
+  echo 'Verbatim is not installed. Extract the complete bundle and run bash install.sh.' >&2
   exit 127
 fi
-
-LIB_PATH="$($PY - <<'PY' 2>/dev/null || true
-import os
-paths = []
-for modname in ("nvidia.cublas.lib", "nvidia.cudnn.lib"):
-    try:
-        mod = __import__(modname, fromlist=["__file__"])
-        p = os.path.dirname(mod.__file__)
-        if p and p not in paths:
-            paths.append(p)
-    except Exception:
-        pass
-print(":".join(paths))
-PY
-)"
-
-if [ -n "$LIB_PATH" ]; then
-  export LD_LIBRARY_PATH="$LIB_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# config.env is read as data by Python, never evaluated as shell commands.
+CUDA_PATH="$(find "$APP/venv/lib" -type d \( -path '*/nvidia/cublas/lib' -o -path '*/nvidia/cudnn/lib' \) -print 2>/dev/null | paste -sd: - || true)"
+if [ -n "$CUDA_PATH" ]; then export LD_LIBRARY_PATH="$CUDA_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; fi
+# Local optional layer shell uses one portable prefix, including Fedora lib64.
+for root in "$APP/native/layer/lib" "$APP/native/layer/lib64" /usr/local/lib /usr/local/lib64; do
+  if [ -d "$root/girepository-1.0" ]; then export GI_TYPELIB_PATH="$root/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"; fi
+  if [ -d "$root" ]; then export LD_LIBRARY_PATH="$root${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; fi
+done
+if [ "${XDG_SESSION_TYPE:-}" = wayland ] || { [ -n "${WAYLAND_DISPLAY:-}" ] && [ "${XDG_SESSION_TYPE:-}" != x11 ]; }; then
+  LS_LIB=''
+  for candidate in "$APP/native/layer/lib/libgtk4-layer-shell.so.0" "$APP/native/layer/lib64/libgtk4-layer-shell.so.0"; do
+    if [ -f "$candidate" ]; then LS_LIB="$candidate"; break; fi
+  done
+  if [ -z "$LS_LIB" ]; then LS_LIB="$(ldconfig -p 2>/dev/null | awk '/libgtk4-layer-shell.so/ && !found {print $NF; found=1}' || true)"; fi
+  if [ -n "$LS_LIB" ]; then export LD_PRELOAD="$LS_LIB${LD_PRELOAD:+:$LD_PRELOAD}"; fi
 fi
-
-LS_LIB="$(ldconfig -p 2>/dev/null | awk '/libgtk4-layer-shell.so/ && !found {print $NF; found=1}' || true)"
-if [ -n "$LS_LIB" ]; then
-  export LD_PRELOAD="$LS_LIB${LD_PRELOAD:+:$LD_PRELOAD}"
-fi
-
 export KDICTATE_APPDIR="$APP"
-exec "$PY" "$APP/app/kdictate.py" "${@:-toggle}"
+if [ "$#" -eq 0 ]; then set -- toggle; fi
+exec "$PY" "$APP/app/kdictate.py" "$@"
