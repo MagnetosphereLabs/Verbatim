@@ -23,6 +23,7 @@ import json
 import os
 import queue
 import select
+import shlex
 import signal
 import socket
 import shutil
@@ -39,6 +40,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 APP_NAME = "KDictate"
+REPAIR_REVISION = "2026-10-08-routing-focus"
 APP_ID = "dev.kdictate.Cosmic"
 APP_DIR = Path(os.environ.get("KDICTATE_APPDIR", Path.home() / ".local/share/kdictate-cosmic")).expanduser()
 LOG_FILE = APP_DIR / "kdictate.log"
@@ -251,75 +253,72 @@ def _pactl_default(kind: str) -> str:
     return ""
 
 
-def _pactl_nodes(kind: str) -> list[dict[str, str]]:
-    # Machine-readable properties preserve identities and avoid localized parsing.
+def _pactl_list(kind: str) -> list[dict]:
+    """Keep device indices/properties on both PulseAudio protocol formats."""
     result = _pactl(["--format=json", "list", kind], timeout=2.0)
     if result is not None and result.returncode == 0:
         try:
-            nodes = []
-            for item in json.loads(result.stdout):
-                props = item.get("properties", {})
-                name = str(item.get("name", ""))
-                if kind == "sources" and (name.endswith(".monitor") or
-                        item.get("monitor_of_sink") not in {None, "n/a", 4294967295}):
-                    continue
-                nodes.append({"name": name,
-                    "label": str(item.get("description") or name),
-                    "description": str(item.get("description") or name),
-                    "properties": props,
-                    "index": str(item.get("index", ""))})
-            return nodes
+            items = json.loads(result.stdout)
+            if isinstance(items, list) and all(isinstance(item, dict) for item in items):
+                return items
         except (ValueError, TypeError, AttributeError):
             pass
-    # kind is "sources" or "sinks". The long form includes the friendly
-    # descriptions shown by desktop audio UIs, unlike PortAudio's generic
-    # "pulse" / "pipewire" bridge names.
     proc = _pactl(["list", kind], timeout=4.0)
     if proc is None or proc.returncode != 0:
         return []
-
-    nodes: list[dict[str, str]] = []
-    current: dict[str, str] = {}
-
-    def flush() -> None:
-        if current.get("name"):
-            name = current.get("name", "")
-            desc = current.get("description", "") or name
-            nodes.append({"name": name, "label": desc, "description": desc})
-
-    header = "Source #" if kind == "sources" else "Sink #"
-
+    headers = {"sources": "Source #", "sinks": "Sink #",
+               "source-outputs": "Source Output #", "sink-inputs": "Sink Input #"}
+    items, current = [], None
     for raw in proc.stdout.splitlines():
         line = raw.strip()
-
-        if line.startswith(header):
-            flush()
-            current = {}
+        if line.startswith(headers[kind]):
+            current = {"index": line.split("#", 1)[1].strip(), "properties": {}}
+            items.append(current)
             continue
+        if current is None:
+            continue
+        if " = " in line:
+            key, value = line.split(" = ", 1)
+            try:
+                value = json.loads(value)
+            except ValueError:
+                value = value.strip('"')
+            current["properties"][key] = value
+        elif ":" in line:
+            key, value = line.split(":", 1)
+            mapped = {"Name": "name", "Description": "description", "Source": "source",
+                      "Sink": "sink", "Monitor of Sink": "monitor_of_sink"}.get(key)
+            if mapped:
+                current[mapped] = value.strip()
+    return items
 
-        if line.startswith("Name:"):
-            current["name"] = line.split(":", 1)[1].strip()
-        elif line.startswith("Description:"):
-            current["description"] = line.split(":", 1)[1].strip()
-        elif line.startswith("node.description =") and not current.get("description"):
-            current["description"] = line.split("=", 1)[1].strip().strip('"')
 
-    flush()
-
-    if kind == "sources":
-        filtered = []
-        for node in nodes:
-            hay = f"{node.get('name', '')} {node.get('label', '')}".lower()
-            if node.get("name", "").endswith(".monitor") or "monitor" in hay:
-                continue
-            filtered.append(node)
-        return filtered
-
+def _pactl_nodes(kind: str) -> list[dict]:
+    nodes = []
+    for item in _pactl_list(kind):
+        props = item.get("properties") or {}
+        name = str(item.get("name") or props.get("node.name") or "")
+        # pactl versions use monitor_source or monitor_of_sink; invalid indices
+        # appear as either a number or text. A mic named "monitoring" is a mic.
+        no_monitor = {None, "", "n/a", -1, "-1", 4294967295, "4294967295"}
+        if kind == "sources" and (name.endswith(".monitor") or
+                item.get("monitor_source") not in no_monitor or
+                item.get("monitor_of_sink") not in no_monitor):
+            continue
+        if not name:
+            continue
+        description = str(item.get("description") or props.get("node.description") or
+                          props.get("device.description") or name)
+        nodes.append({"name": name, "label": description, "description": description,
+                      "properties": props, "index": str(item.get("index", ""))})
     return nodes
 
 
 def _is_wivrn_node(node: dict[str, str]) -> bool:
-    hay = f"{node.get('name', '')} {node.get('label', '')} {node.get('description', '')}".lower()
+    props = node.get("properties") or {}
+    hay = " ".join(str(value) for value in (node.get('name', ''), node.get('label', ''),
+        node.get('description', ''), props.get('application.name', ''), props.get('node.name', ''),
+        props.get('node.description', ''), props.get('device.description', ''))).lower()
     return "wivrn" in hay
 
 
@@ -899,8 +898,67 @@ class WiVRnTruth:
         self.bus = None
         self.last_error = ""
         self.owner = ""
+        self.server_buses = []
+        self.next_bus_scan = 0.0
+
+    def _server_bus_addresses(self) -> list[str]:
+        # A launcher can give WiVRn a separate session bus. Read only the bus
+        # address of this user's actual server, then query the same property.
+        # Process presence is never treated as a connected headset.
+        if time.monotonic() < self.next_bus_scan:
+            return self.server_buses
+        self.next_bus_scan = time.monotonic() + 5.0
+        addresses = []
+        try:
+            for process in Path("/proc").iterdir():
+                if not process.name.isdigit():
+                    continue
+                try:
+                    if process.stat().st_uid != os.getuid():
+                        continue
+                    executable = (process / "cmdline").read_bytes().split(b"\0", 1)[0]
+                    if Path(os.fsdecode(executable)).name != "wivrn-server":
+                        continue
+                    for entry in (process / "environ").read_bytes().split(b"\0"):
+                        if entry.startswith(b"DBUS_SESSION_BUS_ADDRESS="):
+                            address = os.fsdecode(entry.partition(b"=")[2])
+                            if all(part.startswith("unix:") for part in address.split(";")) and address != os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+                                addresses.append(address)
+                            break
+                except (OSError, ValueError):
+                    continue
+        except OSError:
+            pass
+        self.server_buses = list(dict.fromkeys(addresses))
+        return self.server_buses
+
+    def _accept(self, owner: str, connected: bool) -> bool | None:
+        changed = bool(self.owner and self.owner != owner)
+        self.owner = owner
+        self.last_error = ""
+        return None if changed else connected
+
+    def _busctl_query(self, address: str = "") -> tuple[str, bool]:
+        """Independent transport for the same property, never a process heuristic."""
+        prefix = ["busctl", "--address=" + address if address else "--user", "--no-pager", "--timeout=1"]
+        owner = run(prefix + ["call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
+            "org.freedesktop.DBus", "GetNameOwner", "s", "io.github.wivrn.Server"], timeout=1.5,
+            env={**os.environ, "LC_ALL": "C"})
+        if owner.returncode:
+            if any(s in owner.stderr for s in ("NameHasNoOwner", "ServiceUnknown", "does not exist", "not provided", "no such name")):
+                return "", False
+            raise RuntimeError(owner.stderr.strip() or "Cannot read the session bus")
+        fields = shlex.split(owner.stdout)
+        if len(fields) != 2 or fields[0] != "s" or not fields[1].startswith(":"):
+            raise ValueError("Unexpected WiVRn bus owner reply")
+        value = run(prefix + ["get-property", fields[1], "/io/github/wivrn/Server",
+            "io.github.wivrn.Server", "HeadsetConnected"], timeout=1.5, env={**os.environ, "LC_ALL": "C"})
+        if value.returncode or value.stdout.strip() not in {"b true", "b false"}:
+            raise RuntimeError(value.stderr.strip() or "Invalid HeadsetConnected reply")
+        return (address + "|" if address else "") + fields[1], value.stdout.strip() == "b true"
 
     def read(self) -> bool | None:
+        result, errors = None, []
         try:
             from gi.repository import Gio, GLib
             if self.bus is None or self.bus.is_closed():
@@ -910,27 +968,46 @@ class WiVRnTruth:
                 GLib.Variant("(s)", ("io.github.wivrn.Server",)),
                 GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE, 750, None)
             current_owner = owner.unpack()[0]
-            if self.owner and self.owner != current_owner:
-                self.owner = current_owner
-                return None  # invalidate evidence across server restarts
-            self.owner = current_owner
             value = self.bus.call_sync(current_owner, "/io/github/wivrn/Server",
                 "org.freedesktop.DBus.Properties", "Get",
                 GLib.Variant("(ss)", ("io.github.wivrn.Server", "HeadsetConnected")),
                 GLib.VariantType.new("(v)"), Gio.DBusCallFlags.NONE, 750, None)
-            connected = value.unpack()[0]
-            self.last_error = ""
-            return connected if isinstance(connected, bool) else None
+            # Properties.Get returns a tuple containing a *variant*. Unwrap it
+            # explicitly rather than depending on recursive GI unpack behavior.
+            connected = value.get_child_value(0).get_variant()
+            if connected.get_type_string() != "b":
+                raise ValueError("HeadsetConnected is not a boolean")
+            result = current_owner, connected.get_boolean()
         except Exception as exc:
             error = str(exc)
             if "NameHasNoOwner" in error or "ServiceUnknown" in error:
-                self.owner = ""
-                self.last_error = ""
-                return False
+                result = "", False
+            elif command_exists("busctl"):
+                try:
+                    result = self._busctl_query()
+                except Exception as fallback:
+                    errors.append(error + f"; busctl: {fallback}")
+            else:
+                errors.append(error)
+        if result is not None and result[1]:
+            return self._accept(*result)
+        if command_exists("busctl"):
+            for address in self._server_bus_addresses():
+                try:
+                    alternate = self._busctl_query(address)
+                    if alternate[1]:
+                        return self._accept(*alternate)
+                    if alternate[0]:
+                        result = alternate
+                except Exception as exc:
+                    errors.append(str(exc))
+        if errors:
+            error = "; ".join(errors)
             if error != self.last_error:
                 log(f"WiVRn connection evidence unavailable: {error}")
             self.last_error = error
             return None
+        return self._accept(*(result or ("", False)))
 
 
 def _audio_identity(node: dict | None) -> dict:
@@ -960,17 +1037,46 @@ def _resolve_audio_identity(identity: dict, nodes: list[dict]) -> str:
 
 def _discord_stream_identity(item: dict, kind: str) -> str:
     props = item.get("properties", {})
-    binary = Path(str(props.get("application.process.binary", ""))).name.lower()
+    binary = Path(str(props.get("application.process.binary", ""))).name.lower().removesuffix(".bin")
     app_id = str(props.get("application.id", "")).lower()
     name = str(props.get("application.name", "")).lower()
-    known = {"discord", "discordcanary", "discordptb", "vesktop", "legcord", "equicord"}
+    known = {"discord", "discordcanary", "discordptb", "vesktop", "legcord", "equicord", "armcord"}
     client = binary if binary in known else ""
     if not client:
         ids = {"com.discordapp.discord": "discord", "dev.vencord.vesktop": "vesktop",
-               "xyz.armcord.armcord": "legcord", "io.github.legcord.legcord": "legcord"}
+               "xyz.armcord.armcord": "armcord", "io.github.legcord.legcord": "legcord",
+               "io.github.equicord.equicord": "equicord",
+               "com.discordapp.discordcanary": "discordcanary", "com.discordapp.discordptb": "discordptb"}
         client = ids.get(app_id, "")
     if not client and name in known:
         client = name
+    if not client:
+        client = {"discord canary": "discordcanary", "discord ptb": "discordptb"}.get(name, "")
+    if not client:
+        # Electron's voice helper can identify itself as Chromium/WebRTC. Only
+        # accept it if the advertised process belongs to a known desktop client.
+        pid = str(props.get("application.process.id", ""))
+        for unused in range(4):
+            if not pid.isdigit() or int(pid) <= 1:
+                break
+            try:
+                process = Path("/proc") / pid
+                stat = (process / "stat").read_text().rsplit(")", 1)[1].split()
+                arguments = (process / "cmdline").read_bytes().decode(errors="replace").split("\0")
+                executable = Path(arguments[0]).name.lower().removesuffix(".bin")
+                if executable in known:
+                    client = executable
+                    break
+                # Installed Electron application paths identify desktop clients;
+                # generic browser profiles/websites are never sufficient.
+                if executable in {"electron", "electron.exe"} or re.fullmatch(r"electron\d+", executable):
+                    client = next((part.lower() for argument in arguments[1:] if argument.startswith("/")
+                        for part in Path(argument).parts if part.lower() in known), "")
+                    if client:
+                        break
+                pid = stat[1]
+            except (OSError, IndexError):
+                break
     if not client:
         return ""
     role = str(props.get("media.role", "")).lower()
@@ -1001,6 +1107,9 @@ class AudioCoordinator:
                 self.data.update(saved)
         except (OSError, ValueError, AttributeError):
             pass
+        # Migrate the old suppression flag. Audio policy can change defaults
+        # automatically; it is not evidence of a deliberate user override.
+        self.data["overridden"] = []
         self.machine = HeadsetDebouncer(stable=bool(self.data["in_vr"]))
         self.last_saved = ""
         self.current = None
@@ -1008,6 +1117,8 @@ class AudioCoordinator:
         self.evidence = None
         self.evidence_lock = threading.RLock()
         self.preferences = DiscordVoiceRPC()
+        self.stream_status = {"source": "no voice stream", "sink": "no voice stream"}
+        self.default_status = {"source": "waiting for headset evidence", "sink": "waiting for headset evidence"}
         self.preferences.data = self.data.setdefault("discord_preferences", {})
         VR_AUDIO_STATE.update({"active": self.machine.stable,
             "last_desktop_source": self.data["desktop"].get("source", {}).get("name", ""),
@@ -1100,6 +1211,8 @@ class AudioCoordinator:
                     target = _first_non_wivrn_audio_name(nodes)
                 if target and defaults[kind] != target and self.may_route(False):
                     _set_default_audio(kind, target)
+                self.default_status[kind] = ("restored " + target if target and _pactl_default(kind) == target
+                                             else "waiting for saved device or audio server")
                 if target and _pactl_default(kind) == target and target == _resolve_audio_identity(identity, nodes):
                     self.data["desktop"][kind] = identity
                     del self.data["original"][kind]
@@ -1115,8 +1228,9 @@ class AudioCoordinator:
             return
         vr_source = next((n for n in sources if _is_wivrn_node(n)), None)
         vr_sink = next((n for n in sinks if _is_wivrn_node(n)), None)
-        if not vr_source or not vr_sink:
+        if not vr_source and not vr_sink:
             self.current = None
+            self.default_status = {"source": "WiVRn microphone not published", "sink": "WiVRn output not published"}
             return
         if not self.data["original"]:
             self.data["original"] = dict(self.data["desktop"])
@@ -1128,19 +1242,20 @@ class AudioCoordinator:
         if not self.persist():
             return
         for kind, node in (("source", vr_source), ("sink", vr_sink)):
-            previous = self.data["last_applied"].get(kind)
-            if previous and defaults[kind] not in {previous, node["name"]}:
-                if kind not in self.data["overridden"]:
-                    self.data["overridden"].append(kind)
-                    log(f"Preserving deliberate manual {kind} change during VR")
-            if kind not in self.data["overridden"]:
-                if defaults[kind] != node["name"] and self.may_route(True):
-                    _set_default_audio(kind, node["name"])
-                if _pactl_default(kind) == node["name"]:
-                    self.data["last_applied"][kind] = node["name"]
-        self.current = {"source": vr_source["name"], "sink": vr_sink["name"],
-            "source_label": vr_source["label"], "sink_label": vr_sink["label"],
-            "device_id": PULSE_SOURCE_PREFIX + vr_source["name"]}
+            if not node:
+                self.default_status[kind] = "WiVRn device not published; retrying"
+                continue  # Retry a late microphone without holding up headphones.
+            if defaults[kind] != node["name"] and self.may_route(True):
+                _set_default_audio(kind, node["name"])
+            if _pactl_default(kind) == node["name"]:
+                self.data["last_applied"][kind] = node["name"]
+                self.default_status[kind] = "routed to " + node["name"]
+            else:
+                self.default_status[kind] = "audio server did not accept " + node["name"] + "; retrying"
+        # Dictation's auto-mic resolver requires a live source, not just a sink.
+        self.current = ({"source": vr_source["name"], "sink": vr_sink["name"] if vr_sink else "",
+            "source_label": vr_source["label"], "sink_label": vr_sink["label"] if vr_sink else "",
+            "device_id": PULSE_SOURCE_PREFIX + vr_source["name"]} if vr_source else None)
         VR_AUDIO_STATE["easyeffects_was_running"] = bool(self.data.get("easyeffects_was_running"))
         # Journal intent before pausing; preserve package choice across a daemon restart.
         if easyeffects_vr_pause_enabled() and self.data.get("easyeffects_was_running"):
@@ -1155,13 +1270,8 @@ class AudioCoordinator:
     def _route_discord(self, vr: bool, sources: list[dict], sinks: list[dict]) -> None:
         for kind, nodes, endpoint, command in (("sink-inputs", sinks, "sink", "move-sink-input"),
                 ("source-outputs", sources, "source", "move-source-output")):
-            result = _pactl(["--format=json", "list", kind], timeout=2.0)
-            if result is None or result.returncode:
-                continue
-            try:
-                streams = json.loads(result.stdout)
-            except ValueError:
-                continue
+            streams = _pactl_list(kind)
+            self.stream_status[endpoint] = "no recognized voice stream"
             by_index = {str(n.get("index", "")): n for n in nodes}
             for stream in streams:
                 identity = _discord_stream_identity(stream, kind)
@@ -1185,8 +1295,10 @@ class AudioCoordinator:
                         self.data["streams"][identity] = _audio_identity(current)
                     target = next((n["name"] for n in nodes if _is_wivrn_node(n)), "")
                 if not target:
+                    self.stream_status[endpoint] = "waiting for audio device"
                     continue
                 if target == current["name"]:
+                    self.stream_status[endpoint] = "routed to " + target
                     if vr or target == _resolve_audio_identity(saved or {}, nodes):
                         self.data["stream_vr_active"][identity] = vr
                     continue
@@ -1199,15 +1311,17 @@ class AudioCoordinator:
                     return
                 moved = _pactl([command, str(stream["index"]), target], timeout=1.0)
                 if moved is not None and moved.returncode == 0:
-                    actual = _pactl(["--format=json", "list", kind], timeout=1.0)
                     try:
-                        verified = next((item for item in json.loads(actual.stdout) if item["index"] == stream["index"]), None)
+                        verified = next((item for item in _pactl_list(kind) if str(item["index"]) == str(stream["index"])), None)
                         target_node = _node_by_name(nodes, target)
                         if verified and str(verified.get(endpoint)) == str(target_node.get("index")):
+                            self.stream_status[endpoint] = "routed to " + target
                             if vr or target == _resolve_audio_identity(saved or {}, nodes):
                                 self.data["stream_vr_active"][identity] = vr
                     except (AttributeError, ValueError, TypeError):
                         pass
+                else:
+                    self.stream_status[endpoint] = "audio server rejected stream move; retrying"
 
     def shutdown(self) -> None:
         self.stop.set()
@@ -1534,7 +1648,8 @@ def log(message: str) -> None:
         fh.write(f"[{stamp}] {message}\n")
 
 
-def run(cmd: list[str], *, input_text: str | None = None, timeout: float = 4.0) -> subprocess.CompletedProcess[str]:
+def run(cmd: list[str], *, input_text: str | None = None, timeout: float = 4.0,
+        env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         cmd,
         input=input_text,
@@ -1542,6 +1657,7 @@ def run(cmd: list[str], *, input_text: str | None = None, timeout: float = 4.0) 
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=timeout,
+        env=env,
         check=False,
     )
 
@@ -1943,37 +2059,136 @@ class DesktopTarget:
         self.window = ""
         self.terminal = False
         self.clipboard_backend = ""
+        self.last_normal = ""
+        self.last_terminal = False
+        self.focus_revision = 0
+        self.captured_revision = 0
+        self.lock = threading.RLock()
+        self.watcher = None
+        self.watcher_thread = None
+        self.window_info = {}
+        self.context_generation = 0
+        self.prefix_space = None
+
+    def _info(self, window: str) -> tuple[bool, bool]:
+        if not window or window == "0":
+            return False, False
+        cached = self.window_info.get(window)
+        if cached and time.monotonic() - cached[0] < 0.5:
+            return cached[1]
+        if command_exists("xprop"):
+            result = run(["xprop", "-id", window, "WM_CLASS", "_NET_WM_WINDOW_TYPE", "_NET_WM_PID"], timeout=0.35)
+            if result.returncode:
+                return False, False
+            properties = result.stdout
+            klass = next((line for line in properties.splitlines() if line.startswith("WM_CLASS")), "")
+            own_pid = re.search(r"_NET_WM_PID[^=]*=\s*(\d+)", properties)
+            shell = any(name in re.findall(r'"([^\"]+)"', klass.lower()) for name in
+                        {"cinnamon", "mintmenu", "gnome-shell", "plasmashell", "xfce4-panel", "kdictate", "verbatim"})
+            transient = any("_NET_WM_WINDOW_TYPE_" + name in properties for name in
+                ("DESKTOP", "DOCK", "MENU", "DROPDOWN_MENU", "POPUP_MENU", "TOOLTIP", "SPLASH", "NOTIFICATION"))
+            normal = not (shell or transient or (own_pid and int(own_pid[1]) == os.getpid()))
+        else:
+            result = run(["xdotool", "getwindowclassname", window], timeout=0.35)
+            klass = result.stdout
+            normal = result.returncode == 0 and klass.strip().lower() not in {
+                "cinnamon", "mintmenu", "gnome-shell", "plasmashell", "xfce4-panel", "kdictate", "verbatim"}
+        terminal = any(s in klass.lower() for s in
+            ("terminal", "konsole", "alacritty", "kitty", "xterm", "tilix", "wezterm"))
+        info = (bool(normal), terminal)
+        self.window_info[window] = (time.monotonic(), info)
+        if len(self.window_info) > 128:
+            self.window_info = {window: self.window_info[window]}
+        return info
+
+    def _observe(self, window: str) -> tuple[bool, bool]:
+        with self.lock:
+            normal, terminal = self._info(window)
+            if normal:
+                if window != self.last_normal:
+                    self.focus_revision += 1
+                self.last_normal, self.last_terminal = window, terminal
+            return normal, terminal
+
+    def _active(self) -> str:
+        result = run(["xdotool", "getactivewindow"], timeout=0.35)
+        window = result.stdout.strip()
+        return window if result.returncode == 0 and window.isdigit() else ""
+
+    def start(self) -> None:
+        """Remember the text application's window before a shell menu grabs focus."""
+        if self.watcher_thread or desktop_session_type() != "x11" or not command_exists("xprop") or not command_exists("xdotool"):
+            return
+        with contextlib.suppress(Exception):
+            self._observe(self._active())
+        def watch():
+            try:
+                self.watcher = subprocess.Popen(["xprop", "-spy", "-root", "_NET_ACTIVE_WINDOW"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                for line in self.watcher.stdout:
+                    match = re.search(r"window id # (0x[0-9a-fA-F]+)", line)
+                    if match:
+                        self._observe(str(int(match[1], 16)))
+            except Exception as exc:
+                log(f"X11 focus tracking unavailable: {exc}")
+        self.watcher_thread = threading.Thread(target=watch, name="VerbatimFocus", daemon=True)
+        self.watcher_thread.start()
+        atexit.register(self.shutdown)
+
+    def shutdown(self) -> None:
+        if self.watcher is not None and self.watcher.poll() is None:
+            with contextlib.suppress(Exception):
+                self.watcher.terminate()
 
     def capture(self) -> None:
+        self.context_generation += 1
+        self.prefix_space = None
         self.window = ""
         self.terminal = False
         if desktop_session_type() != "x11" or not command_exists("xdotool"):
             return
         try:
-            result = run(["xdotool", "getactivewindow"], timeout=0.35)
-            if result.returncode == 0 and result.stdout.strip().isdigit():
-                self.window = result.stdout.strip()
-                # Stable Mint/Ubuntu releases can ship an xdotool version
-                # predating getwindowclassname. WM_CLASS is available on X11.
-                if command_exists("xprop"):
-                    klass = run(["xprop", "-id", self.window, "WM_CLASS"], timeout=0.35)
-                else:
-                    klass = run(["xdotool", "getwindowclassname", self.window], timeout=0.35)
-                self.terminal = any(s in klass.stdout.lower() for s in
-                    ("terminal", "konsole", "alacritty", "kitty", "xterm", "tilix", "wezterm"))
+            active = self._active()
+            self._observe(active)
+            with self.lock:
+                self.window, self.terminal = self.last_normal, self.last_terminal
+                self.captured_revision = self.focus_revision
         except Exception:
             pass
 
+    def prepare_context(self) -> None:
+        """Read text context while listening, without delaying final delivery."""
+        generation, revision = self.context_generation, self.focus_revision
+        if not _CONTEXT_PROBE_LOCK.acquire(blocking=False):
+            return
+        def probe():
+            try:
+                prefix = should_prefix_space_before_paste("word")
+                with self.lock:
+                    if generation == self.context_generation and revision == self.focus_revision:
+                        self.prefix_space = prefix
+            except Exception:
+                pass
+            finally:
+                _CONTEXT_PROBE_LOCK.release()
+        threading.Thread(target=probe, name="VerbatimTextContext", daemon=True).start()
+
     def ready(self) -> bool:
-        if not self.window or desktop_session_type() != "x11":
+        if desktop_session_type() != "x11":
             return True
+        if not self.window:
+            return False
         try:
-            active = run(["xdotool", "getactivewindow"], timeout=0.4)
-            if active.stdout.strip() == self.window:
+            active = self._active()
+            normal, _ = self._observe(active)
+            if active == self.window:
                 return True
-            title = run(["xdotool", "getwindowname", active.stdout.strip()], timeout=0.4)
-            # Restore only a focus change caused by our overlay, never a user switch.
-            if title.stdout.strip() in {APP_NAME, "Verbatim"}:
+            # Shell menus and our nonfocus overlay may briefly be active. Restore
+            # the captured app only while no other normal app was selected.
+            with self.lock:
+                restore = bool(active and not normal and self.last_normal == self.window and
+                               self.focus_revision == self.captured_revision)
+            if restore:
                 return run(["xdotool", "windowactivate", "--sync", self.window], timeout=0.6).returncode == 0
             return False
         except Exception:
@@ -2573,15 +2788,20 @@ class ClipboardPaster:
 
         return self._probe_previous_character_for_spacing()
 
-    def paste_text(self, text: str) -> tuple[bool, str]:
+    def paste_text(self, text: str, valid: Callable[[], bool] | None = None) -> tuple[bool, str]:
         # Serialized publication/injection prevents two sessions interleaving.
         if not hasattr(self, "delivery_lock"):
             self.delivery_lock = threading.RLock()
             self.serial = 0
         with self.delivery_lock:
-            return self.paste_text_fast(text)
+            return self.paste_text_fast(text, valid)
 
-    def paste_text_fast(self, text: str) -> tuple[bool, str]:
+    def paste_text_fast(self, text: str, valid: Callable[[], bool] | None = None) -> tuple[bool, str]:
+        generation = DESKTOP_TARGET.context_generation
+        def current() -> bool:
+            return generation == DESKTOP_TARGET.context_generation and (valid is None or valid())
+        if not current():
+            return False, "Dictation was cancelled before delivery. The transcript is saved."
         if not clipboard_backends():
             return False, "No usable clipboard. Install xclip for X11 or wl-clipboard for Wayland."
         if not DESKTOP_TARGET.ready():
@@ -2589,15 +2809,30 @@ class ClipboardPaster:
         self.backend = ""
         self.serial += 1
         serial = self.serial
-        previous = {backend: clipboard_read(backend, 0.25) for backend in clipboard_backends()}
-        if text and not text[:1].isspace() and text[:1] not in ".,!?;:%)]}" and bounded_prefix_space(text):
+        previous = {}
+        prefix = DESKTOP_TARGET.prefix_space
+        if prefix is None and FAST_PASTE_CONTEXT_PROBE:
+            prefix = bounded_prefix_space(text)
+        if text and not text[:1].isspace() and text[:1] not in ".,!?;:%)]}" and prefix:
             text = " " + text
-        ok, message, owner = self._set_clipboard_text(text, "dictation")
+        ok, owner = False, None
+        message = "No working clipboard backend for this desktop session"
+        for backend in clipboard_backends():
+            if FAST_PASTE_RESTORE_CLIPBOARD:
+                previous[backend] = clipboard_read(backend, FAST_PASTE_OLD_CLIPBOARD_TIMEOUT)
+            if not current():
+                return False, "Dictation was cancelled before delivery. The transcript is saved."
+            ok, owner, message = clipboard_publish(backend, text)
+            if ok:
+                self.backend = backend
+                break
         if not ok:
             return False, message
         old_ok, old_clip = previous.get(self.backend, (False, None))
         self.pause_monitor(2.0)
         time.sleep(max(0.03, FAST_PASTE_PRE_PASTE_DELAY))
+        if not current():
+            return False, "Dictation was cancelled before paste. The transcript is saved."
         if not DESKTOP_TARGET.ready():
             return False, "Focus changed before paste. Text is on the clipboard and in kdictate last-transcript."
         if not self.injector.paste_shortcut(terminal=DESKTOP_TARGET.terminal):
@@ -3475,6 +3710,7 @@ def daemon_main() -> int:
 
     injector = InputInjector()
     injector.ensure()
+    DESKTOP_TARGET.start()
     start_background_vr_audio_monitor()
     
     app = Gtk.Application(application_id=APP_ID)
@@ -3847,6 +4083,8 @@ def daemon_main() -> int:
                     return
 
         def open_settings(self):
+            self.delivery_pending = False
+            self.hidden_for_paste = False
             self.engine.cancel("settings opened")
             self.monitor.disarm()
             self.settings_open = True
@@ -3874,6 +4112,8 @@ def daemon_main() -> int:
                 self.present_with_glass()
 
         def present_with_glass(self) -> None:
+            if getattr(self, "delivery_pending", False):
+                return
             self.window.realize()
             configure_native_overlay(self.window)
             position_native_overlay(self.window, self.window_x, self.window_y)
@@ -3902,7 +4142,7 @@ def daemon_main() -> int:
                         self.glass._ensure_portal()
                         hidden = threading.Event()
                         def hide_ready():
-                            if generation == self.glass_generation and self.visible:
+                            if generation == self.glass_generation and self.visible and not getattr(self, "delivery_pending", False):
                                 self.window.hide()
                             hidden.set()
                             return False
@@ -3916,7 +4156,7 @@ def daemon_main() -> int:
                     log(f"Glass authorization: {exc}")
                 def present():
                     self.glass.busy = False
-                    if not self.visible or generation != self.glass_generation:
+                    if not self.visible or generation != self.glass_generation or getattr(self, "delivery_pending", False):
                         return False
                     if not ok and self.mode == "settings":
                         self.subtitle = "Glass: screen access needed. Reselect Appearance to retry."
@@ -4057,6 +4297,11 @@ def daemon_main() -> int:
                 return
 
             DESKTOP_TARGET.capture()
+            self.delivery_pending = False
+            self.hidden_for_paste = False
+            if desktop_session_type() == "x11":
+                DESKTOP_TARGET.ready()
+            DESKTOP_TARGET.prepare_context()
             self.settings_open = False
             self.open_dropdown = None
             self.realtime_preview = ""
@@ -4134,6 +4379,9 @@ def daemon_main() -> int:
             self.open_dropdown = None
             self.fade_target = 0.0
             self.open_target = 0.0
+            if getattr(self, "hidden_for_paste", False):
+                self.visible = False
+                self.fade_alpha = self.open_anim = 0.0
 
         def set_level(self, rms: float) -> None:
             # Map microphone RMS into a stable visual 0..1 range.
@@ -4220,6 +4468,10 @@ def daemon_main() -> int:
             return False
 
         def _on_transcribed(self, text: str):
+            if getattr(self, "delivery_pending", False):
+                return False
+            self.delivery_pending = True
+            self.monitor.disarm()
             if realtime_transcription_enabled() and self.realtime_preview:
                 self.keep_preview_during_finish = True
                 self.set_window_height(LISTENING_PREVIEW_WINDOW_H)
@@ -4233,8 +4485,12 @@ def daemon_main() -> int:
 
             session = self.engine.session_id
             self.glass_generation = getattr(self, "glass_generation", 0) + 1
-            # A normal GTK fallback window must be out of the way before injection.
-            if not self.layer_enabled:
+            # Blur support says nothing about keyboard focus. Keep a nonfocus
+            # card visible; unmap a regular Wayland window only when it owns
+            # focus (or a permission dialog can give focus back to it).
+            self.hidden_for_paste = (desktop_session_type() == "wayland" and
+                not self.layer_enabled and (self.window.is_active() or self.glass.permission_pending))
+            if self.hidden_for_paste:
                 self.window.hide()
             def paste_worker() -> None:
                 if session != self.engine.session_id or self.engine.cancelled:
@@ -4249,7 +4505,8 @@ def daemon_main() -> int:
                     if session != self.engine.session_id or self.engine.cancelled:
                         return
                     time.sleep(0.18)
-                ok, msg = self.paster.paste_text(text)
+                ok, msg = self.paster.paste_text(text, valid=lambda:
+                    session == self.engine.session_id and not self.engine.cancelled)
 
                 if session != self.engine.session_id or self.engine.cancelled:
                     return
@@ -4266,6 +4523,8 @@ def daemon_main() -> int:
             return False
 
         def show_error(self, msg: str):
+            self.delivery_pending = False
+            self.hidden_for_paste = False
             self.monitor.disarm()
             self.settings_open = False
             self.set_status("error", "Needs attention", msg[:96])
@@ -4895,6 +5154,7 @@ def gpu_status_text() -> str:
 
 def doctor_text() -> str:
     lines: list[str] = []
+    lines.append(f"Verbatim repair: {REPAIR_REVISION}")
     lines.append(f"KDictate app dir: {APP_DIR}")
     lines.append(f"Session: XDG_SESSION_TYPE={os.environ.get('XDG_SESSION_TYPE', '')} XDG_CURRENT_DESKTOP={os.environ.get('XDG_CURRENT_DESKTOP', '')}")
     lines.append(f"Backend: {BACKEND}")
@@ -4924,7 +5184,12 @@ def doctor_text() -> str:
     lines.append(f"WiVRn headset connection: {truth if truth is not None else 'unknown'}")
     if AUDIO_COORDINATOR:
         lines.append(f"Audio confirmed VR: {AUDIO_COORDINATOR.machine.stable}")
-        lines.append(f"Discord: {AUDIO_COORDINATOR.preferences.status}")
+        lines.append(f"WiVRn observer: {AUDIO_COORDINATOR.truth.last_error or 'reading headset connection'}")
+        lines.append(f"Audio source: {AUDIO_COORDINATOR.default_status['source']}")
+        lines.append(f"Audio output: {AUDIO_COORDINATOR.default_status['sink']}")
+        lines.append(f"Discord microphone stream: {AUDIO_COORDINATOR.stream_status['source']}")
+        lines.append(f"Discord output stream: {AUDIO_COORDINATOR.stream_status['sink']}")
+        lines.append(f"Discord saved preferences RPC: {AUDIO_COORDINATOR.preferences.status}")
     try:
         subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3)
     except Exception:
