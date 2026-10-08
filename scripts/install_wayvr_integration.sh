@@ -56,15 +56,20 @@ cat > "$MIC_ICON" <<'SVG'
 </svg>
 SVG
 
-python3 - "$WATCH_XML" "$KEYBOARD_XML" "$VERBATIM_ACTION" "$MIC_ICON" <<'PY'
+python3 - "$WATCH_XML" "$KEYBOARD_XML" "$VERBATIM_HELPER" "$MIC_ICON" <<'PY'
 from pathlib import Path
 import re
 import sys
+import html
+import shlex
+import tempfile
+import os
+import xml.etree.ElementTree as ET
 
 watch_path = Path(sys.argv[1])
 keyboard_path = Path(sys.argv[2])
-action = sys.argv[3]
-mic_icon = sys.argv[4]
+action = html.escape("::ShellExec " + shlex.join([sys.argv[3], "toggle"]), quote=True)
+mic_icon = html.escape(sys.argv[4], quote=True)
 
 watch = watch_path.read_text(encoding="utf-8")
 keyboard = keyboard_path.read_text(encoding="utf-8")
@@ -115,7 +120,7 @@ watch = re.sub(
 if "btn_verbatim_dictation" not in watch:
     raise SystemExit("Failed to install Verbatim button into WayVR watch.xml")
 
-watch_path.write_text(watch, encoding="utf-8")
+# Validate both documents before writing either custom UI file.
 
 # ---------------------------------------------------------------------
 # KEYBOARD INTEGRATION
@@ -193,7 +198,27 @@ if not inserted:
 if "btn_verbatim_dictation" not in keyboard:
     raise SystemExit("Failed to install Verbatim button into WayVR keyboard.xml")
 
-keyboard_path.write_text(keyboard, encoding="utf-8")
+ET.fromstring(watch)
+ET.fromstring(keyboard)
+original_watch = watch_path.read_bytes()
+original_keyboard = keyboard_path.read_bytes()
+def atomic_write(path, data):
+    fd, temporary = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+try:
+    atomic_write(watch_path, watch.encode())
+    atomic_write(keyboard_path, keyboard.encode())
+except Exception:
+    atomic_write(watch_path, original_watch)
+    atomic_write(keyboard_path, original_keyboard)
+    raise
 
 print(f"Patched {watch_path}")
 print(f"Patched {keyboard_path}")
