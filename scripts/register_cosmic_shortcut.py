@@ -10,6 +10,8 @@ import os
 import re
 import shutil
 import sys
+import shlex
+import tempfile
 import time
 from pathlib import Path
 
@@ -101,7 +103,7 @@ def split_key_value(entry: str) -> tuple[str, str]:
 def is_kdictate_entry(entry: str) -> bool:
     key, val = split_key_value(entry)
     low = entry.lower()
-    return "kdictate" in low or (is_super_v_key(key) and "spawn" in val.lower())
+    return "kdictate" in low or "verbatim" in low
 
 
 def backup(path: Path) -> None:
@@ -121,12 +123,19 @@ def write_entries(entries: list[str]) -> None:
     body = ""
     if entries:
         body = "\n" + "\n".join(f"    {entry}," for entry in entries) + "\n"
-    CONFIG.write_text("{" + body + "}\n", encoding="utf-8")
+    fd, temporary = tempfile.mkstemp(dir=CONFIG.parent)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write("{" + body + "}\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, CONFIG)
 
 
 def install(command: str) -> None:
     entries = read_entries()
     new_entries = [e for e in entries if not is_kdictate_entry(e)]
+    if any(is_super_v_key(split_key_value(e)[0]) for e in new_entries):
+        raise RuntimeError("Super+V already belongs to another COSMIC action; choose a free shortcut in Settings.")
     entry = (
         '( modifiers: [ Super, ], key: "v", description: Some("'
         + escape_ron_string(DESC)
@@ -143,7 +152,7 @@ def install(command: str) -> None:
 
 def remove() -> None:
     entries = read_entries()
-    new_entries = [e for e in entries if "kdictate" not in e.lower()]
+    new_entries = [e for e in entries if not is_kdictate_entry(e)]
     if entries != new_entries:
         backup(CONFIG)
     write_entries(new_entries)
@@ -154,7 +163,7 @@ def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--remove":
         remove()
         return 0
-    command = " ".join(sys.argv[1:]).strip() or str(Path.home() / ".local/bin/kdictate toggle")
+    command = " ".join(sys.argv[1:]).strip() or shlex.join([str(Path.home() / ".local/bin/kdictate"), "toggle"])
     install(command)
     return 0
 
