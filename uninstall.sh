@@ -41,6 +41,7 @@ BIN_FILES=(
   "$HOME/.local/bin/verbatim"
   "$HOME/.local/bin/kdictate"
   "$HOME/.local/bin/verbatim-wayvr"
+  "$HOME/.local/bin/verbatim-session"
 )
 
 SERVICE_NAMES=(
@@ -239,6 +240,7 @@ if [ "$PURGE_SYSTEM" -eq 1 ]; then
     echo "sudo is required for --purge-system, but sudo was not found." >&2
   else
     sudo rm -f \
+      /etc/udev/rules.d/70-verbatim-input.rules \
       /etc/udev/rules.d/80-verbatim-uinput.rules \
       /etc/udev/rules.d/80-kdictate-uinput.rules \
       /etc/modules-load.d/verbatim-uinput.conf \
@@ -259,3 +261,4 @@ fi
 echo
 echo "Verbatim removed."
 echo "Legacy KDictate Cosmic files were also removed if present."
+
