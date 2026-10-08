@@ -1753,39 +1753,76 @@ def start_daemon_if_needed() -> bool:
     return False
 
 
+class _NativeTextInterface:
+    """Small AT-SPI adapter using the distro's GI bindings directly.
+
+    Call Text's methods explicitly: Accessible also has get_text/get_selection
+    methods with different signatures. Keep the existing insertion semantics.
+    """
+    def __init__(self, accessible, atspi):
+        self.accessible = accessible
+        self.atspi = atspi
+
+    @property
+    def caretOffset(self):
+        return self.atspi.Text.get_caret_offset(self.accessible)
+
+    def getNSelections(self):
+        return self.atspi.Text.get_n_selections(self.accessible)
+
+    def getSelection(self, index):
+        selection = self.atspi.Text.get_selection(self.accessible, index)
+        return selection.start_offset, selection.end_offset
+
+    def getText(self, start, end):
+        return self.atspi.Text.get_text(self.accessible, start, end)
+
+    def screen_character_extents(self, offset):
+        rect = self.atspi.Text.get_character_extents(
+            self.accessible, offset, self.atspi.CoordType.SCREEN
+        )
+        return rect.x, rect.y, rect.width, rect.height
+
+
 def _focused_text_interface():
     """Return the focused AT-SPI text interface, if the focused app exposes one."""
     try:
-        import pyatspi
+        import gi
+        gi.require_version("Atspi", "2.0")
+        from gi.repository import Atspi
     except Exception:
         return None
 
     try:
-        desktop = pyatspi.Registry.getDesktop(0)
+        if Atspi.init() not in (0, 1):
+            return None
+        desktop = Atspi.get_desktop(0)
         seen = 0
 
         def find_focused(obj, depth=0):
             nonlocal seen
             seen += 1
 
-            if seen > 1400 or depth > 12:
+            if obj is None or seen > 1400 or depth > 12:
                 return None
 
             try:
-                state = obj.getState()
-                if state.contains(pyatspi.STATE_FOCUSED):
+                state = obj.get_state_set()
+                if state.contains(Atspi.StateType.FOCUSED):
                     return obj
             except Exception:
                 pass
 
             try:
-                count = obj.childCount
+                count = obj.get_child_count()
             except Exception:
                 count = 0
 
             for idx in range(count):
                 try:
-                    found = find_focused(obj[idx], depth + 1)
+                    if seen >= 1400:
+                        break
+                    found = find_focused(obj.get_child_at_index(idx), depth + 1)
                     if found:
                         return found
                 except Exception:
@@ -1798,7 +1835,8 @@ def _focused_text_interface():
             return None
 
         try:
-            return focused.queryText()
+            text = focused.get_text_iface()
+            return _NativeTextInterface(text, Atspi) if text is not None else None
         except Exception:
             return None
     except Exception as exc:
@@ -3373,45 +3411,8 @@ class SocketServer:
 
 def atspi_caret_position() -> tuple[int, int] | None:
     try:
-        import pyatspi
-    except Exception as exc:
-        log(f"AT-SPI unavailable: {exc!r}")
-        return None
-
-    try:
-        desktop = pyatspi.Registry.getDesktop(0)
-        seen = 0
-
-        def find_focused(obj, depth=0):
-            nonlocal seen
-            seen += 1
-            if seen > 1400 or depth > 12:
-                return None
-            try:
-                state = obj.getState()
-                if state.contains(pyatspi.STATE_FOCUSED):
-                    return obj
-            except Exception:
-                pass
-            try:
-                count = obj.childCount
-            except Exception:
-                count = 0
-            for idx in range(count):
-                try:
-                    found = find_focused(obj[idx], depth + 1)
-                    if found:
-                        return found
-                except Exception:
-                    continue
-            return None
-
-        focused = find_focused(desktop)
-        if not focused:
-            return None
-        try:
-            text = focused.queryText()
-        except Exception:
+        text = _focused_text_interface()
+        if text is None:
             return None
         try:
             offset = max(0, int(text.caretOffset))
@@ -3419,7 +3420,7 @@ def atspi_caret_position() -> tuple[int, int] | None:
             offset = 0
         for off in [offset, max(0, offset - 1), 0]:
             try:
-                x, y, w, h = text.getCharacterExtents(off, pyatspi.DESKTOP_COORDS)
+                x, y, w, h = text.screen_character_extents(off)
                 if x > 0 and y > 0:
                     return int(x + 14), int(y + max(h, 22) + 10)
             except Exception:
