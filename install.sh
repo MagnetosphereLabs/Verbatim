@@ -304,7 +304,7 @@ if [ "$READY" != 1 ]; then
   exit 1
 fi
 "$BIN/kdictate" doctor
-"$BIN/kdictate" warmup-foreground
+"$BIN/kdictate" warmup-verify
 if [ "$SHORTCUT_READY" = 1 ]; then
   printf '\nInstalled. Press Super+V in a text field, speak, then pause.\n'
 else
