@@ -1,4 +1,5 @@
 faster-whisper>=1.1.1,<2
+av>=11,<19
 sounddevice>=0.5.1,<1
 soundfile>=0.12.1,<1
 numpy>=1.26,<3
