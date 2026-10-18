@@ -3162,6 +3162,39 @@ class AudioState:
     recent_avg_rms: list[tuple[float, float]] = dataclasses.field(default_factory=list)
 
 
+def _inference_process_environment() -> dict[str, str]:
+    """Expose the selected venv's NVIDIA wheels to the inference subprocess.
+
+    The loader reads LD_LIBRARY_PATH at exec time. The GUI daemon and a bare
+    Python invocation must both start the *same* configured GPU backend.
+    These paths change no compute setting, driver, or system-wide environment.
+    """
+    env = os.environ.copy()
+    if BACKEND == "faster-whisper" and DEVICE == "cuda":
+        wheel_dirs: list[str] = []
+        for root in (Path(sys.prefix) / "lib", Path(sys.prefix) / "lib64"):
+            for directory in sorted(root.glob("python*/site-packages/nvidia/*/lib")):
+                if directory.is_dir():
+                    resolved = str(directory.resolve())
+                    if resolved not in wheel_dirs:
+                        wheel_dirs.append(resolved)
+        if wheel_dirs:
+            inherited = [entry for entry in env.get("LD_LIBRARY_PATH", "").split(":") if entry]
+            env["LD_LIBRARY_PATH"] = ":".join(dict.fromkeys(wheel_dirs + inherited))
+
+    # Layer-shell is needed only for the GTK overlay, not for the CUDA worker.
+    # Preserve all other caller-requested preloads (profilers, diagnostics, etc.).
+    preload = env.get("LD_PRELOAD", "")
+    if "libgtk4-layer-shell" in preload:
+        retained = [entry for entry in preload.replace(":", " ").split()
+                    if "libgtk4-layer-shell" not in entry]
+        if retained:
+            env["LD_PRELOAD"] = " ".join(retained)
+        else:
+            env.pop("LD_PRELOAD", None)
+    return env
+
+
 class InferenceService:
     """A warm, killable worker. Native inference never runs on the GTK thread."""
     def __init__(self) -> None:
@@ -3197,7 +3230,7 @@ class InferenceService:
         # A socket isolates structured replies from libraries writing to stdout.
         parent, child = socket.socketpair()
         child.set_inheritable(True)
-        env = os.environ.copy()
+        env = _inference_process_environment()
         env["KDICTATE_INFERENCE_FD"] = str(child.fileno())
         log_file = open(LOG_FILE, "a", encoding="utf-8")
         try:
@@ -3256,19 +3289,27 @@ class InferenceService:
                     # Loading a local model is included, but downloads are never an
                     # unbounded operation in the visible dictation lifecycle.
                     deadline = time.monotonic() + budget
+                    recovered_on_cpu = False
                     while True:
                         reply = self.responses.get(timeout=max(0.01, deadline - time.monotonic()))
                         if reply.get("id") not in {None, identity}:
                             continue
+                        if reply.get("event") == "cpu-fallback":
+                            # Emergency recovery may need longer than the CUDA
+                            # deadline; the selected GPU remains the default.
+                            recovered_on_cpu = True
+                            deadline = max(deadline, time.monotonic() + max(180.0, audio_seconds * 8.0))
+                            continue
                         if reply.get("error"):
                             raise RuntimeError(reply["error"])
-                        self.loaded = True
+                        self.loaded = not recovered_on_cpu
                         return str(reply.get("text", ""))
                 except (queue.Empty, OSError, RuntimeError) as exc:
                     # Keep the selected device; report the real runtime error.
                     self.close()
                     if attempt + 1 >= attempts:
-                        detail = str(exc) or type(exc).__name__
+                        detail = (f"Inference timed out after {budget:.0f}s on {BACKEND}/{DEVICE}/{COMPUTE_TYPE}"
+                                  if isinstance(exc, queue.Empty) else str(exc) or type(exc).__name__)
                         raise RuntimeError(f"Transcription failed: {detail}. Audio retained for recovery") from exc
                     log(f"Restarting inference worker after a failed final job: {exc}")
             return ""
@@ -3294,29 +3335,49 @@ def inference_worker_main() -> int:
                 DEVICE, COMPUTE_TYPE, LANGUAGE = request["device"], request["compute_type"], request["language"]
                 WHISPER_CPP_BIN, WHISPER_CPP_MODEL = request["cpp_bin"], request["cpp_model"]
                 path = request.get("path")
-                if BACKEND == "whisper.cpp":
-                    if not Path(WHISPER_CPP_BIN).is_file():
-                        raise RuntimeError("whisper.cpp executable is missing")
-                    text = transcribe_with_whisper_cpp(path) if path else ""
-                else:
-                    model = ModelManager.load()
-                    if path:
-                        segments, _info = model.transcribe(path, language=LANGUAGE, task="transcribe",
-                            beam_size=1 if request["realtime"] else 5, vad_filter=False,
-                            condition_on_previous_text=False, temperature=0.0,
-                            no_speech_threshold=0.35, compression_ratio_threshold=2.4)
-                        text = " ".join(segment.text.strip() for segment in segments).strip()
-                    else:
-                        # CUDA dependencies are loaded lazily. Model construction
-                        # alone cannot establish that transcription will work.
-                        import numpy as np
-                        segments, _info = model.transcribe(np.zeros(16000, dtype=np.float32),
-                            language=LANGUAGE, beam_size=1, vad_filter=False,
-                            condition_on_previous_text=False)
-                        list(segments)
-                        text = ""
-                reply = {"id": identity, "text": text}
+                preferred_device, preferred_compute = DEVICE, COMPUTE_TYPE
+                try:
+                    for gpu_attempt in range(2):
+                        try:
+                            if BACKEND == "whisper.cpp":
+                                if not Path(WHISPER_CPP_BIN).is_file():
+                                    raise RuntimeError("whisper.cpp executable is missing")
+                                text = transcribe_with_whisper_cpp(path) if path else ""
+                            else:
+                                model = ModelManager.load()
+                                if path:
+                                    segments, _info = model.transcribe(path, language=LANGUAGE, task="transcribe",
+                                        beam_size=1 if request["realtime"] else 5, vad_filter=False,
+                                        condition_on_previous_text=False, temperature=0.0,
+                                        no_speech_threshold=0.35, compression_ratio_threshold=2.4)
+                                    text = " ".join(segment.text.strip() for segment in segments).strip()
+                                else:
+                                    # Actually execute CUDA before reporting GPU warmup ready.
+                                    import numpy as np
+                                    segments, _info = model.transcribe(np.zeros(16000, dtype=np.float32),
+                                        language=LANGUAGE, beam_size=1, vad_filter=False,
+                                        condition_on_previous_text=False)
+                                    list(segments)
+                                    text = ""
+                            break
+                        except Exception as exc:
+                            gpu_error = any(word in str(exc).lower() for word in
+                                ("cuda", "cudnn", "cublas", "out of memory", "unsupported compute type"))
+                            if (gpu_attempt or BACKEND != "faster-whisper" or preferred_device != "cuda"
+                                or not path or request["realtime"] or not gpu_error):
+                                raise
+                            log(f"CUDA final inference failed ({exc!r}); recovering retained audio on CPU")
+                            ModelManager.clear()
+                            DEVICE, COMPUTE_TYPE = "cpu", "int8"
+                            replies.sendall((json.dumps({"id": identity, "event": "cpu-fallback"}) + "\n").encode())
+                    reply = {"id": identity, "text": text}
+                finally:
+                    if (DEVICE, COMPUTE_TYPE) != (preferred_device, preferred_compute):
+                        ModelManager.clear()
+                        DEVICE, COMPUTE_TYPE = preferred_device, preferred_compute
             except Exception as exc:
+                log(f"Inference worker failed on {BACKEND}/{DEVICE}/{COMPUTE_TYPE}: "
+                    f"{exc!r}\n{traceback.format_exc()}")
                 reply = {"id": identity, "error": str(exc)}
             replies.sendall((json.dumps(reply) + "\n").encode("utf-8"))
     return 0
@@ -5106,6 +5167,16 @@ def daemon_main() -> int:
         if msg == "warmup":
             ModelManager.warm_async()
             return "warming"
+        if msg == "warmup-verify":
+            # Validate the inference process already owned by the daemon;
+            # never allocate a second Whisper model on the same GPU.
+            try:
+                if not INFERENCE.loaded:
+                    INFERENCE.request(None)
+                return "ready"
+            except Exception as exc:
+                log(f"Daemon warmup validation failed: {exc!r}\n{traceback.format_exc()}")
+                return f"error: {exc}"
         if msg == "doctor":
             report = doctor_text()
             overlay = overlay_ref.get("overlay")
@@ -5312,6 +5383,22 @@ def cli_main(argv: list[str]) -> int:
     if cmd == "warmup-foreground":
         return warmup_foreground()
 
+    if cmd == "warmup-verify":
+        try:
+            if not start_daemon_if_needed():
+                raise RuntimeError("Verbatim daemon could not start")
+            budget = float(os.environ.get("KDICTATE_INFERENCE_TIMEOUT", "180"))
+            timeout = min(900.0, max(30.0, budget * 3.0 + 30.0))
+            response = send_socket("warmup-verify", timeout=timeout)
+            if response != "ready":
+                raise RuntimeError(response or "daemon did not respond")
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"Daemon inference warmup failed: {exc}", file=sys.stderr)
+            print(f"Log: {LOG_FILE}", file=sys.stderr)
+            return 1
+        print(f"Whisper ready via daemon ({BACKEND}, {DEVICE}/{COMPUTE_TYPE}).")
+        return 0
+
     if cmd == "status":
         if daemon_is_running():
             print("running")
@@ -5332,7 +5419,7 @@ def cli_main(argv: list[str]) -> int:
             print(send_socket("quit"))
         return 0
 
-    print("Usage: kdictate [toggle|start|cancel|daemon|status|doctor|gpu-status|last-transcript|warmup|warmup-foreground|quit]", file=sys.stderr)
+    print("Usage: kdictate [toggle|start|cancel|daemon|status|doctor|gpu-status|last-transcript|warmup|warmup-foreground|warmup-verify|quit]", file=sys.stderr)
     return 2
 
 
