@@ -4303,7 +4303,7 @@ def daemon_main() -> int:
                 self.update_settings_height()
 
             target_preview = 1.0 if (
-                (self.engine.recording or self.mode == "listening" or self.keep_preview_during_finish)
+                (self.engine.recording or self.mode in {"listening", "transcribing", "typing"} or self.keep_preview_during_finish)
                 and realtime_transcription_enabled()
                 and not self.settings_open
             ) else 0.0
@@ -4885,7 +4885,7 @@ def daemon_main() -> int:
                 cr.paint_with_alpha(a)
             # Native blur uses live translucency; fallback contains actually blurred
             # background pixels, frozen for the short life of this card.
-            tint_alpha = 0.78 if glass and (self.glass.native or has_backdrop) else 0.995
+            tint_alpha = 0.55 if glass and (self.glass.native or has_backdrop) else 0.995
             cr.set_source_rgba(*palette["surface"], tint_alpha * a)
             cr.paint()
             if glass:
