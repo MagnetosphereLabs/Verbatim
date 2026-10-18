@@ -10,7 +10,10 @@ if [ ! -x "$KDICTATE_BIN" ]; then
 fi
 
 case "$CMD" in
-  toggle|start|cancel|status)
+  toggle|start)
+    "$KDICTATE_BIN" "vr-$CMD"
+    ;;
+  cancel|status)
     "$KDICTATE_BIN" "$CMD"
     ;;
   *)
