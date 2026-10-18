@@ -8,7 +8,7 @@ if [ ! -x "$PY" ]; then
   exit 127
 fi
 # config.env is read as data by Python, never evaluated as shell commands.
-CUDA_PATH="$(find "$APP/venv/lib" -type d \( -path '*/nvidia/cublas/lib' -o -path '*/nvidia/cudnn/lib' \) -print 2>/dev/null | paste -sd: - || true)"
+CUDA_PATH="$(find "$APP/venv/lib" -type d -path '*/nvidia/*/lib' -print 2>/dev/null | paste -sd: - || true)"
 if [ -n "$CUDA_PATH" ]; then export LD_LIBRARY_PATH="$CUDA_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; fi
 # Local optional layer shell uses one portable prefix, including Fedora lib64.
 for root in "$APP/native/layer/lib" "$APP/native/layer/lib64" /usr/local/lib /usr/local/lib64; do
