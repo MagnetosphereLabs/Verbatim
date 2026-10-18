@@ -83,7 +83,12 @@ packages() {
     pacman) sudo pacman -S --needed --noconfirm "$@" ;;
   esac
 }
-if [ "$FAMILY" = apt ]; then sudo apt-get update; fi
+if [ "$FAMILY" = apt ]; then
+  if ! sudo apt-get update; then
+    echo 'Warning: APT could not refresh every repository. Trying the available package indexes; required package installation must still succeed.' >&2
+    echo 'Verbatim does not change repository settings or disable package signature checks.' >&2
+  fi
+fi
 read -r -a BASE_PACKAGES <<< "$(verbatim_packages "$FAMILY" base)"
 packages "${BASE_PACKAGES[@]}"
 # Keep the existing desktop's portal implementation. Install the matching one
