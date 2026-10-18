@@ -72,6 +72,8 @@ int verbatim_blur(GtkWindow *window, int width, int height, int enabled) {
         g_object_set_data(G_OBJECT(window), "verbatim-native-blur", NULL);
         blur = NULL;
     }
+    /* Disabling an unused effect must not initialize protocols/roundtrips. */
+    if (!blur && !enabled) return 0;
     if (!blur) {
         blur = g_new0(Blur, 1);
         blur->surface = wl_surface;
