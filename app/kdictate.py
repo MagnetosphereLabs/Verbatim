@@ -2254,7 +2254,7 @@ def clipboard_publish(backend: str, value: str) -> tuple[bool, subprocess.Popen 
                 process.stderr.close()
 
 
-def configure_native_overlay(window) -> None:
+def configure_native_overlay(window, blur_enabled: bool | None = None) -> None:
     """Set X11 nonfocus hints before mapping, and request KDE's real blur."""
     surface = window.get_surface()
     if surface is not None and hasattr(surface, "set_focusable"):
@@ -2287,7 +2287,7 @@ def configure_native_overlay(window) -> None:
             property_values("WM_HINTS", "WM_HINTS", [1, 0, 1, 0, 0, 0, 0, 0, 0])
             property_values("_NET_WM_WINDOW_TYPE", "ATOM", [atom("_NET_WM_WINDOW_TYPE_UTILITY")])
             property_values("_NET_WM_STATE", "ATOM", [atom("_NET_WM_STATE_SKIP_TASKBAR"), atom("_NET_WM_STATE_SKIP_PAGER")])
-            if active_theme().startswith("glass-"):
+            if (active_theme().startswith("glass-") if blur_enabled is None else blur_enabled):
                 property_values("_KDE_NET_WM_BLUR_BEHIND_REGION", "CARDINAL", [])
             else:
                 lib.XDeleteProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong]
@@ -2356,8 +2356,9 @@ class GlassBackdrop:
                 os.close(self.remote_fd)
             self.remote_fd = None
 
-    def configure(self, window, width: int, height: int) -> bool:
-        enabled = active_theme().startswith("glass-")
+    def configure(self, window, width: int, height: int, *, enabled: bool | None = None) -> bool:
+        if enabled is None:
+            enabled = active_theme().startswith("glass-")
         if desktop_session_type() == "wayland":
             try:
                 if self.bridge is None:
@@ -2371,7 +2372,7 @@ class GlassBackdrop:
             except (OSError, AttributeError):
                 self.native = False
         else:
-            configure_native_overlay(window)
+            configure_native_overlay(window, blur_enabled=enabled)
             self.native = False
             if enabled and command_exists("xprop"):
                 try:
@@ -2382,7 +2383,6 @@ class GlassBackdrop:
         if self.native:
             self.status = "native compositor blur"
         if not enabled:
-            self.close()
             self.surface = self.pixels = None
         return self.native
 
@@ -3880,23 +3880,40 @@ def daemon_main() -> int:
                 self.on_settings_click(x, y)
 
         def on_drag_begin(self, gesture, start_x, start_y):
-            top_band = max(30.0, self.current_window_h * 0.25)
+            top_band = 48.0  # Header only; expanding settings must not turn rows into drag handles.
             on_button = self._hit_circle(start_x, start_y, WINDOW_W - 58, 27) or self._hit_circle(start_x, start_y, WINDOW_W - 27, 27)
             self.dragging_window = bool(start_y <= top_band and not on_button)
+            self.native_drag = False
+            if not self.dragging_window:
+                return
+            if not self.layer_enabled and desktop_session_type() == "wayland":
+                # Wayland clients cannot move toplevels with absolute coordinates.
+                # Hand the original input event to the compositor instead.
+                surface = self.window.get_surface()
+                device = gesture.get_device()
+                if surface is not None and device is not None:
+                    self.native_drag = True
+                    gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+                    surface.begin_move(device, gesture.get_current_button(), start_x, start_y,
+                                       gesture.get_current_event_time())
+                    self.native_drag = True
             self.drag_origin_x = self.window_x
             self.drag_origin_y = self.window_y
 
         def on_drag_update(self, gesture, offset_x, offset_y):
-            if not self.dragging_window:
+            if not self.dragging_window or getattr(self, "native_drag", False):
                 return
-
-            self.move_overlay(self.drag_origin_x + int(offset_x), self.drag_origin_y + int(offset_y))
+            # Gesture offsets are surface-local: moving the surface changes the
+            # coordinate origin under the pointer. Compensate for that movement.
+            self.move_overlay(self.window_x + int(offset_x), self.window_y + int(offset_y))
 
         def on_drag_end(self, gesture, offset_x, offset_y):
-            if self.dragging_window:
-                self.move_overlay(self.drag_origin_x + int(offset_x), self.drag_origin_y + int(offset_y))
+            moved = self.dragging_window
+            native = getattr(self, "native_drag", False)
+            # The final offset may repeat the last update; do not apply it twice.
             self.dragging_window = False
-            if active_theme().startswith("glass-") and not self.glass.native:
+            self.native_drag = False
+            if moved and not native and self.visible and self.fade_target > 0 and active_theme().startswith("glass-") and not self.glass.native:
                 self.present_with_glass()
 
         def on_scroll(self, controller, dx, dy):
@@ -4066,7 +4083,8 @@ def daemon_main() -> int:
             _items, bottom = self.settings_layout()
             wanted_extra = max(SETTINGS_EXTRA_H, min(SETTINGS_MAX_EXTRA_H, bottom - WINDOW_H + 18.0))
             self.settings_extra_target = wanted_extra
-            self.set_window_height(WINDOW_H + int(math.ceil(wanted_extra)))
+            # Keep enough allocation for the closing dropdown's remaining frames.
+            self.set_window_height(WINDOW_H + int(math.ceil(max(wanted_extra, self.settings_extra))))
 
         def toggle_dropdown(self, key: str) -> None:
             self.open_dropdown = None if self.open_dropdown == key else key
@@ -4105,6 +4123,7 @@ def daemon_main() -> int:
             self.delivery_pending = False
             self.hidden_for_paste = False
             self.engine.cancel("settings opened")
+            self.glass_generation = getattr(self, "glass_generation", 0) + 1
             self.monitor.disarm()
             self.settings_open = True
             self.open_dropdown = None
@@ -4131,7 +4150,7 @@ def daemon_main() -> int:
                 self.present_with_glass()
 
         def present_with_glass(self) -> None:
-            if getattr(self, "delivery_pending", False):
+            if not self.visible or self.fade_target == 0 or getattr(self, "delivery_pending", False):
                 return
             self.window.realize()
             configure_native_overlay(self.window)
@@ -4141,7 +4160,10 @@ def daemon_main() -> int:
             if not enabled or native:
                 self.window.set_visible(True)
                 return
-            if self.glass.busy:
+            if self.settings_open or self.glass.busy:
+                # Settings must stay mapped while changing appearance. Reuse the
+                # frozen backdrop (or tint) instead of hiding to recapture it.
+                self.window.set_visible(True)
                 return
             self.glass.busy = True
             generation = getattr(self, "glass_generation", 0) + 1
@@ -4161,7 +4183,7 @@ def daemon_main() -> int:
                         self.glass._ensure_portal()
                         hidden = threading.Event()
                         def hide_ready():
-                            if generation == self.glass_generation and self.visible and not getattr(self, "delivery_pending", False):
+                            if generation == self.glass_generation and self.visible and not self.settings_open and not getattr(self, "delivery_pending", False):
                                 self.window.hide()
                             hidden.set()
                             return False
@@ -4228,7 +4250,7 @@ def daemon_main() -> int:
                 self.update_settings_height()
 
             target_preview = 1.0 if (
-                (self.engine.recording or self.keep_preview_during_finish)
+                (self.engine.recording or self.mode == "listening" or self.keep_preview_during_finish)
                 and realtime_transcription_enabled()
                 and not self.settings_open
             ) else 0.0
@@ -4263,13 +4285,13 @@ def daemon_main() -> int:
                 self.preview_user_scroll_lines = 0
                 self.set_window_height(WINDOW_H)
 
-            if (
-                not self.settings_open
-                and not self.keep_preview_during_finish
-                and self.settings_anim < 0.03
-                and self.preview_anim < 0.015
-            ):
-                self.set_window_height(WINDOW_H)
+            # Reserve space before the preview opens, including asynchronous
+            # microphone startup. Always grow again if a prior frame shrank it.
+            if self.visible and not self.settings_open and self.settings_anim < 0.03:
+                if target_preview > 0 or self.preview_anim >= 0.015:
+                    self.set_window_height(LISTENING_PREVIEW_WINDOW_H)
+                else:
+                    self.set_window_height(WINDOW_H)
 
             with contextlib.suppress(Exception):
                 self.window.set_opacity(max(0.0, min(1.0, self.fade_alpha)))
@@ -4403,6 +4425,10 @@ def daemon_main() -> int:
             self.open_dropdown = None
             self.fade_target = 0.0
             self.open_target = 0.0
+            # Compositor blur does not follow GTK opacity. Remove it before the
+            # card fades, and invalidate pending backdrop presentations above.
+            self.glass.configure(self.window, WINDOW_W, self.current_window_h, enabled=False)
+            self.area.queue_draw()
             if getattr(self, "hidden_for_paste", False):
                 self.visible = False
                 self.fade_alpha = self.open_anim = 0.0
@@ -4443,6 +4469,8 @@ def daemon_main() -> int:
             GLib.idle_add(self._cancel_on_ui, reason)
 
         def _cancel_on_ui(self, reason: str):
+            if self.settings_open and reason == "manual typing":
+                return False  # Ignore a keyboard-monitor callback queued before settings opened.
             self.engine.cancel(reason)
             self.close_smoothly()
             return False
@@ -4515,6 +4543,7 @@ def daemon_main() -> int:
             self.hidden_for_paste = (desktop_session_type() == "wayland" and
                 not self.layer_enabled and (self.window.is_active() or self.glass.permission_pending))
             if self.hidden_for_paste:
+                self.glass.configure(self.window, WINDOW_W, self.current_window_h, enabled=False)
                 self.window.hide()
             def paste_worker() -> None:
                 if session != self.engine.session_id or self.engine.cancelled:
