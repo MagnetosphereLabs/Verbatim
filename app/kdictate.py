@@ -39,8 +39,10 @@ import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
+from vr_target import VrTargetRouter
+
 APP_NAME = "KDictate"
-REPAIR_REVISION = "2026-10-08-routing-focus"
+REPAIR_REVISION = "2026-10-18-vr-targeting"
 APP_ID = "dev.kdictate.Cosmic"
 APP_DIR = Path(os.environ.get("KDICTATE_APPDIR", Path.home() / ".local/share/kdictate-cosmic")).expanduser()
 LOG_FILE = APP_DIR / "kdictate.log"
@@ -2196,6 +2198,7 @@ class DesktopTarget:
 
 
 DESKTOP_TARGET = DesktopTarget()
+VR_TARGET: VrTargetRouter | None = None
 
 
 def clipboard_backends() -> list[str]:
@@ -2794,9 +2797,20 @@ class ClipboardPaster:
             self.delivery_lock = threading.RLock()
             self.serial = 0
         with self.delivery_lock:
-            return self.paste_text_fast(text, valid)
+            if valid is not None and not valid():
+                return False, "Dictation was cancelled before delivery. The transcript is saved."
+            target = None
+            try:
+                target = VR_TARGET.prepare() if VR_TARGET else None
+                return self.paste_text_fast(text, valid, target=target)
+            except Exception as exc:
+                log(f"Text delivery failed: {exc!r}")
+                return False, "Text delivery failed. Your transcript is available with kdictate last-transcript."
+            finally:
+                if target is not None:
+                    target.finish()
 
-    def paste_text_fast(self, text: str, valid: Callable[[], bool] | None = None) -> tuple[bool, str]:
+    def paste_text_fast(self, text: str, valid: Callable[[], bool] | None = None, *, target=None) -> tuple[bool, str]:
         generation = DESKTOP_TARGET.context_generation
         def current() -> bool:
             return generation == DESKTOP_TARGET.context_generation and (valid is None or valid())
@@ -2804,13 +2818,14 @@ class ClipboardPaster:
             return False, "Dictation was cancelled before delivery. The transcript is saved."
         if not clipboard_backends():
             return False, "No usable clipboard. Install xclip for X11 or wl-clipboard for Wayland."
-        if not DESKTOP_TARGET.ready():
-            return False, "The focused window changed. Your transcript is available with kdictate last-transcript."
+        ready = target.ready if target is not None else DESKTOP_TARGET.ready
+        if not ready():
+            return False, target.error if target is not None else "The focused window changed. Your transcript is available with kdictate last-transcript."
         self.backend = ""
         self.serial += 1
         serial = self.serial
         previous = {}
-        prefix = DESKTOP_TARGET.prefix_space
+        prefix = (False if target.game else bounded_prefix_space(text)) if target is not None else DESKTOP_TARGET.prefix_space
         if prefix is None and FAST_PASTE_CONTEXT_PROBE:
             prefix = bounded_prefix_space(text)
         if text and not text[:1].isspace() and text[:1] not in ".,!?;:%)]}" and prefix:
@@ -2833,9 +2848,10 @@ class ClipboardPaster:
         time.sleep(max(0.03, FAST_PASTE_PRE_PASTE_DELAY))
         if not current():
             return False, "Dictation was cancelled before paste. The transcript is saved."
-        if not DESKTOP_TARGET.ready():
-            return False, "Focus changed before paste. Text is on the clipboard and in kdictate last-transcript."
-        if not self.injector.paste_shortcut(terminal=DESKTOP_TARGET.terminal):
+        if not ready():
+            return False, target.error if target is not None else "Focus changed before paste. Text is on the clipboard and in kdictate last-transcript."
+        terminal = target.terminal if target is not None else DESKTOP_TARGET.terminal
+        if not self.injector.paste_shortcut(terminal=terminal):
             # After ambiguous injection, keep the transcript; never retry blindly.
             return False, "Paste could not be confirmed. Text is on the clipboard and in kdictate last-transcript."
         if old_ok and old_clip is not None and FAST_PASTE_RESTORE_CLIPBOARD:
@@ -3666,6 +3682,7 @@ def atspi_caret_position() -> tuple[int, int] | None:
 
 
 def daemon_main() -> int:
+    global VR_TARGET
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     _ensure_dirs()
 
@@ -3711,6 +3728,8 @@ def daemon_main() -> int:
     injector = InputInjector()
     injector.ensure()
     DESKTOP_TARGET.start()
+    VR_TARGET = VrTargetRouter.for_session(log)
+    VR_TARGET.start()
     start_background_vr_audio_monitor()
     
     app = Gtk.Application(application_id=APP_ID)
@@ -4291,17 +4310,22 @@ def daemon_main() -> int:
 
             self.move_overlay(int(x), int(y))
 
-        def show_and_record(self, *, preserve_position: bool = False):
+        def show_and_record(self, *, preserve_position: bool = False, source: str | None = None):
             if self.engine.recording:
                 self.invoke_cancel("toggle")
                 return
 
+            source = source or (getattr(self, "dictation_source", "desktop") if preserve_position else "desktop")
+            self.dictation_source = source
             DESKTOP_TARGET.capture()
+            if VR_TARGET:
+                VR_TARGET.capture(source)
             self.delivery_pending = False
             self.hidden_for_paste = False
-            if desktop_session_type() == "x11":
+            if source == "desktop" and desktop_session_type() == "x11":
                 DESKTOP_TARGET.ready()
-            DESKTOP_TARGET.prepare_context()
+            if source == "desktop":
+                DESKTOP_TARGET.prepare_context()
             self.settings_open = False
             self.open_dropdown = None
             self.realtime_preview = ""
@@ -5040,12 +5064,12 @@ def daemon_main() -> int:
     def handle_socket(msg: str) -> str:
         if msg == "status":
             return "running"
-        if msg == "toggle" or msg == "start":
+        if msg in {"toggle", "start", "vr-toggle", "vr-start"}:
             overlay = wait_for_overlay()
             if overlay is None:
                 return "not-ready"
             def start_it():
-                overlay.show_and_record()
+                overlay.show_and_record(source="vr" if msg.startswith("vr-") else "desktop")
                 return False
             GLib.idle_add(start_it)
             return "ok"
@@ -5178,6 +5202,8 @@ def doctor_text() -> str:
         lines.append(f"/dev/uinput: not writable ({exc})")
     backends = clipboard_backends()
     lines.append(f"Clipboard backends: {', '.join(backends) or 'none'}")
+    if VR_TARGET:
+        lines.append(VR_TARGET.diagnostics())
     lines.append(f"Theme: {active_theme()}")
     lines.append(f"Native blur bridge: {'installed' if (APP_DIR / 'native/libverbatim-blur.so').exists() else 'not installed'}")
     truth = WiVRnTruth().read()
@@ -5255,7 +5281,7 @@ def cli_main(argv: list[str]) -> int:
     if cmd == "daemon":
         return daemon_main()
 
-    if cmd in {"toggle", "start", "cancel", "warmup"}:
+    if cmd in {"toggle", "start", "vr-toggle", "vr-start", "cancel", "warmup"}:
         if not start_daemon_if_needed():
             print(f"KDictate daemon did not start. Log: {LOG_FILE}", file=sys.stderr)
             return 1
