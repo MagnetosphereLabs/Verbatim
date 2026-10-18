@@ -9,7 +9,7 @@ if [ -n "$INSTALL_SOURCE" ] && [ -f "$INSTALL_SOURCE" ]; then
   ROOT="$(cd -- "$(dirname -- "$INSTALL_SOURCE")" && pwd)"
 fi
 REQUIRED_FILES=(
-  install.sh requirements.txt app/kdictate.py bin/kdictate
+  install.sh requirements.txt app/kdictate.py app/vr_target.py app/focus_backend.py bin/kdictate
   scripts/platform.sh scripts/verbatim-session scripts/verbatim-wayvr
   scripts/register_desktop_shortcut.py scripts/register_cosmic_shortcut.py
   scripts/install_wayvr_integration.sh systemd/kdictate.service
@@ -255,6 +255,8 @@ printf 'uinput\n' | sudo tee /etc/modules-load.d/verbatim-uinput.conf >/dev/null
 sudo tee /etc/udev/rules.d/70-verbatim-input.rules >/dev/null <<'RULES'
 KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess"
 SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}=="1", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_MOUSE}=="1", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_TOUCHPAD}=="1", TAG+="uaccess"
 RULES
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=misc --sysname-match=uinput
@@ -262,7 +264,7 @@ sudo udevadm trigger --subsystem-match=input
 sudo setfacl -m "u:$(id -u):rw" /dev/uinput || true
 for dev in /dev/input/event*; do
   [ -e "$dev" ] || continue
-  if udevadm info --query=property --name="$dev" | grep -qx 'ID_INPUT_KEYBOARD=1'; then sudo setfacl -m "u:$(id -u):r" "$dev" || true; fi
+  if udevadm info --query=property --name="$dev" | grep -Eq '^ID_INPUT_(KEYBOARD|MOUSE|TOUCHPAD)=1$'; then sudo setfacl -m "u:$(id -u):r" "$dev" || true; fi
 done
 # Desktop autostart imports the exact environment at every login. systemd keeps
 # the model warm and follows graphical-session lifetime on supporting desktops.
