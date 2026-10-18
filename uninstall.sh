@@ -139,6 +139,15 @@ def backup_file(path: Path, prefix: str) -> None:
 
 
 def remove_verbatim_blocks(text: str) -> str:
+    # Undo only Verbatim's include for dynamically generated Panel buttons.
+    # Removing it restores WayVR's Whisper shortcut without replacing the file.
+    text = re.sub(
+        r'\n<!-- Verbatim Panel Visibility -->[\s\S]*?'
+        r'<!-- /Verbatim Panel Visibility -->\n',
+        "",
+        text,
+    )
+
     # New robust installer block.
     text = re.sub(
         r'\s*<!-- Verbatim Dictation: installed by Verbatim -->[\s\S]*?<!-- /Verbatim Dictation -->\s*',
@@ -171,18 +180,19 @@ def remove_verbatim_blocks(text: str) -> str:
 if watch.exists():
     text = watch.read_text(encoding="utf-8")
 
-    if "btn_verbatim_dictation" in text or "Verbatim Dictation" in text:
+    if "btn_verbatim_dictation" in text or "Verbatim Dictation" in text or "Verbatim Panel Visibility" in text:
         backup_file(watch, "watch.xml")
 
-        # Watch integration replaced the 2x2 quick grid, so restore the default grid.
-        text = re.sub(
-            r'''          <!-- Four buttons -->\s*
+        # Restore the grid only while Verbatim's watch button is still present.
+        if "btn_verbatim_dictation" in text:
+            text = re.sub(
+                r'''          <!-- Four buttons -->\s*
           <div flex_direction="column" gap="8">[\s\S]*?          </div>\s*
         </rectangle>''',
-            default_watch_grid + "\n        </rectangle>",
-            text,
-            count=1,
-        )
+                default_watch_grid + "\n        </rectangle>",
+                text,
+                count=1,
+            )
 
         # Also remove any future marker-style Verbatim block, if present.
         text = remove_verbatim_blocks(text)
@@ -192,7 +202,7 @@ if watch.exists():
 if keyboard.exists():
     text = keyboard.read_text(encoding="utf-8")
 
-    if "btn_verbatim_dictation" in text or "Verbatim Dictation" in text:
+    if "btn_verbatim_dictation" in text or "Verbatim Dictation" in text or "Verbatim Panel Visibility" in text:
         backup_file(keyboard, "keyboard.xml")
 
         # Keyboard integration should be removed in place. Do not replace the
@@ -203,6 +213,7 @@ if keyboard.exists():
 PY
 
 rm -f "$WAYVR_MIC_ICON"
+rm -f "$WAYVR_CONFIG/theme/verbatim-panel-whisper.xml"
 rmdir "$WAYVR_CONFIG/theme" "$WAYVR_CONFIG/theme/gui" 2>/dev/null || true
 
 echo "Removing user services and autostart entries..."
