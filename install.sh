@@ -235,7 +235,7 @@ if ! "$APP/venv/bin/python" -m pip install 'faster-whisper>=1.1.1,<2'; then
   fi
 fi
 if [ "$GPU" = nvidia ] && [ "$BACKEND" = faster-whisper ]; then
-  "$APP/venv/bin/python" -m pip install 'nvidia-cublas-cu12>=12.4,<13' 'nvidia-cudnn-cu12>=9,<10'
+  "$APP/venv/bin/python" -m pip install 'nvidia-cublas-cu12>=12.4,<13' 'nvidia-cudnn-cu12>=9,<10' 'nvidia-cuda-runtime-cu12>=12.4,<13' 'nvidia-cuda-nvrtc-cu12>=12.4,<13'
 fi
 "$PYTHON" - "$APP/config.env" "$BACKEND" "$MODEL" "$PROFILE" "$DEVICE" "$COMPUTE" "$CPP_BIN" "$CPP_MODEL" <<'PY'
 from pathlib import Path
@@ -304,7 +304,7 @@ if [ "$READY" != 1 ]; then
   exit 1
 fi
 "$BIN/kdictate" doctor
-"$BIN/kdictate" warmup
+"$BIN/kdictate" warmup-foreground
 if [ "$SHORTCUT_READY" = 1 ]; then
   printf '\nInstalled. Press Super+V in a text field, speak, then pause.\n'
 else
