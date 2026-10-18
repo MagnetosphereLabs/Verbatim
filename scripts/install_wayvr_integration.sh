@@ -70,6 +70,7 @@ watch_path = Path(sys.argv[1])
 keyboard_path = Path(sys.argv[2])
 action = html.escape("::ShellExec " + shlex.join([sys.argv[3], "toggle"]), quote=True)
 mic_icon = html.escape(sys.argv[4], quote=True)
+panel_style_path = Path(sys.argv[4]).with_name("verbatim-panel-whisper.xml")
 
 watch = watch_path.read_text(encoding="utf-8")
 keyboard = keyboard_path.read_text(encoding="utf-8")
@@ -198,10 +199,53 @@ if not inserted:
 if "btn_verbatim_dictation" not in keyboard:
     raise SystemExit("Failed to install Verbatim button into WayVR keyboard.xml")
 
+# WayVR creates the built-in Whisper shortcut dynamically from the Panel
+# template. Only its "whisper" instance loads a local, hidden button style;
+# other panels keep their original styling. Each template instantiation has
+# its own macro scope, so this cannot hide the keyboard's other buttons.
+panel_macros = set()
+
+
+def hide_builtin_dictation(text):
+    text = re.sub(
+        r'\n<!-- Verbatim Panel Visibility -->[\s\S]*?'
+        r'<!-- /Verbatim Panel Visibility -->\n',
+        "",
+        text,
+    )
+    panel = re.search(
+        r'''(<template\b[^>]*\bname\s*=\s*["']Panel["'][^>]*>)([\s\S]*?)(</template\s*>)''',
+        text,
+    )
+    if not panel:
+        return text
+
+    button = ET.fromstring("<layout>" + panel[2] + "</layout>").find(".//Button")
+    if button is None or not button.get("macro") or button.get("display") not in (None, "none"):
+        raise SystemExit("Cannot safely hide WayVR dictation: unsupported custom Panel button style.")
+    panel_macros.add(button.get("macro"))
+    include = html.escape(str(panel_style_path.with_name("verbatim-panel-${name}.xml")), quote=True)
+    opening = f'''
+<!-- Verbatim Panel Visibility -->
+    <include src_ext="{include}" optional="1" />
+<!-- /Verbatim Panel Visibility -->
+'''
+    replacement = panel[1] + opening + panel[2] + panel[3]
+    return text[:panel.start()] + replacement + text[panel.end():]
+
+
+watch = hide_builtin_dictation(watch)
+keyboard = hide_builtin_dictation(keyboard)
+panel_style = ('<layout version="2">\n' + "".join(
+    f'  <macro name="{html.escape(name, quote=True)}" display="none" />\n'
+    for name in sorted(panel_macros)
+) + '</layout>\n').encode()
+
 ET.fromstring(watch)
 ET.fromstring(keyboard)
 original_watch = watch_path.read_bytes()
 original_keyboard = keyboard_path.read_bytes()
+original_panel_style = panel_style_path.read_bytes() if panel_style_path.exists() else None
 def atomic_write(path, data):
     fd, temporary = tempfile.mkstemp(dir=path.parent)
     try:
@@ -213,11 +257,16 @@ def atomic_write(path, data):
     finally:
         Path(temporary).unlink(missing_ok=True)
 try:
+    atomic_write(panel_style_path, panel_style)
     atomic_write(watch_path, watch.encode())
     atomic_write(keyboard_path, keyboard.encode())
 except Exception:
     atomic_write(watch_path, original_watch)
     atomic_write(keyboard_path, original_keyboard)
+    if original_panel_style is None:
+        panel_style_path.unlink(missing_ok=True)
+    else:
+        atomic_write(panel_style_path, original_panel_style)
     raise
 
 print(f"Patched {watch_path}")
