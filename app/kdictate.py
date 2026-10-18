@@ -3244,7 +3244,8 @@ class InferenceService:
                 self._start()
                 identity = uuid.uuid4().hex
                 request = {"id": identity, "path": path, "realtime": realtime,
-                    "model": MODEL_NAME, "backend": BACKEND, "device": DEVICE,
+                    "model": MODEL_NAME, "backend": BACKEND,
+                    "device": DEVICE,
                     "compute_type": COMPUTE_TYPE, "language": LANGUAGE,
                     "cpp_bin": WHISPER_CPP_BIN, "cpp_model": WHISPER_CPP_MODEL}
                 try:
@@ -3259,17 +3260,16 @@ class InferenceService:
                         reply = self.responses.get(timeout=max(0.01, deadline - time.monotonic()))
                         if reply.get("id") not in {None, identity}:
                             continue
-                        if reply.get("event") == "cpu-fallback":
-                            deadline = max(deadline, time.monotonic() + max(180.0, audio_seconds * 8.0))
-                            continue
                         if reply.get("error"):
                             raise RuntimeError(reply["error"])
                         self.loaded = True
                         return str(reply.get("text", ""))
                 except (queue.Empty, OSError, RuntimeError) as exc:
+                    # Keep the selected device; report the real runtime error.
                     self.close()
                     if attempt + 1 >= attempts:
-                        raise RuntimeError("Transcription could not finish; captured audio was retained for recovery") from exc
+                        detail = str(exc) or type(exc).__name__
+                        raise RuntimeError(f"Transcription failed: {detail}. Audio retained for recovery") from exc
                     log(f"Restarting inference worker after a failed final job: {exc}")
             return ""
         finally:
@@ -3284,7 +3284,6 @@ atexit.register(INFERENCE.close)
 def inference_worker_main() -> int:
     global MODEL_NAME, BACKEND, DEVICE, COMPUTE_TYPE, LANGUAGE, WHISPER_CPP_BIN, WHISPER_CPP_MODEL
     fd = int(os.environ["KDICTATE_INFERENCE_FD"])
-    force_cpu = False
     with socket.socket(fileno=fd) as replies:
         for line in sys.stdin:
             identity = None
@@ -3294,35 +3293,28 @@ def inference_worker_main() -> int:
                 MODEL_NAME, BACKEND = request["model"], request["backend"]
                 DEVICE, COMPUTE_TYPE, LANGUAGE = request["device"], request["compute_type"], request["language"]
                 WHISPER_CPP_BIN, WHISPER_CPP_MODEL = request["cpp_bin"], request["cpp_model"]
-                if force_cpu and BACKEND == "faster-whisper":
-                    DEVICE, COMPUTE_TYPE = "cpu", "int8"
                 path = request.get("path")
-                for attempt in range(2):
-                    try:
-                        if BACKEND == "whisper.cpp":
-                            if not Path(WHISPER_CPP_BIN).is_file():
-                                raise RuntimeError("whisper.cpp executable is missing")
-                            text = transcribe_with_whisper_cpp(path) if path else ""
-                        else:
-                            model = ModelManager.load()
-                            if path:
-                                segments, _info = model.transcribe(path, language=LANGUAGE, task="transcribe",
-                                    beam_size=1 if request["realtime"] else 5, vad_filter=False,
-                                    condition_on_previous_text=False, temperature=0.0,
-                                    no_speech_threshold=0.35, compression_ratio_threshold=2.4)
-                                text = " ".join(segment.text.strip() for segment in segments).strip()
-                            else:
-                                text = ""
-                        break
-                    except Exception as exc:
-                        gpu_error = any(word in str(exc).lower() for word in ("cuda", "cudnn", "cublas", "out of memory", "unsupported compute type"))
-                        if attempt or DEVICE != "cuda" or not gpu_error:
-                            raise
-                        force_cpu = True
-                        DEVICE, COMPUTE_TYPE = "cpu", "int8"
-                        ModelManager.clear()
-                        replies.sendall((json.dumps({"id": identity, "event": "cpu-fallback"}) + "\n").encode())
-                        log("GPU runtime unavailable; retrying captured audio on CPU")
+                if BACKEND == "whisper.cpp":
+                    if not Path(WHISPER_CPP_BIN).is_file():
+                        raise RuntimeError("whisper.cpp executable is missing")
+                    text = transcribe_with_whisper_cpp(path) if path else ""
+                else:
+                    model = ModelManager.load()
+                    if path:
+                        segments, _info = model.transcribe(path, language=LANGUAGE, task="transcribe",
+                            beam_size=1 if request["realtime"] else 5, vad_filter=False,
+                            condition_on_previous_text=False, temperature=0.0,
+                            no_speech_threshold=0.35, compression_ratio_threshold=2.4)
+                        text = " ".join(segment.text.strip() for segment in segments).strip()
+                    else:
+                        # CUDA dependencies are loaded lazily. Model construction
+                        # alone cannot establish that transcription will work.
+                        import numpy as np
+                        segments, _info = model.transcribe(np.zeros(16000, dtype=np.float32),
+                            language=LANGUAGE, beam_size=1, vad_filter=False,
+                            condition_on_previous_text=False)
+                        list(segments)
+                        text = ""
                 reply = {"id": identity, "text": text}
             except Exception as exc:
                 reply = {"id": identity, "error": str(exc)}
@@ -5283,7 +5275,7 @@ def doctor_text() -> str:
 def warmup_foreground() -> int:
     print(f"Loading Whisper {MODEL_NAME} on {DEVICE}/{COMPUTE_TYPE}...")
     try:
-        ModelManager.load()
+        INFERENCE.request(None)
     except Exception as exc:
         print(f"Warmup failed: {exc}", file=sys.stderr)
         print(f"Log: {LOG_FILE}", file=sys.stderr)
