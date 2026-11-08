@@ -251,21 +251,14 @@ def register_cinnamon(command: str, remove: bool) -> bool:
             print(f"Super+V already belongs to {conflict}; choose a free shortcut in Keyboard settings.")
             return False
 
-    if matched:
-        slot = matched[0]
-        new_list = current
-    else:
-        used = set(current)
-        slot = ""
-        for idx in range(0, 80):
-            candidate = f"custom{idx}"
-            if candidate not in used:
-                slot = candidate
-                break
-        if not slot:
-            print("Could not find a free Cinnamon custom shortcut slot", file=sys.stderr)
-            return False
-        new_list = current + [slot]
+    # Cinnamon watches custom-list, not edits to an existing slot. Stage a
+    # different slot so a reinstall really changes that list and refreshes the
+    # native grab. Muffin then suppresses the bare-Super action for Super+V.
+    slot = next((f"custom{idx}" for idx in range(80) if f"custom{idx}" not in current), "")
+    if not slot:
+        print("Could not find a free Cinnamon custom shortcut slot", file=sys.stderr)
+        return False
+    new_list = [item for item in current if item not in matched] + [slot]
 
     base = f"/org/cinnamon/desktop/keybindings/custom-keybindings/{slot}"
     if not all([dconf_write(f"{base}/name", dconf_string(NAME)),
@@ -273,11 +266,56 @@ def register_cinnamon(command: str, remove: bool) -> bool:
         dconf_write(f"{base}/binding", gvariant_strv([BINDING]))]):
         return False
 
-    # Force Cinnamon to notice changes by rewriting the list after item values.
     if not dconf_write(list_path, gvariant_strv(new_list)):
         return False
+    for old in matched:
+        run(["dconf", "reset", "-f", f"/org/cinnamon/desktop/keybindings/custom-keybindings/{old}/"])
 
     print(f"Registered Cinnamon shortcut: Super+V -> {command}")
+    return True
+
+
+def register_mate(command: str, remove: bool) -> bool:
+    if not command_exists("gsettings") or not command_exists("dconf"):
+        return False
+    root = "/org/mate/desktop/keybindings/"
+    schema = "org.mate.control-center.keybinding"
+    schemas = run(["gsettings", "list-relocatable-schemas"])
+    if schema not in schemas.stdout.splitlines():
+        return False
+    listed = run(["dconf", "list", root])
+    if listed.returncode:
+        return False
+    current = [root + entry for entry in listed.stdout.splitlines() if entry.endswith("/")]
+    matched = []
+    for path in current:
+        name = gsettings_reloc_get(schema, path, "name")
+        action = gsettings_reloc_get(schema, path, "action")
+        if any(token in (name + " " + action).lower() for token in ("verbatim", "kdictate")):
+            matched.append(path)
+    if remove:
+        return all(run(["dconf", "reset", "-f", path]).returncode == 0 for path in matched)
+    for path in current:
+        if path not in matched and owns_super_v(gsettings_reloc_get(schema, path, "binding")):
+            print("Super+V already belongs to another MATE action; choose a free shortcut in Keyboard settings.")
+            return False
+    conflict = builtin_super_v_conflict("org.mate.")
+    if conflict:
+        print(f"Super+V already belongs to {conflict}; choose a free shortcut in Keyboard settings.")
+        return False
+    path = matched[0] if matched else next((root + f"custom{idx}/" for idx in range(80)
+                                          if root + f"custom{idx}/" not in current), "")
+    if not path:
+        print("Could not find a free MATE custom shortcut slot", file=sys.stderr)
+        return False
+    # MATE's settings daemon watches these relocatable entries directly; its
+    # command field is 'action', unlike GNOME and Cinnamon.
+    for key, value in (("name", NAME), ("action", command), ("binding", BINDING)):
+        if not gsettings_reloc_set(schema, path, key, gvariant_string(value)):
+            return False
+    for duplicate in matched[1:]:
+        run(["dconf", "reset", "-f", duplicate])
+    print(f"Registered MATE shortcut: Super+V -> {command}")
     return True
 
 
@@ -347,6 +385,12 @@ def main() -> int:
     command = " ".join(sys.argv[1:]).strip() if not remove else ""
     command = command or DEFAULT_COMMAND
 
+    if remove:
+        guard = Path(__file__).with_name("super_key_guard.py")
+        if guard.exists() and subprocess.run([sys.executable, str(guard), "--stop"], timeout=30).returncode:
+            print("Could not restore the original Super-key shortcut; keeping shortcut setup for recovery.", file=sys.stderr)
+            return 1
+
     tokens = desktop_tokens()
     attempted: list[str] = []
     ok = False
@@ -372,6 +416,9 @@ def main() -> int:
     if "XFCE" in tokens:
         attempted.append("Xfce")
         ok = register_xfce(command, remove) or ok
+    if "MATE" in tokens:
+        attempted.append("MATE")
+        ok = register_mate(command, remove) or ok
 
     # If the environment is unclear, inspect installed schemas before writing.
     if not attempted and command_exists("gsettings"):
@@ -380,6 +427,8 @@ def main() -> int:
             ok = register_gnome(command, remove)
         elif "org.cinnamon.desktop.keybindings" in schemas:
             ok = register_cinnamon(command, remove)
+        elif "org.mate.Marco.global-keybindings" in schemas:
+            ok = register_mate(command, remove)
 
     if ok:
         return 0
