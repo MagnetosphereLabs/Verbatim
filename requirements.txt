@@ -7,3 +7,5 @@ evdev>=1.7.1,<2
 Pillow>=10.4,<13
 # GTK/PyGObject and pycairo come from matched distribution packages.
 # CUDA wheels are installed only for a detected NVIDIA system.
+# X11 modifier-tap compatibility for MATE and older Xfce.
+python-xlib>=0.33,<1
