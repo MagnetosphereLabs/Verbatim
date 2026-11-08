@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 KDICTATE_BIN="${KDICTATE_BIN:-$HOME/.local/bin/kdictate}"
+VERBATIM_APP="${KDICTATE_APPDIR:-$HOME/.local/share/kdictate-cosmic}"
+start_super_key_guard() {
+  if [ -x "$VERBATIM_APP/venv/bin/python" ] && [ -f "$VERBATIM_APP/scripts/super_key_guard.py" ]; then
+    "$VERBATIM_APP/venv/bin/python" "$VERBATIM_APP/scripts/super_key_guard.py" --start || {
+      echo 'Verbatim: Super-key compatibility could not start; the original menu shortcut has been retained.' >&2
+    }
+  fi
+}
 if command -v systemctl >/dev/null 2>&1; then
   session_vars=()
   for key in DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR PATH; do
@@ -11,7 +19,11 @@ if command -v systemctl >/dev/null 2>&1; then
   if [ "${#session_vars[@]}" -gt 0 ]; then systemctl --user import-environment "${session_vars[@]}" || true; fi
   systemctl --user daemon-reload || true
   systemctl --user enable kdictate.service || true
-  if systemctl --user restart kdictate.service; then exit 0; fi
+  if systemctl --user restart kdictate.service; then
+    start_super_key_guard
+    exit 0
+  fi
 fi
 # No user-systemd session: same single-instance daemon, exact desktop environment.
 nohup "$KDICTATE_BIN" daemon >/dev/null 2>&1 &
+start_super_key_guard
