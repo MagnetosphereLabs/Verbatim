@@ -12,6 +12,7 @@ REQUIRED_FILES=(
   install.sh requirements.txt app/kdictate.py app/vr_target.py app/focus_backend.py bin/kdictate
   scripts/platform.sh scripts/verbatim-session scripts/verbatim-wayvr
   scripts/register_desktop_shortcut.py scripts/register_cosmic_shortcut.py
+  scripts/super_key_guard.py
   scripts/install_wayvr_integration.sh systemd/kdictate.service
   native/build.sh native/blur.c native/ext-background-effect-v1.xml native/kde-blur.xml
 )
@@ -148,6 +149,12 @@ build() { nice -n 10 "$@"; }
 # Dependencies and Python are validated before interrupting an existing daemon.
 # Keep the restoration journal and lock inode intact for VR session recovery.
 if command -v systemctl >/dev/null; then systemctl --user stop kdictate.service || true; fi
+if [ -x "$APP/venv/bin/python" ] && [ -f "$APP/scripts/super_key_guard.py" ]; then
+  "$APP/venv/bin/python" "$APP/scripts/super_key_guard.py" --stop || {
+    echo 'Could not restore the Super-key menu shortcut before updating. Existing application files were retained.' >&2
+    exit 1
+  }
+fi
 if [ -x "$BIN/kdictate" ]; then "$BIN/kdictate" quit >/dev/null 2>&1 || true; fi
 # Copy only application-owned trees. Config, models, recovery files, and journal
 # remain intact. Installing this bundle never fetches an unpatched app from main.
