@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -157,14 +158,21 @@ def menu_items(kind: str, settings: Settings, spare_key) -> list[dict]:
         if result.returncode:
             raise RuntimeError("Could not inspect Xfce shortcuts")
         paths = set(result.stdout.splitlines())
+        disabled_command = None
         for key in sorted(KEYS):
             path = "/commands/custom/" + key
             if path in paths:
                 item = {"backend": "xfconf", "key": path, "super": key}
                 value = settings.get(item)
                 if value:
-                    # Empty the active property; reset could revive a default.
-                    items.append(dict(item, original=value, applied="", command=value))
+                    # Xfce rejects an empty shortcut command with a dialog.
+                    # A valid no-op masks defaults; SuperTap runs the saved menu.
+                    if disabled_command is None:
+                        executable = shutil.which("true", path=os.defpath)
+                        if not executable:
+                            raise RuntimeError("No silent command available; original menu shortcuts retained")
+                        disabled_command = shlex.join([str(Path(executable).resolve())])
+                    items.append(dict(item, original=value, applied=disabled_command, command=value))
     elif kind == "MATE":
         result = run(["gsettings", "list-schemas"])
         if result.returncode:
