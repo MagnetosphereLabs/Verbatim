@@ -42,7 +42,7 @@ from typing import Callable, Optional
 from vr_target import VrTargetRouter
 
 APP_NAME = "KDictate"
-REPAIR_REVISION = "2026-10-18-vr-targeting"
+REPAIR_REVISION = "2026-11-08-audio-history-and-bounded-routing"
 APP_ID = "dev.kdictate.Cosmic"
 APP_DIR = Path(os.environ.get("KDICTATE_APPDIR", Path.home() / ".local/share/kdictate-cosmic")).expanduser()
 LOG_FILE = APP_DIR / "kdictate.log"
@@ -1091,7 +1091,17 @@ def _discord_stream_identity(item: dict, kind: str) -> str:
 
 
 class AudioCoordinator:
-    """One background writer; dictation and UI only read its cached result."""
+    """Bounded transition writes; dictation and UI only read cached results.
+
+    Default devices are switched once per confirmed headset transition, with
+    limited retries for a late device/server. Observation must never become
+    continuous enforcement of either a VR device or an old desktop choice.
+    """
+    ROUTE_SECONDS = 15.0
+    ROUTE_ATTEMPTS = 3
+    RETRY_SECONDS = 2.0
+    HISTORY_LIMIT = 12
+
     def __init__(self) -> None:
         self.path = APP_DIR / "audio-state.json"
         self.truth = WiVRnTruth()
@@ -1109,8 +1119,13 @@ class AudioCoordinator:
                 self.data.update(saved)
         except (OSError, ValueError, AttributeError):
             pass
-        # Migrate the old suppression flag. Audio policy can change defaults
-        # automatically; it is not evidence of a deliberate user override.
+        history = self.data.setdefault("desktop_history", {})
+        for kind in ("source", "sink"):
+            if kind not in history:
+                previous = self.data["desktop"].get(kind) or self.data["original"].get(kind)
+                history[kind] = [previous] if previous else []
+        # Legacy journals are recovered through one bounded transition below.
+        # Completed/expired route records survive daemon and machine restarts.
         self.data["overridden"] = []
         self.machine = HeadsetDebouncer(stable=bool(self.data["in_vr"]))
         self.last_saved = ""
@@ -1156,6 +1171,94 @@ class AudioCoordinator:
         with self.evidence_lock:
             return self.evidence is not None and self.machine.stable == vr and (not vr or self.evidence is True)
 
+    def _new_window(self) -> dict:
+        now = time.time()
+        return {"started_at": now, "expires_at": now + self.ROUTE_SECONDS}
+
+    def _remember_desktop(self, kind: str, node: dict) -> None:
+        if not node or _is_wivrn_node(node):
+            return
+        identity = _audio_identity(node)
+        history = self.data["desktop_history"][kind]
+        self.data["desktop_history"][kind] = ([identity] + [old for old in history
+            if old.get("name") != identity["name"]])[:self.HISTORY_LIMIT]
+        self.data["desktop"][kind] = identity
+        VR_AUDIO_STATE[f"last_desktop_{kind}"] = identity["name"]
+
+    def _desktop_target(self, kind: str, original: dict, nodes: list[dict]) -> str:
+        # Prefer the pre-VR device, then actual desktop history in recency order.
+        # A disconnected Bluetooth headset is skipped without inventing a
+        # preference from the order in which the audio server lists devices.
+        for identity in [original, *self.data["desktop_history"][kind]]:
+            target = _resolve_audio_identity(identity, nodes)
+            if target:
+                return target
+        return ""
+
+    def _window_open(self, window: dict) -> bool:
+        # Persist wall-clock deadlines so reboot cannot renew the allowance.
+        # A backwards clock adjustment fails closed rather than extending it.
+        now = time.time()
+        return window["started_at"] <= now < window["expires_at"]
+
+    def _begin_routing(self, vr: bool) -> None:
+        window = self._new_window()
+        kinds = ("source", "sink") if vr else tuple(self.data["original"])
+        self.data["routing"] = {**window, "vr": vr,
+            "defaults": {kind: dict(window) for kind in kinds}}
+        self.persist()
+
+    def _finish_route(self, route: dict, result: str, label: str, status: str) -> None:
+        route.update({"result": result, "status": status})
+        log(f"WiVRn audio {label}: {status}")
+
+    def _route_once(self, route: dict, current: str, target: str, vr: bool,
+                    apply: Callable[[], None], read: Callable[[], str], label: str) -> None:
+        """A successful readback, external change, deadline or budget ends a route."""
+        if route.get("result"):
+            return
+        if not self._window_open(route):
+            self._finish_route(route, "released", label, "retry window expired; control released")
+            return
+        if target and current == target:
+            self._finish_route(route, "verified", label, "verified " + target + "; control released")
+            return
+        previous = route.get("observed")
+        if previous and current and current != previous:
+            self._finish_route(route, "released", label, "device changed externally; keeping " + current)
+            return
+        route["observed"] = current
+        if route.get("attempts", 0) >= self.ROUTE_ATTEMPTS:
+            self._finish_route(route, "released", label, "retry limit reached; control released")
+            return
+        route["status"] = "waiting for device within retry window" if not target else "waiting to retry " + target
+        if (not target or not current or time.time() < route.get("next_attempt", 0)
+                or not self.may_route(vr) or self.evidence is not vr):
+            return
+        # Record the attempt BEFORE the command. A crash cannot reset its budget.
+        route["attempts"] = route.get("attempts", 0) + 1
+        route["next_attempt"] = time.time() + self.RETRY_SECONDS
+        if not self.persist():
+            return
+        # Device enumeration and journal I/O can take time. Recheck both the
+        # selected device and permission immediately before a mutating command.
+        actual = read()
+        if actual != current:
+            if actual:
+                self._finish_route(route, "verified" if actual == target else "released", label,
+                                   "device changed during routing; keeping " + actual)
+            return
+        if not self._window_open(route) or not self.may_route(vr) or self.evidence is not vr:
+            return
+        log(f"WiVRn audio {label}: attempt {route['attempts']}/{self.ROUTE_ATTEMPTS} target={target!r}")
+        apply()
+        actual = read()
+        route["observed"] = actual or current
+        if actual == target:
+            self._finish_route(route, "verified", label, "verified " + target + "; control released")
+        elif route["attempts"] >= self.ROUTE_ATTEMPTS:
+            self._finish_route(route, "released", label, "retry limit reached; control released")
+
     def process_state(self, now: float) -> None:
         with self.evidence_lock:
             observed, stable = self.evidence, self.machine.stable
@@ -1165,13 +1268,17 @@ class AudioCoordinator:
             self.data["in_vr"] = stable
             self.data["overridden"] = []
             if stable:
-                if not self.data["original"]:
-                    self.data["original"] = dict(self.data["desktop"])
+                self.data["original"] = dict(self.data["desktop"])
                 self.data["last_applied"] = {}
                 self.data["easyeffects_was_running"] = _easyeffects_is_running()
+            self._begin_routing(stable)
             self.next_scan = 0.0
             self.preferences.next_check = 0.0
             self.persist()
+        elif "routing" not in self.data and observed is not None:
+            # One-time migration of pre-fix journals, including a missing
+            # Bluetooth device left pending across yesterday's shutdown.
+            self._begin_routing(stable)
         if self.pulse_changed.is_set() and now - self.last_scan >= 0.2:
             self.pulse_changed.clear()
             self.next_scan = 0.0
@@ -1189,6 +1296,9 @@ class AudioCoordinator:
         if observed is None or (self.machine.stable and observed is False):
             self.current = None
             return
+        routing = self.data.get("routing")
+        if routing is None:
+            return
         sources, sinks = _pactl_nodes("sources"), _pactl_nodes("sinks")
         if not sources and not sinks:
             return
@@ -1196,29 +1306,50 @@ class AudioCoordinator:
         all_nodes = {"source": sources, "sink": sinks}
         original_source = self.data["original"].get("source") or self.data["desktop"].get("source", {})
         self.capture_desktop_source = _resolve_audio_identity(original_source, sources) or _first_non_wivrn_audio_name(sources)
-        if not self.machine.stable:
+        vr = self.machine.stable
+        vr_source = next((n for n in sources if _is_wivrn_node(n)), None)
+        vr_sink = next((n for n in sinks if _is_wivrn_node(n)), None)
+        vr_nodes = {"source": vr_source, "sink": vr_sink}
+        for kind, nodes in all_nodes.items():
+            route = routing["defaults"].get(kind)
+            current = _node_by_name(nodes, defaults[kind])
+            if vr and current and not _is_wivrn_node(current):
+                # Capture the live choice before our first write, and respect
+                # a subsequent selection after releasing a completed route.
+                if route and ("observed" not in route or route.get("result")):
+                    self.data["original"][kind] = _audio_identity(current)
+                    self._remember_desktop(kind, current)
+            if route:
+                target = (vr_nodes[kind]["name"] if vr_nodes[kind] else "") if vr else self._desktop_target(
+                    kind, self.data["original"].get(kind, {}), nodes)
+                # Use only known history for fallbacks. If none is connected,
+                # wait briefly, then leave the live choice alone.
+                self._route_once(route, defaults[kind], target, vr,
+                    lambda k=kind, t=target: _set_default_audio(k, t),
+                    lambda k=kind: _pactl_default(k), "default " + kind)
+                self.default_status[kind] = route.get("status", "waiting for headset evidence")
+                if route.get("result"):
+                    if vr:
+                        selected = _node_by_name(nodes, _pactl_default(kind))
+                        if selected and not _is_wivrn_node(selected):
+                            self.data["original"][kind] = _audio_identity(selected)
+                            self._remember_desktop(kind, selected)
+                        elif route["result"] == "verified":
+                            self.data["last_applied"][kind] = target
+                    elif not vr:
+                        self.data["original"].pop(kind, None)
+                        self.data["last_applied"].pop(kind, None)
+            elif not vr:
+                self.default_status[kind] = "desktop choice " + (defaults[kind] or "unavailable")
+            if not vr and kind not in self.data["original"] and self.machine.candidate is not True:
+                current = _node_by_name(nodes, _pactl_default(kind))
+                if current and not _is_wivrn_node(current):
+                    self._remember_desktop(kind, current)
+
+        # Keep auto-mic, Discord and EasyEffects behavior independent of the
+        # bounded SYSTEM-default writes above.
+        if not vr:
             self.current = None
-            # Only update baseline after originals have been restored.
-            if not self.data["original"] and self.machine.candidate is not True:
-                for kind, nodes in all_nodes.items():
-                    node = _node_by_name(nodes, defaults[kind])
-                    if node and not _is_wivrn_node(node):
-                        self.data["desktop"][kind] = _audio_identity(node)
-                        VR_AUDIO_STATE[f"last_desktop_{kind}"] = node["name"]
-            for kind, identity in list(self.data["original"].items()):
-                nodes = all_nodes[kind]
-                target = _resolve_audio_identity(identity, nodes)
-                if not target:
-                    # A temporary desktop fallback never replaces the saved original.
-                    target = _first_non_wivrn_audio_name(nodes)
-                if target and defaults[kind] != target and self.may_route(False):
-                    _set_default_audio(kind, target)
-                self.default_status[kind] = ("restored " + target if target and _pactl_default(kind) == target
-                                             else "waiting for saved device or audio server")
-                if target and _pactl_default(kind) == target and target == _resolve_audio_identity(identity, nodes):
-                    self.data["desktop"][kind] = identity
-                    del self.data["original"][kind]
-                    self.data["last_applied"].pop(kind, None)
             self._route_discord(False, sources, sinks)
             self.preferences.sync(False, lambda: self.may_route(False) and self.persist())
             if self.data.get("easyeffects_paused"):
@@ -1228,33 +1359,10 @@ class AudioCoordinator:
                     self.data["easyeffects_was_running"] = False
             self.persist()
             return
-        vr_source = next((n for n in sources if _is_wivrn_node(n)), None)
-        vr_sink = next((n for n in sinks if _is_wivrn_node(n)), None)
         if not vr_source and not vr_sink:
             self.current = None
-            self.default_status = {"source": "WiVRn microphone not published", "sink": "WiVRn output not published"}
+            self.persist()
             return
-        if not self.data["original"]:
-            self.data["original"] = dict(self.data["desktop"])
-        for kind, nodes in all_nodes.items():
-            if kind not in self.data["original"]:
-                node = _node_by_name(nodes, defaults[kind])
-                if node and not _is_wivrn_node(node):
-                    self.data["original"][kind] = _audio_identity(node)
-        if not self.persist():
-            return
-        for kind, node in (("source", vr_source), ("sink", vr_sink)):
-            if not node:
-                self.default_status[kind] = "WiVRn device not published; retrying"
-                continue  # Retry a late microphone without holding up headphones.
-            if defaults[kind] != node["name"] and self.may_route(True):
-                _set_default_audio(kind, node["name"])
-            if _pactl_default(kind) == node["name"]:
-                self.data["last_applied"][kind] = node["name"]
-                self.default_status[kind] = "routed to " + node["name"]
-            else:
-                self.default_status[kind] = "audio server did not accept " + node["name"] + "; retrying"
-        # Dictation's auto-mic resolver requires a live source, not just a sink.
         self.current = ({"source": vr_source["name"], "sink": vr_sink["name"] if vr_sink else "",
             "source_label": vr_source["label"], "sink_label": vr_sink["label"] if vr_sink else "",
             "device_id": PULSE_SOURCE_PREFIX + vr_source["name"]} if vr_source else None)
@@ -5425,3 +5533,4 @@ def cli_main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(cli_main(sys.argv))
+
